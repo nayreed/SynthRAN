@@ -116,6 +116,22 @@
       changed_when: false
       failed_when: false
 
+    - name: Probe Kubernetes node identity
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: synthran_preflight_kubelet_identity
+
+    - name: Probe generated kubelet configuration
+      ansible.builtin.stat:
+        path: /var/lib/kubelet/config.yaml
+      register: synthran_preflight_kubelet_config
+
+    - name: Resolve missing required boot parameters
+      ansible.builtin.set_fact:
+        synthran_preflight_missing_boot_tokens: >-
+          {{ synthran_preflight_required_boot_tokens
+             | difference(synthran_preflight_cmdline.stdout.split()) | list }}
+
     - name: Build per-host SOP preflight evidence
       ansible.builtin.set_fact:
         synthran_sop_preflight_evidence:
@@ -131,7 +147,11 @@
           boot:
             profile: "{{ synthran_preflight_boot_profile }}"
             required_tokens: "{{ synthran_preflight_required_boot_tokens }}"
+            missing_tokens: "{{ synthran_preflight_missing_boot_tokens }}"
             command_line: "{{ synthran_preflight_cmdline.stdout | trim }}"
+          kubernetes_identity:
+            kubelet_conf: "{{ synthran_preflight_kubelet_identity.stat.exists | default(false) }}"
+            kubelet_config: "{{ synthran_preflight_kubelet_config.stat.exists | default(false) }}"
           services:
             containerd_rc: "{{ synthran_preflight_containerd.rc }}"
             containerd_state: "{{ synthran_preflight_containerd.stdout | default('') | trim }}"
@@ -171,6 +191,16 @@
   become: true
   any_errors_fatal: true
   tasks:
+    - name: Probe Kubernetes administrator identity
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: synthran_preflight_admin_conf
+
+    - name: Probe Kubernetes etcd identity
+      ansible.builtin.stat:
+        path: /var/lib/etcd
+      register: synthran_preflight_etcd_state
+
     - name: Probe Kubernetes control plane readiness
       ansible.builtin.command:
         argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, --raw=/readyz]
@@ -213,6 +243,9 @@
           host_preparation: "{{ synthran_host_preparation }}"
           core_node: "{{ inventory_hostname }}"
           ran_node: "{{ ran_node_name }}"
+          identity:
+            admin_conf: "{{ synthran_preflight_admin_conf.stat.exists | default(false) }}"
+            etcd_state: "{{ synthran_preflight_etcd_state.stat.exists | default(false) }}"
           readyz:
             rc: "{{ synthran_preflight_readyz.rc }}"
             stdout: "{{ synthran_preflight_readyz.stdout | default('') | trim }}"
@@ -255,6 +288,7 @@
           {{ inventory_hostname }} is missing required boot parameter {{ item }}
           for {{ synthran_preflight_boot_profile }}.
       loop: "{{ synthran_preflight_required_boot_tokens }}"
+      when: synthran_host_preparation in ['preserve', 'fresh']
 
     - name: Require preserved containerd
       ansible.builtin.assert:
