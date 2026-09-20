@@ -11,6 +11,8 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from .host_preparation import BOOTSTRAP, PREPARATION_MODES, validate_preparation_mode
+
 
 STATE_PATH = Path(".synthran/pos-reservation.json")
 PROVIDER_PREFIX_ATTEMPTS_AFTER_CREATE = 12
@@ -20,7 +22,6 @@ POS_READY_ATTEMPTS = 60
 POS_READY_INTERVAL_SECONDS = 5.0
 
 ACQUISITION_MODES = {"create", "require-existing", "disabled"}
-PREPARATION_MODES = {"fresh", "preserve"}
 PROVIDER_MODES = {"create", "require-existing", "disabled"}
 R2LAB_MODES = {"book", "require-existing", "disabled"}
 _SAFE_CONTEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -532,11 +533,10 @@ def prepare_hosts(
     selected: Sequence[str],
     calendar: Mapping[str, Any],
 ) -> dict[str, Any]:
-    mode = str(reservation.get("host_preparation", ""))
-    if mode not in PREPARATION_MODES:
-        raise ReservationError(
-            "deployment.reservation.host_preparation must be fresh or preserve"
-        )
+    try:
+        mode = validate_preparation_mode(reservation.get("host_preparation", ""))
+    except ValueError as exc:
+        raise ReservationError(str(exc)) from exc
     if mode == "preserve":
         print(
             "Reusing existing SOP host state; no allocation, image, boot-parameter, or reset mutation will be performed",
@@ -548,6 +548,12 @@ def prepare_hosts(
             "mutations": [],
             "managed_by": "synthran",
         }
+    if mode == BOOTSTRAP:
+        raise ReservationError(
+            "bootstrap host preparation is declared but not executable yet; "
+            "no host mutation was attempted; use preserve only for already-valid "
+            "hosts or fresh for a known-clean rebuild"
+        )
     if calendar.get("status") == "disabled":
         raise ReservationError(
             "fresh host preparation requires create or require-existing POS calendar authority"
