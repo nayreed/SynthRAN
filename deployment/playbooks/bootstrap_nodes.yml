@@ -194,7 +194,10 @@
         synthran_cni_arch: >-
           {{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else
              'arm64' if ansible_architecture in ['aarch64', 'arm64'] else '' }}
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
 
     - name: Require a pinned CNI artifact for this architecture
       ansible.builtin.assert:
@@ -205,7 +208,10 @@
         fail_msg: >-
           No checksum-pinned CNI plugin bundle is defined for architecture
           {{ ansible_architecture }}.
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
 
     - name: Stage the checksum-verified CNI plugin bundle
       ansible.builtin.get_url:
@@ -215,7 +221,10 @@
         mode: '0600'
         force: true
         checksum: "sha256:{{ cni_plugins_sha256[synthran_cni_arch] }}"
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
   roles:
     - role: setup/k8s/cluster_create
       when: synthran_host_preparation == 'fresh'
@@ -254,14 +263,20 @@
   roles:
     - role: setup/k8s/cluster_join
       when:
-        - synthran_host_preparation == 'fresh'
+        - >-
+          synthran_host_preparation == 'fresh' or
+          (synthran_host_preparation == 'bootstrap' and
+           synthran_bootstrap_cluster_action == 'rebuild')
         - inventory_hostname != groups['core_node'][0]
     - role: setup/k8s/cni_dhcp
       when:
-        - synthran_host_preparation == 'fresh'
+        - >-
+          synthran_host_preparation == 'fresh' or
+          (synthran_host_preparation == 'bootstrap' and
+           synthran_bootstrap_cluster_action == 'rebuild')
         - inventory_hostname != groups['core_node'][0]
 
-- name: Apply fresh cluster placement policy
+- name: Apply mutable cluster placement policy
   hosts: core_node
   become: true
   any_errors_fatal: true
@@ -270,14 +285,14 @@
       vars:
         target_node: "{{ ran_node_name }}"
       when:
-        - synthran_host_preparation == 'fresh'
+        - synthran_host_preparation in ['fresh', 'bootstrap']
         - bridge_enabled
         - core_node_name != ran_node_name
     - role: setup/k8s/remove_taint
       vars:
         target_node: "{{ ran_node_name }}"
       when:
-        - synthran_host_preparation == 'fresh'
+        - synthran_host_preparation in ['fresh', 'bootstrap']
         - core_node_name == ran_node_name
 
 - name: Install or verify Multus and storage prerequisites
@@ -286,10 +301,10 @@
   any_errors_fatal: true
   roles:
     - role: setup/cni
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
     - role: setup/storage
       when:
-        - synthran_host_preparation == 'fresh'
+        - synthran_host_preparation in ['fresh', 'bootstrap']
         - core == 'open5gs' or core == 'free5gc'
   tasks:
     - name: Verify preserved NetworkAttachmentDefinition API
@@ -305,13 +320,13 @@
       changed_when: false
       when: synthran_host_preparation == 'preserve'
 
-- name: Apply fresh RAN-node CPU and kubelet tuning
+- name: Apply mutable RAN-node CPU and kubelet tuning
   hosts: ran_node
   become: true
   any_errors_fatal: true
   roles:
     - role: setup/k8s/k8s_cpu_tuning
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
 - name: Collect host bootstrap evidence
   hosts: sopnodes
@@ -364,7 +379,9 @@
                {'host': item,
                 'storage': hostvars[item].storage | default(''),
                 'containerd_mount': hostvars[item].synthran_bootstrap_mount.stdout | trim,
-                'cni_dhcp': hostvars[item].synthran_bootstrap_cni_dhcp.stdout | trim}
+                'cni_dhcp': hostvars[item].synthran_bootstrap_cni_dhcp.stdout | trim,
+                'bootstrap_classification': hostvars[item].synthran_bootstrap_classification | default('not-applicable'),
+                'bootstrap_cluster_action': hostvars[item].synthran_bootstrap_cluster_action | default('not-applicable')}
              ] }}
       loop: "{{ groups['sopnodes'] | unique | list }}"
 
