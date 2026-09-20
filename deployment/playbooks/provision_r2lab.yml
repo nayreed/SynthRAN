@@ -17,7 +17,7 @@
     - name: Start R2Lab RRU setup phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - start
@@ -36,7 +36,7 @@
     - name: Finish R2Lab RRU setup phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - finish
@@ -57,7 +57,7 @@
     - name: Start R2Lab UE setup phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - start
@@ -110,7 +110,7 @@
     - name: Finish R2Lab UE setup phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - finish
