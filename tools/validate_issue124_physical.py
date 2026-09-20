@@ -154,40 +154,70 @@ def validate_preserve_failure(run: Path, expected_revision: str) -> dict[str, An
         f"{run}: negative proof must use split sopnode-f2/sopnode-f3",
     )
 
-    preflights = {
-        host: host_preflight(run, host)
+    log = read_text(run / "ansible.log")
+    preflight_paths = {
+        host: run / f"sop-preflight-{host}.json"
         for host in ("sopnode-f2", "sopnode-f3")
     }
+    detailed_preflight_available = all(path.is_file() for path in preflight_paths.values())
     unhealthy: dict[str, list[str]] = {}
-    for host, evidence in preflights.items():
-        services = evidence.get("services") if isinstance(evidence.get("services"), dict) else {}
-        cni = evidence.get("cni") if isinstance(evidence.get("cni"), dict) else {}
-        network = evidence.get("network") if isinstance(evidence.get("network"), dict) else {}
-        reasons: list[str] = []
-        if int(services.get("containerd_rc", 1)) != 0:
-            reasons.append("containerd")
-        if int(services.get("kubelet_rc", 1)) != 0:
-            reasons.append("kubelet")
-        if int(services.get("cni_dhcp_rc", 1)) != 0:
-            reasons.append("cni-dhcp-service")
-        if cni.get("dhcp_binary_exists") is not True or cni.get("dhcp_binary_executable") is not True:
-            reasons.append("cni-dhcp-binary")
-        if int(services.get("ovsdb_server_rc", 1)) != 0 or int(services.get("ovs_vswitchd_rc", 1)) != 0:
-            reasons.append("ovs")
-        if str(network.get("ip_forward", "")) != "1":
-            reasons.append("ip-forward")
-        if reasons:
-            unhealthy[host] = reasons
-    require(
-        unhealthy,
-        f"{run}: preserve failure does not demonstrate an incomplete SOP prerequisite state",
-    )
 
-    log = read_text(run / "ansible.log")
-    require(
-        "Preflight selected SOP hosts before physical testbed mutation" in log,
-        f"{run}: SOP preflight evidence is not visible in ansible.log",
-    )
+    if detailed_preflight_available:
+        preflights = {
+            host: read_json(path)
+            for host, path in preflight_paths.items()
+        }
+        for host, evidence in preflights.items():
+            services = evidence.get("services") if isinstance(evidence.get("services"), dict) else {}
+            cni = evidence.get("cni") if isinstance(evidence.get("cni"), dict) else {}
+            network = evidence.get("network") if isinstance(evidence.get("network"), dict) else {}
+            reasons: list[str] = []
+            if int(services.get("containerd_rc", 1)) != 0:
+                reasons.append("containerd")
+            if int(services.get("kubelet_rc", 1)) != 0:
+                reasons.append("kubelet")
+            if int(services.get("cni_dhcp_rc", 1)) != 0:
+                reasons.append("cni-dhcp-service")
+            if cni.get("dhcp_binary_exists") is not True or cni.get("dhcp_binary_executable") is not True:
+                reasons.append("cni-dhcp-binary")
+            if int(services.get("ovsdb_server_rc", 1)) != 0 or int(services.get("ovs_vswitchd_rc", 1)) != 0:
+                reasons.append("ovs")
+            if str(network.get("ip_forward", "")) != "1":
+                reasons.append("ip-forward")
+            if reasons:
+                unhealthy[host] = reasons
+        require(
+            unhealthy,
+            f"{run}: preserve failure does not demonstrate an incomplete SOP prerequisite state",
+        )
+        require(
+            "Preflight selected SOP hosts before physical testbed mutation" in log,
+            f"{run}: detailed SOP preflight evidence is not visible in ansible.log",
+        )
+        failure_stage = "detailed-preflight"
+    else:
+        require(
+            "Validate selected SOP nodes" in log
+            and "Wait for the selected SOP node to become reachable" in log,
+            f"{run}: preserve failure reached neither the SOP reachability gate nor detailed preflight",
+        )
+        reachability_markers = (
+            "Permission denied (publickey)",
+            "timed out waiting for ping module test",
+            "UNREACHABLE!",
+        )
+        require(
+            any(marker in log for marker in reachability_markers),
+            f"{run}: preserve failure has no concrete SOP reachability/authentication failure",
+        )
+        for host in ("sopnode-f2", "sopnode-f3"):
+            if host in log:
+                unhealthy[host] = ["ssh-reachability-or-authentication"]
+        require(
+            unhealthy,
+            f"{run}: preserve reachability failure is not attributable to a selected SOP node",
+        )
+        failure_stage = "reachability-gate"
     for marker in MUTATION_MARKERS:
         require(
             marker not in log,
@@ -222,6 +252,7 @@ def validate_preserve_failure(run: Path, expected_revision: str) -> dict[str, An
         "revision": revision,
         "host_preparation": "preserve",
         "controller_exit_code": exit_code(run),
+        "preflight_failure_stage": failure_stage,
         "preflight_failure_reasons": unhealthy,
         "physical_mutation_started": False,
         "status": "passed",
