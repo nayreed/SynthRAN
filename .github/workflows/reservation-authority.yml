@@ -33,6 +33,7 @@ jobs:
         run: >-
           python -m py_compile
           synthran/reservation.py
+          synthran/phase_timing.py
           synthran/pos_images.py
           synthran/r2lab.py
           synthran/inventory.py
@@ -45,6 +46,8 @@ jobs:
           tools/check_pos_preparation_regression.py
           tools/check_reservation_wizard_contract.py
           tools/check_reservation_output_contract.py
+          tools/check_phase_timing_contract.py
+          tools/check_issue124_regressions.py
           tools/check_r2lab_handoff_contract.py
           tools/check_reservation_failure_evidence.py
           tools/check_reservation_cli_fakes.py
@@ -70,6 +73,12 @@ jobs:
 
       - name: Validate operator-facing reservation output
         run: python tools/check_reservation_output_contract.py
+
+      - name: Validate deployment phase timing evidence
+        run: python tools/check_phase_timing_contract.py
+
+      - name: Validate issue 124 host-preparation regression matrix
+        run: python tools/check_issue124_regressions.py
 
       - name: Validate R2Lab Ansible handoff and cleanup scope
         run: python tools/check_r2lab_handoff_contract.py
