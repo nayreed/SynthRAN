@@ -1,0 +1,185 @@
+---
+- name: Resolve the run-scoped R2Lab N320 SSH trust file
+  ansible.builtin.set_fact:
+    oai_n320_readiness_known_hosts: "/tmp/synthran-n320-{{ run_dir | basename }}-known-hosts"
+
+- name: Initialize the run-scoped R2Lab N320 SSH trust file
+  ansible.builtin.file:
+    path: "{{ oai_n320_readiness_known_hosts }}"
+    state: touch
+    mode: '0600'
+    access_time: preserve
+    modification_time: preserve
+
+- name: Reconcile and attest R2Lab N320 dual-SFP readiness
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    ssh_options=(
+      -o BatchMode=yes
+      -o ConnectTimeout=5
+      -o "UserKnownHostsFile=${N320_KNOWN_HOSTS}"
+      -o StrictHostKeyChecking=accept-new
+    )
+
+    remote_state="$(
+      ssh "${ssh_options[@]}" \
+        "${N320_SSH_USER}@${N320_SFP1_IP}" \
+        sh -s -- "${N320_SFP0_IP}" "${N320_SFP1_IP}" <<'REMOTE'
+    set -eu
+    expected_sfp0_ip="$1"
+    expected_sfp1_ip="$2"
+
+    sfp0_ip="$(ifconfig sfp0 | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -n 1)"
+    sfp1_ip="$(ifconfig sfp1 | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -n 1)"
+    sfp0_mac="$(tr '[:upper:]' '[:lower:]' < /sys/class/net/sfp0/address)"
+    sfp1_mac="$(tr '[:upper:]' '[:lower:]' < /sys/class/net/sfp1/address)"
+
+    test "$(cat /sys/class/net/sfp0/operstate)" = "up"
+    test "$(cat /sys/class/net/sfp1/operstate)" = "up"
+    test "$sfp0_ip" = "$expected_sfp0_ip"
+    test "$sfp1_ip" = "$expected_sfp1_ip"
+
+    for scope in all sfp0 sfp1; do
+      sysctl -w "net.ipv4.conf.${scope}.arp_ignore=1" >/dev/null
+      sysctl -w "net.ipv4.conf.${scope}.arp_announce=2" >/dev/null
+    done
+
+    arp_ignore="$(sysctl -n net.ipv4.conf.all.arp_ignore)"
+    arp_announce="$(sysctl -n net.ipv4.conf.all.arp_announce)"
+    test "$arp_ignore" = "1"
+    test "$arp_announce" = "2"
+    test "$(sysctl -n net.ipv4.conf.sfp0.arp_ignore)" = "1"
+    test "$(sysctl -n net.ipv4.conf.sfp0.arp_announce)" = "2"
+    test "$(sysctl -n net.ipv4.conf.sfp1.arp_ignore)" = "1"
+    test "$(sysctl -n net.ipv4.conf.sfp1.arp_announce)" = "2"
+
+    printf '%s %s %s %s %s %s\n' \
+      "$sfp0_ip" "$sfp0_mac" "$sfp1_ip" "$sfp1_mac" \
+      "$arp_ignore" "$arp_announce"
+    REMOTE
+    )"
+
+    read -r remote_sfp0_ip remote_sfp0_mac \
+      remote_sfp1_ip remote_sfp1_mac \
+      remote_arp_ignore remote_arp_announce <<<"$remote_state"
+
+    test "$remote_sfp0_ip" = "$N320_SFP0_IP"
+    test "$remote_sfp1_ip" = "$N320_SFP1_IP"
+    test -n "$remote_sfp0_mac"
+    test -n "$remote_sfp1_mac"
+    test "$remote_sfp0_mac" != "$remote_sfp1_mac"
+
+    ip neigh del "$N320_SFP0_IP" dev "$N320_PARENT" 2>/dev/null || true
+    ip neigh del "$N320_SFP1_IP" dev "$N320_PARENT" 2>/dev/null || true
+
+    ping -n -I "$N320_PARENT" -c 1 -W 2 "$N320_SFP0_IP" >/dev/null
+    ping -n -I "$N320_PARENT" -c 1 -W 2 "$N320_SFP1_IP" >/dev/null
+
+    neighbor_mac() {
+      ip neigh show to "$1" dev "$N320_PARENT" |
+        awk '{for (i=1; i<=NF; i++) if ($i == "lladdr") {print tolower($(i+1)); exit}}'
+    }
+
+    sfp0_neighbor="$(neighbor_mac "$N320_SFP0_IP")"
+    sfp1_neighbor="$(neighbor_mac "$N320_SFP1_IP")"
+
+    test "$sfp0_neighbor" = "$remote_sfp0_mac"
+    test "$sfp1_neighbor" = "$remote_sfp1_mac"
+
+    python3 - \
+      "$N320_PARENT" \
+      "$remote_sfp0_ip" "$remote_sfp0_mac" "$sfp0_neighbor" \
+      "$remote_sfp1_ip" "$remote_sfp1_mac" "$sfp1_neighbor" \
+      "$remote_arp_ignore" "$remote_arp_announce" <<'PY'
+    import json
+    import sys
+
+    (
+        parent,
+        sfp0_ip,
+        sfp0_mac,
+        sfp0_neighbor,
+        sfp1_ip,
+        sfp1_mac,
+        sfp1_neighbor,
+        arp_ignore,
+        arp_announce,
+    ) = sys.argv[1:]
+
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "parent": parent,
+                "sfp0": {
+                    "ip": sfp0_ip,
+                    "mac": sfp0_mac,
+                    "neighbor_mac": sfp0_neighbor,
+                    "reachable": True,
+                },
+                "sfp1": {
+                    "ip": sfp1_ip,
+                    "mac": sfp1_mac,
+                    "neighbor_mac": sfp1_neighbor,
+                    "reachable": True,
+                },
+                "arp": {
+                    "ignore": int(arp_ignore),
+                    "announce": int(arp_announce),
+                    "scopes": ["all", "sfp0", "sfp1"],
+                },
+            },
+            sort_keys=True,
+        )
+    )
+    PY
+  args:
+    executable: /bin/bash
+  environment:
+    N320_KNOWN_HOSTS: "{{ oai_n320_readiness_known_hosts }}"
+    N320_SSH_USER: "{{ oai_r2lab_n320_ssh_user }}"
+    N320_PARENT: "{{ oai_r2lab_n320_ru_parent }}"
+    N320_SFP0_IP: "{{ oai_r2lab_n320_sfp0_ip }}"
+    N320_SFP1_IP: "{{ oai_r2lab_n320_sfp1_ip }}"
+  register: oai_n320_network_readiness
+  changed_when: oai_n320_network_readiness.rc == 0
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: oai_n320_network_readiness.rc == 0
+
+- name: Require the reconciled R2Lab N320 dual-SFP contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - oai_n320_network_readiness.rc == 0
+      - (oai_n320_network_readiness.stdout | from_json).sfp0.ip == oai_r2lab_n320_sfp0_ip
+      - (oai_n320_network_readiness.stdout | from_json).sfp1.ip == oai_r2lab_n320_sfp1_ip
+      - (oai_n320_network_readiness.stdout | from_json).sfp0.mac == (oai_n320_network_readiness.stdout | from_json).sfp0.neighbor_mac
+      - (oai_n320_network_readiness.stdout | from_json).sfp1.mac == (oai_n320_network_readiness.stdout | from_json).sfp1.neighbor_mac
+      - (oai_n320_network_readiness.stdout | from_json).arp.ignore == 1
+      - (oai_n320_network_readiness.stdout | from_json).arp.announce == 2
+    fail_msg: >-
+      R2Lab N320 dual-SFP readiness failed before OAI launch. SynthRAN requires
+      sfp0={{ oai_r2lab_n320_sfp0_ip }} and sfp1={{ oai_r2lab_n320_sfp1_ip }}
+      to be reachable through {{ oai_r2lab_n320_ru_parent }} and to resolve to
+      their own physical MAC addresses after ARP reconciliation. Refusing to
+      launch OAI against ambiguous N320 RFNoC transport.
+
+- name: Ensure the run provenance directory exists for N320 readiness
+  ansible.builtin.file:
+    path: "{{ run_dir }}/provenance"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  become: false
+
+- name: Retain the pre-launch R2Lab N320 network readiness evidence
+  ansible.builtin.copy:
+    dest: "{{ run_dir }}/provenance/oai-n320-network-readiness.json"
+    content: "{{ (oai_n320_network_readiness.stdout | from_json) | to_nice_json }}"
+    mode: '0644'
+  delegate_to: localhost
+  become: false
