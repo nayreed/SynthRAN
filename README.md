@@ -217,6 +217,8 @@ Study-specific treatment definitions belong under `Experiments/` rather than bec
 
 The existence of implementation code is not treated as proof that a combination has passed current physical acceptance. Physical capability claims remain tied to actual run evidence.
 
+For SOP host-preparation choices and the current physical validation procedure, see [`docs/host-preparation.md`](docs/host-preparation.md) and [`docs/issue124-r2lab-validation.md`](docs/issue124-r2lab-validation.md).
+
 ### Upstream deployment foundation
 
 Substantial portions of SynthRAN's deployment layer derive from [`sopnode/5g_ansible`](https://github.com/sopnode/5g_ansible), developed at **Inria Sophia Antipolis / SophiaNode / R2Lab / SLICES-RI**. SynthRAN preserves upstream provenance and modifications under [`third_party/sopnode-5g-ansible/`](third_party/sopnode-5g-ansible/). The upstream project is Apache-2.0 licensed.
