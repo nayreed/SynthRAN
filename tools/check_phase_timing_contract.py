@@ -128,6 +128,13 @@ def instrumentation_contract() -> None:
     deploy = ROOT / "deploy.sh"
     require_text(deploy, "--phase reservation --scope r2lab")
 
+    bootstrap_classify = ROOT / "deployment/playbooks/bootstrap_classify.yml"
+    yaml.safe_load(bootstrap_classify.read_text(encoding="utf-8"))
+    require_text(bootstrap_classify, "Start bootstrap boot-parameter mutation timing")
+    require_text(bootstrap_classify, "- boot_parameter_mutation")
+    require_text(bootstrap_classify, "Start bootstrap reboot timing")
+    require_text(bootstrap_classify, "- bootstrap_reboot")
+
     bootstrap = ROOT / "deployment/playbooks/bootstrap_nodes.yml"
     yaml.safe_load(bootstrap.read_text(encoding="utf-8"))
     require_text(bootstrap, "- kubernetes_bootstrap")
