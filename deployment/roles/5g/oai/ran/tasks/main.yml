@@ -24,6 +24,12 @@
          if (oai_gnb_mode | default('monolithic')) == 'cudu'
          else ['oai-cu-cp', 'oai-cu-up', 'oai-du'] }}
 
+- name: Reconcile R2Lab N320 dual-SFP network readiness before OAI launch
+  ansible.builtin.include_tasks: r2lab_n320_readiness.yml
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
 - name: Remove previous OAI RAN deployment if any
   ansible.builtin.command: "{{ demo_oai_script }} stop-ran"
   args:
