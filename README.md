@@ -41,36 +41,67 @@ flowchart LR
         RX --> EVENTS["Decoded event trace"]
     end
 
-    subgraph SCIENCE["Scientific experiment layer"]
-        EXP["./experiment.sh"] --> QUAL["Qualify"]
+    subgraph DEPLOY["Infrastructure authority — ./deploy.sh"]
+        DEP["Deployment request"] --> RESOLVE["Resolve selected topology"]
+        RESOLVE --> PLATFORM{"Radio platform"}
+
+        PLATFORM -->|"R2Lab / N3xx"| AUTH["Resource authority<br/>SLICES / POS / R2Lab"]
+        PLATFORM -->|"RFSIM"| HOST["Host / cluster preparation"]
+        AUTH --> HOST
+
+        HOST --> TRANSPORT["N2 / N3 / N4 transport"]
+        TRANSPORT --> CORE["5G core<br/>OAI / Open5GS / free5GC"]
+        CORE --> RAN["RAN<br/>OAI / srsRAN / UERANSIM"]
+        RAN --> RADIO{"Selected radio / UE path"}
+
+        RADIO -->|"software"| SWUE["RFSIM / software UE(s)"]
+        RADIO -->|"physical"| PHYUE["N300 / N320 + selected modem UE(s)"]
+
+        SWUE --> VERIFY["Runtime verification + attestation"]
+        PHYUE --> VERIFY
+        VERIFY --> ACCEPTED["accepted-testbed<br/>deployment identity"]
+    end
+
+    subgraph UPSTREAM["Reviewed upstream lifecycle delegation"]
+        REF["Pinned sopnode/5g_ansible<br/>execution reference"]
+    end
+
+    REF -. "reviewed task ownership only" .-> HOST
+    REF -. "reviewed task ownership only" .-> CORE
+    REF -. "reviewed task ownership only" .-> RAN
+
+    subgraph SCIENCE["Scientific experiment authority — ./experiment.sh"]
+        EXP["Select experiment"] --> QUAL["Qualify"]
         QUAL --> CAL["Calibrate"]
         CAL --> FREEZE["Freeze design"]
         FREEZE --> CONF["Confirm"]
         CONF --> ANALYZE["Analyze"]
+
+        ATTACH["Read-only accepted-testbed attachment"]
+        ELIG["Experiment-time eligibility<br/>fresh UE / PDU / path / treatment evidence"]
+        REPLAY["Frozen workload replay"]
     end
 
-    subgraph TESTBED["5G infrastructure layer"]
-        DEP["./deploy.sh"] --> RES["Reserve / resolve"]
-        RES --> PREP["Prepare"]
-        PREP --> CORE["5G core"]
-        CORE --> RAN["RAN + radio"]
-        RAN --> UE["Gateway UE(s)"]
-        UE --> VERIFY["Verify + attest"]
-    end
+    EVENTS --> BUNDLE["Immutable decoded workload bundle"]
+    BUNDLE --> CONF
 
-    subgraph ATTACH["Read-only experiment attachment"]
-        ACCEPTED["Accepted deployment identity"] --> COMPAT["Compatibility gate"]
-        COMPAT --> REPLAY["Workload replay"]
-    end
+    ACCEPTED --> ATTACH
+    CONF --> ATTACH
+    ATTACH --> ELIG
+    ELIG --> REPLAY
 
-    EVENTS --> CONF
-    VERIFY --> ACCEPTED
-    CONF --> COMPAT
-    REPLAY --> UE
-    UE --> APP["N6-side application / collector"]
-    APP --> RESULT["Reconciled evidence"]
+    REPLAY --> GATEWAY["Selected gateway UE"]
+    GATEWAY --> APP["N6-side application / collector"]
+    APP --> RESULT["Reconciled scientific evidence"]
     ANALYZE --> RESULT
 ```
+
+The post-rework authority boundary is deliberate:
+
+- **SynthRAN owns resource authority, deployment identity, acceptance, and experiment eligibility.** A reviewed upstream task may own a lifecycle step, but it never decides that a deployment is accepted.
+- **Physical resource mutation is selected and bounded.** R2Lab/SLICES/POS authority is resolved before host, radio, or UE mutation; software-only RFSIM paths do not inherit physical resource ownership.
+- **Host preparation and deployment acceptance are separate concepts.** SOP preparation may use `preserve`, `bootstrap`, or `fresh`, while acceptance is based on retained live evidence after the selected core/RAN/radio/UE path is running.
+- **`accepted-testbed` is not automatically `experiment-eligible`.** A study may require stricter experiment-time evidence—such as fresh UE/PDU state, treatment validity, or remote-observed UE→N6 path/source identity—before scientific replay begins. This distinction is especially important for transport experiments and is tracked explicitly rather than inferred from provisioning success.
 
 ---
 
