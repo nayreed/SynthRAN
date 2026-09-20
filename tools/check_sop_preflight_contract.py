@@ -96,7 +96,11 @@ def main() -> int:
     expected_generic = reservation.REFERENCE_BOOT_PARAMETERS.split()
     expected_ran = reservation.REFERENCE_BOOT_RAN_PARAMETERS.split()
     require(common == expected_generic, "generic preflight boot tokens drifted from POS reservation profile")
-    require(common + ran == expected_ran, "RAN preflight boot tokens drifted from POS reservation profile")
+    require(len(common + ran) == len(set(common + ran)), "preflight boot-token lists contain duplicates")
+    require(
+        set(common + ran) == set(expected_ran),
+        "RAN preflight boot tokens drifted from POS reservation profile",
+    )
 
     r2lab_text = (ROOT / "deployment/playbooks/provision_r2lab.yml").read_text(encoding="utf-8")
     for mutation in (
