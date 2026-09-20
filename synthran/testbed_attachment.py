@@ -120,6 +120,8 @@ def validate_requirements(
         "radio_unit",
         "network_profile",
         "bridge_enabled",
+        "reservation_mode",
+        "host_preparation",
         "nodes",
         "minimum_ues",
         "ue_devices",
@@ -142,6 +144,8 @@ def validate_requirements(
         "radio_unit",
         "network_profile",
         "bridge_enabled",
+        "reservation_mode",
+        "host_preparation",
     ):
         if key in requirements:
             _expected(deployment.get(key), requirements[key], key)
@@ -304,6 +308,9 @@ def attach_active_deployment(
                 "ran",
                 "platform",
                 "radio_unit",
+                "reservation_mode",
+                "host_preparation",
+                "pos_image",
                 "network_profile",
                 "bridge_enabled",
                 "nodes",
