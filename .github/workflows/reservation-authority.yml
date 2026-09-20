@@ -48,6 +48,8 @@ jobs:
           tools/check_reservation_output_contract.py
           tools/check_phase_timing_contract.py
           tools/check_issue124_regressions.py
+          tools/validate_issue124_physical.py
+          tools/check_issue124_physical_validator.py
           tools/check_r2lab_handoff_contract.py
           tools/check_reservation_failure_evidence.py
           tools/check_reservation_cli_fakes.py
@@ -79,6 +81,9 @@ jobs:
 
       - name: Validate issue 124 host-preparation regression matrix
         run: python tools/check_issue124_regressions.py
+
+      - name: Validate issue 124 physical artifact gate without hardware
+        run: python tools/check_issue124_physical_validator.py
 
       - name: Validate R2Lab Ansible handoff and cleanup scope
         run: python tools/check_r2lab_handoff_contract.py
