@@ -194,8 +194,17 @@ def validate_local_contract(pin: str) -> None:
         "A nonzero result is tolerated only for the\n      evidence-backed R2Lab N320 readiness timeout",
         "OAI RAN lifecycle",
     )
+    readiness_index = ran.index("ansible.builtin.include_tasks: r2lab_n320_readiness.yml")
+    readiness_window = ran[readiness_index : readiness_index + 220]
+    for gate in (
+        "platform == 'r2lab'",
+        "rru == 'n320'",
+    ):
+        require(readiness_window, gate, "OAI RAN N320 readiness gate")
 
     for needle in (
+        "BatchMode=yes",
+        "UserKnownHostsFile=${N320_KNOWN_HOSTS}",
         "StrictHostKeyChecking=accept-new",
         "net.ipv4.conf.${scope}.arp_ignore=1",
         "net.ipv4.conf.${scope}.arp_announce=2",
@@ -208,7 +217,11 @@ def validate_local_contract(pin: str) -> None:
     ):
         require(readiness, needle, "N320 pre-launch readiness")
     forbid(readiness, "StrictHostKeyChecking=no", "N320 pre-launch readiness")
+    forbid(readiness, "UserKnownHostsFile=/dev/null", "N320 pre-launch readiness")
     forbid(readiness, "rhubarbe-pdu", "N320 pre-launch readiness")
+    forbid(readiness, "/etc/sysctl", "N320 pre-launch readiness")
+    forbid(readiness, "/data/network", "N320 pre-launch readiness")
+    forbid(readiness, "systemctl restart systemd-networkd", "N320 pre-launch readiness")
 
     for needle in (
         "time.sleep(10)",
