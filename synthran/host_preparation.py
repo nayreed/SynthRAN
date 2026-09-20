@@ -3,9 +3,10 @@
 Issue #124 introduces bootstrap as the in-place preparation policy between
 strictly read-only preserve and known-clean fresh preparation.
 
-Task 1 defines the contract only. bootstrap is intentionally declared but
-not executable until the bounded reconciliation implementation lands; callers
-must fail closed rather than silently escalating it to fresh.
+Issue #124 Tasks 4-6 activate bootstrap as a bounded in-place reconciler.
+It may repair declared host prerequisites and perform a minimum authorized
+reboot, but it never stages an image, reclaims allocation, uses the fresh POS
+reset path, or silently escalates to fresh.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ BOOTSTRAP = "bootstrap"
 FRESH = "fresh"
 
 PREPARATION_MODES = frozenset({PRESERVE, BOOTSTRAP, FRESH})
-EXECUTABLE_PREPARATION_MODES = frozenset({PRESERVE, FRESH})
+EXECUTABLE_PREPARATION_MODES = frozenset({PRESERVE, BOOTSTRAP, FRESH})
 
 PREPARATION_CONTRACT = {
     PRESERVE: {
@@ -40,7 +41,7 @@ PREPARATION_CONTRACT = {
         "allows_reboot": True,
         "allows_pos_reset": False,
         "silent_escalation_to_fresh": False,
-        "implementation": "declared",
+        "implementation": "active",
     },
     FRESH: {
         "mutates_host": True,
