@@ -3,6 +3,11 @@ import copy, ipaddress, re
 from pathlib import Path
 import yaml
 
+from .host_preparation import (
+    BOOTSTRAP,
+    FRESH,
+    validate_preparation_mode,
+)
 from .profile_validation import (
     validate_network_profile,
     validate_ue_catalog,
@@ -14,7 +19,6 @@ SUPPORTED_RANS = {"oai", "srsran", "ueransim"}
 SUPPORTED_PLATFORMS = {"rfsim", "r2lab"}
 SUPPORTED_R2LAB_RADIOS = {"n300", "n320"}
 _RESERVATION_MODES = {"create", "require-existing", "disabled"}
-_PREPARATION_MODES = {"fresh", "preserve"}
 _PROVIDER_MODES = {"create", "require-existing", "disabled"}
 _R2LAB_RESERVATION_MODES = {"book", "require-existing", "disabled"}
 _TRANSPORT_KEYS = {"mode", "interface", "mbim_session"}
@@ -250,13 +254,11 @@ def _normalize_reservation_policy(deployment: dict) -> None:
     host_preparation = reservation.get("host_preparation")
     if host_preparation is None:
         host_preparation = "fresh" if mode != "disabled" else "preserve"
-    if host_preparation not in _PREPARATION_MODES:
+    host_preparation = validate_preparation_mode(host_preparation)
+    if mode == "disabled" and host_preparation in {BOOTSTRAP, FRESH}:
         raise ValueError(
-            "deployment.reservation.host_preparation must be fresh or preserve"
-        )
-    if mode == "disabled" and host_preparation == "fresh":
-        raise ValueError(
-            "fresh host preparation requires deployment.reservation.mode create or require-existing"
+            f"{host_preparation} host preparation requires "
+            "deployment.reservation.mode create or require-existing"
         )
 
     duration = reservation.get("duration_minutes", 120)
