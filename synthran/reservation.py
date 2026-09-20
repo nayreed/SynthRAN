@@ -548,16 +548,30 @@ def prepare_hosts(
             "mutations": [],
             "managed_by": "synthran",
         }
+    if calendar.get("status") == "disabled" and mode in {BOOTSTRAP, "fresh"}:
+        raise ReservationError(
+            f"{mode} host preparation requires create or require-existing POS calendar authority"
+        )
     if mode == BOOTSTRAP:
-        raise ReservationError(
-            "bootstrap host preparation is declared but not executable yet; "
-            "no host mutation was attempted; use preserve only for already-valid "
-            "hosts or fresh for a known-clean rebuild"
+        print(
+            "Retaining the current SOP allocation and OS for in-place bootstrap; "
+            "image staging, allocation reclaim, and POS reset are forbidden",
+            flush=True,
         )
-    if calendar.get("status") == "disabled":
-        raise ReservationError(
-            "fresh host preparation requires create or require-existing POS calendar authority"
-        )
+        return {
+            "mode": "bootstrap",
+            "nodes": {
+                node: {
+                    "allocation": "retained",
+                    "image": "retained",
+                    "boot_profile": _boot_parameters(node)[0],
+                    "reconcile": "ansible-preflight",
+                }
+                for node in selected
+            },
+            "mutations": [],
+            "managed_by": "synthran",
+        }
 
     image = reservation.get("image", "ubuntu-jammy")
     if not isinstance(image, str) or not image.strip():

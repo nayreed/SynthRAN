@@ -24,8 +24,8 @@ def check_contract_matrix() -> None:
     )
     require(
         host_preparation.EXECUTABLE_PREPARATION_MODES
-        == frozenset({"preserve", "fresh"}),
-        "bootstrap must remain declared-but-not-executable in task 1",
+        == frozenset({"preserve", "bootstrap", "fresh"}),
+        "bootstrap must be executable after Tasks 4-6",
     )
 
     preserve = host_preparation.PREPARATION_CONTRACT["preserve"]
@@ -43,7 +43,7 @@ def check_contract_matrix() -> None:
     require(not bootstrap["allows_allocation_reclaim"], "bootstrap must not reclaim allocation")
     require(not bootstrap["allows_pos_reset"], "bootstrap must not use the clean-image POS reset")
     require(not bootstrap["silent_escalation_to_fresh"], "bootstrap must never silently become fresh")
-    require(bootstrap["implementation"] == "declared", "task 1 must not claim bootstrap is implemented")
+    require(bootstrap["implementation"] == "active", "bootstrap reconciliation must be active")
 
     require(fresh["mutates_host"], "fresh must remain mutating")
     require(fresh["allows_image_staging"], "fresh must retain image staging")
@@ -86,39 +86,55 @@ def check_scenario_normalization() -> None:
         raise CheckError("bootstrap without POS calendar authority was accepted")
 
 
-def check_bootstrap_fails_before_host_commands() -> None:
+def check_bootstrap_reservation_retains_host() -> None:
     calls: list[list[str]] = []
 
     def forbidden_run(argv, *, check=True, stdin=None, echo=False):
         calls.append(list(argv))
-        raise CheckError(f"bootstrap attempted a host command: {argv}")
+        raise CheckError(f"bootstrap reservation unexpectedly executed a POS command: {argv}")
 
     original_run = reservation.run
     reservation.run = forbidden_run
     try:
-        try:
-            reservation.prepare_hosts(
-                {"host_preparation": "bootstrap", "image": "ubuntu-jammy"},
-                selected=["sopnode-f2", "sopnode-f3"],
-                calendar={"status": "reused"},
-            )
-        except reservation.ReservationError as exc:
-            require(
-                "declared but not executable yet" in str(exc),
-                f"unexpected bootstrap guard message: {exc}",
-            )
-        else:
-            raise CheckError("bootstrap unexpectedly executed")
+        result = reservation.prepare_hosts(
+            {"host_preparation": "bootstrap", "image": "ubuntu-jammy"},
+            selected=["sopnode-f2", "sopnode-f3"],
+            calendar={"status": "reused"},
+        )
     finally:
         reservation.run = original_run
 
-    require(not calls, f"bootstrap executed host commands before Task 4: {calls}")
+    require(result["mode"] == "bootstrap", "bootstrap reservation mode was not retained")
+    require(not calls, f"bootstrap reservation executed POS commands: {calls}")
+    for node in ("sopnode-f2", "sopnode-f3"):
+        require(
+            result["nodes"][node]["allocation"] == "retained",
+            f"bootstrap did not retain allocation for {node}",
+        )
+        require(
+            result["nodes"][node]["image"] == "retained",
+            f"bootstrap did not retain OS image for {node}",
+        )
+
+    try:
+        reservation.prepare_hosts(
+            {"host_preparation": "bootstrap", "image": "ubuntu-jammy"},
+            selected=["sopnode-f2"],
+            calendar={"status": "disabled"},
+        )
+    except reservation.ReservationError as exc:
+        require(
+            "requires create or require-existing POS calendar authority" in str(exc),
+            f"unexpected disabled-bootstrap failure: {exc}",
+        )
+    else:
+        raise CheckError("bootstrap without POS calendar authority was accepted")
 
 
 def main() -> int:
     check_contract_matrix()
     check_scenario_normalization()
-    check_bootstrap_fails_before_host_commands()
+    check_bootstrap_reservation_retains_host()
     print("Host preparation policy contract checks passed")
     return 0
 

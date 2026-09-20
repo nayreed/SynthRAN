@@ -8,9 +8,9 @@
       ansible.builtin.assert:
         quiet: true
         that:
-          - synthran_host_preparation in ['fresh', 'preserve']
+          - synthran_host_preparation in ['fresh', 'bootstrap', 'preserve']
         fail_msg: >-
-          synthran_host_preparation must be either 'fresh' or 'preserve',
+          synthran_host_preparation must be 'fresh', 'bootstrap', or 'preserve',
           got {{ synthran_host_preparation | default('undefined') }}.
 
     - name: Wait for the selected SOP node to become reachable
@@ -25,7 +25,7 @@
     - name: Record explicitly configured containerd storage
       ansible.builtin.set_fact:
         synthran_configured_storage: "{{ storage | default('') | string | trim }}"
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
     - name: Discover containerd storage only when inventory did not select one
       ansible.builtin.shell: |
@@ -51,18 +51,18 @@
       changed_when: false
       failed_when: false
       when:
-        - synthran_host_preparation == 'fresh'
+        - synthran_host_preparation in ['fresh', 'bootstrap']
         - synthran_configured_storage | length == 0
 
     - name: Use discovered storage only when inventory did not select one
       ansible.builtin.set_fact:
         storage: "{{ synthran_storage_discovery.stdout | trim }}"
       when:
-        - synthran_host_preparation == 'fresh'
+        - synthran_host_preparation in ['fresh', 'bootstrap']
         - synthran_configured_storage | length == 0
         - synthran_storage_discovery.rc == 0
 
-    - name: Require a selected containerd storage device for fresh provisioning
+    - name: Require a selected containerd storage device for mutable preparation
       ansible.builtin.assert:
         quiet: true
         that:
@@ -70,16 +70,16 @@
           - storage | string | trim | length > 0
           - synthran_configured_storage | length > 0 or synthran_storage_discovery.rc == 0
         fail_msg: >-
-          Fresh provisioning requires an explicit inventory storage device or a
+          Mutable host preparation requires an explicit inventory storage device or a
           safely discovered ext4 candidate. Explicit inventory storage is never
           overwritten by discovery.
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
     - name: Inspect the selected containerd storage device
       ansible.builtin.stat:
         path: "/dev/{{ storage }}"
       register: synthran_storage_device
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
     - name: Require the selected storage path to be a block device
       ansible.builtin.assert:
@@ -88,7 +88,7 @@
           - synthran_storage_device.stat.exists
           - synthran_storage_device.stat.isblk | default(false)
         fail_msg: "Selected storage /dev/{{ storage }} is not a block device."
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
     - name: Validate the selected storage filesystem and mounted state
       ansible.builtin.shell: |
@@ -116,15 +116,15 @@
       become: true
       register: synthran_storage_state
       changed_when: false
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
-    - name: Report fresh storage ownership
+    - name: Report mutable preparation storage ownership
       ansible.builtin.debug:
         msg: >-
           containerd storage={{ storage }};
           source={{ 'inventory' if synthran_configured_storage | length > 0 else 'safe-discovery' }};
           state={{ synthran_storage_state.stdout | trim }}
-      when: synthran_host_preparation == 'fresh'
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
 
     - name: Report accepted-testbed preservation policy
       ansible.builtin.debug:
