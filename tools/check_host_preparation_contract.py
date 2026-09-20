@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from synthran import host_preparation, reservation
+from synthran.deployment_state import build_manifest
 from synthran.scenario import _normalize_reservation_policy
 
 
@@ -131,9 +132,56 @@ def check_bootstrap_reservation_retains_host() -> None:
         raise CheckError("bootstrap without POS calendar authority was accepted")
 
 
+
+def check_deployment_identity_policy() -> None:
+    network_profile = {
+        "plmn": {"mcc": "001", "mnc": "01"},
+        "slices": [],
+    }
+    ue_map = [{"device": "uesim01", "user_plane_target": "12.1.1.1"}]
+    topology = {"namespace": "open5gs"}
+    for mode in ("preserve", "bootstrap", "fresh"):
+        scenario = {
+            "deployment": {
+                "core": "open5gs",
+                "ran": "srsran",
+                "platform": "rfsim",
+                "nodes": {"core": "f2", "ran": "f3", "broker": "f2"},
+                "network_profile": "ci",
+                "ues": ["uesim01"],
+                "reservation": {
+                    "mode": "create",
+                    "host_preparation": mode,
+                    "image": "ubuntu-jammy",
+                },
+            }
+        }
+        manifest = build_manifest(scenario, network_profile, ue_map, topology)
+        deployment = manifest["deployment"]
+        require(
+            deployment["reservation_mode"] == "create",
+            f"deployment identity lost reservation mode for {mode}",
+        )
+        require(
+            deployment["host_preparation"] == mode,
+            f"deployment identity lost host preparation mode {mode}",
+        )
+        if mode == "fresh":
+            require(
+                deployment["pos_image"] == "ubuntu-jammy",
+                "fresh deployment identity lost selected POS image",
+            )
+        else:
+            require(
+                deployment["pos_image"] is None,
+                f"{mode} deployment identity must not claim an unused POS image",
+            )
+
+
 def main() -> int:
     check_contract_matrix()
     check_scenario_normalization()
+    check_deployment_identity_policy()
     check_bootstrap_reservation_retains_host()
     print("Host preparation policy contract checks passed")
     return 0
