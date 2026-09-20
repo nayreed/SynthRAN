@@ -18,14 +18,14 @@
     ssh_options=(
       -o BatchMode=yes
       -o ConnectTimeout=5
-      -o "UserKnownHostsFile=\${N320_KNOWN_HOSTS}"
+      -o "UserKnownHostsFile=${N320_KNOWN_HOSTS}"
       -o StrictHostKeyChecking=accept-new
     )
 
     remote_state="$(
-      ssh "\${ssh_options[@]}" \
-        "\${N320_SSH_USER}@\${N320_SFP1_IP}" \
-        sh -s -- "\${N320_SFP0_IP}" "\${N320_SFP1_IP}" <<'REMOTE'
+      ssh "${ssh_options[@]}" \
+        "${N320_SSH_USER}@${N320_SFP1_IP}" \
+        sh -s -- "${N320_SFP0_IP}" "${N320_SFP1_IP}" <<'REMOTE'
     set -eu
     expected_sfp0_ip="$1"
     expected_sfp1_ip="$2"
@@ -41,14 +41,18 @@
     test "$sfp1_ip" = "$expected_sfp1_ip"
 
     for scope in all sfp0 sfp1; do
-      sysctl -w "net.ipv4.conf.\${scope}.arp_ignore=1" >/dev/null
-      sysctl -w "net.ipv4.conf.\${scope}.arp_announce=2" >/dev/null
+      sysctl -w "net.ipv4.conf.${scope}.arp_ignore=1" >/dev/null
+      sysctl -w "net.ipv4.conf.${scope}.arp_announce=2" >/dev/null
     done
 
     arp_ignore="$(sysctl -n net.ipv4.conf.all.arp_ignore)"
     arp_announce="$(sysctl -n net.ipv4.conf.all.arp_announce)"
     test "$arp_ignore" = "1"
     test "$arp_announce" = "2"
+    test "$(sysctl -n net.ipv4.conf.sfp0.arp_ignore)" = "1"
+    test "$(sysctl -n net.ipv4.conf.sfp0.arp_announce)" = "2"
+    test "$(sysctl -n net.ipv4.conf.sfp1.arp_ignore)" = "1"
+    test "$(sysctl -n net.ipv4.conf.sfp1.arp_announce)" = "2"
 
     printf '%s %s %s %s %s %s\n' \
       "$sfp0_ip" "$sfp0_mac" "$sfp1_ip" "$sfp1_mac" \
