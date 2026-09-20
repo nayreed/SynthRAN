@@ -132,7 +132,7 @@ def main() -> None:
     bootstrap_path = ROOT / "deployment/playbooks/bootstrap_nodes.yml"
     bootstrap = bootstrap_path.read_text(encoding="utf-8")
     bootstrap_data = yaml.safe_load(bootstrap)
-    destructive_roles = {
+    mutating_roles = {
         "setup/common",
         "setup/netplan",
         "setup/containerd",
@@ -150,6 +150,14 @@ def main() -> None:
         "setup/storage",
         "setup/k8s/k8s_cpu_tuning",
     }
+    rebuild_only_roles = {
+        "setup/netplan",
+        "setup/pre_k8s",
+        "setup/k8s/cluster_create",
+        "setup/k8s/cni_dhcp",
+        "setup/k8s/cluster_join",
+        "setup/k8s/remove_cp_taint",
+    }
     seen_roles = set()
     for play in bootstrap_data:
         for role_entry in play.get("roles", []):
@@ -160,14 +168,23 @@ def main() -> None:
                 role = role_entry
                 role_name = role["role"]
             seen_roles.add(role_name)
-            if role_name in destructive_roles and "synthran_host_preparation == 'fresh'" not in _when_text(role):
-                fail(f"bootstrap_nodes.yml: mutating role lacks fresh-only guard: {role_name}")
+            when_text = _when_text(role)
+            if role_name in mutating_roles:
+                if "synthran_host_preparation" not in when_text:
+                    fail(f"bootstrap_nodes.yml: mutating role lacks preparation-mode guard: {role_name}")
+                if "fresh" not in when_text and "bootstrap" not in when_text:
+                    fail(f"bootstrap_nodes.yml: mutating role is not restricted to mutable modes: {role_name}")
+                if "preserve" in when_text:
+                    fail(f"bootstrap_nodes.yml: preserve must not execute mutating role: {role_name}")
+            if role_name in rebuild_only_roles and "bootstrap" in when_text:
+                if "synthran_bootstrap_cluster_action == 'rebuild'" not in when_text:
+                    fail(f"bootstrap_nodes.yml: destructive bootstrap role lacks rebuild classification: {role_name}")
 
-    for role in destructive_roles:
+    for role in mutating_roles:
         if role not in seen_roles:
             fail(f"bootstrap_nodes.yml: expected lifecycle role missing: {role}")
 
-    fresh_only_tasks = {
+    mutable_tasks = {
         "Resolve the supported yq architecture",
         "Require a checksum-pinned yq binary for this architecture",
         "Install the checksum-verified shared yq binary",
@@ -176,6 +193,15 @@ def main() -> None:
         "Resolve the supported CNI plugin architecture",
         "Require a pinned CNI artifact for this architecture",
         "Stage the checksum-verified CNI plugin bundle",
+    }
+    bootstrap_only_tasks = {
+        "Resolve bootstrap CNI plugin architecture",
+        "Require pinned CNI artifact for bootstrap reuse",
+        "Ensure CNI plugin directory exists for bootstrap reuse",
+        "Stage checksum-verified CNI plugins for bootstrap reuse",
+        "Reconcile CNI plugin binaries for bootstrap reuse",
+        "Reconcile CNI DHCP service for bootstrap reuse",
+        "Require containerd and kubelet after bootstrap prerequisite reconciliation",
     }
     preserve_only_tasks = {
         "Verify preserved containerd is active",
@@ -196,7 +222,7 @@ def main() -> None:
         "Write shareable bootstrap evidence",
     }
 
-    classified = fresh_only_tasks | preserve_only_tasks | shared_tasks
+    classified = mutable_tasks | bootstrap_only_tasks | preserve_only_tasks | shared_tasks
     tasks_by_name = _bootstrap_tasks(bootstrap_data)
     actual_tasks = set(tasks_by_name)
     unclassified = actual_tasks - classified
@@ -212,11 +238,17 @@ def main() -> None:
             + ", ".join(sorted(missing))
         )
 
-    fresh_guard = "synthran_host_preparation == 'fresh'"
     preserve_guard = "synthran_host_preparation == 'preserve'"
-    for name in fresh_only_tasks:
-        if fresh_guard not in _when_text(tasks_by_name[name]):
-            fail(f"bootstrap_nodes.yml: fresh-only task lacks fresh guard: {name}")
+    for name in mutable_tasks:
+        when_text = _when_text(tasks_by_name[name])
+        if "synthran_host_preparation" not in when_text or "fresh" not in when_text:
+            fail(f"bootstrap_nodes.yml: mutable task lacks explicit fresh/bootstrap guard: {name}")
+    for name in bootstrap_only_tasks:
+        when_text = _when_text(tasks_by_name[name])
+        if "synthran_host_preparation == 'bootstrap'" not in when_text:
+            fail(f"bootstrap_nodes.yml: bootstrap-only task lacks bootstrap guard: {name}")
+        if "synthran_bootstrap_cluster_action == 'reuse'" not in when_text:
+            fail(f"bootstrap_nodes.yml: bootstrap reuse task lacks reuse classification: {name}")
     for name in preserve_only_tasks:
         if preserve_guard not in _when_text(tasks_by_name[name]):
             fail(f"bootstrap_nodes.yml: preserve-only task lacks preserve guard: {name}")
@@ -236,7 +268,7 @@ def main() -> None:
         if isinstance(tags, str):
             tags = [tags]
         if "fresh_yq" not in tags:
-            fail(f"bootstrap_nodes.yml: yq fresh-path regression task lacks fresh_yq tag: {name}")
+            fail(f"bootstrap_nodes.yml: yq mutable-path regression task lacks fresh_yq tag: {name}")
 
     require(bootstrap, "synthran_host_preparation == 'preserve'", "bootstrap_nodes.yml")
     require(bootstrap, "Verify preserved Kubernetes control plane is reachable", "bootstrap_nodes.yml")
