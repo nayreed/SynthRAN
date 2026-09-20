@@ -203,6 +203,7 @@ def validate_local_contract(pin: str) -> None:
         require(readiness_window, gate, "OAI RAN N320 readiness gate")
 
     for needle in (
+        "become: true",
         "BatchMode=yes",
         "UserKnownHostsFile=${N320_KNOWN_HOSTS}",
         "StrictHostKeyChecking=accept-new",
