@@ -33,7 +33,7 @@ At least the selected physical qhats must reach verified modem identity, PDU/ses
 
 ## Proof A — preserve fails before physical mutation
 
-Purpose: prove that an incomplete SOP prerequisite state is rejected before SynthRAN cycles the N320 or selected qhats.
+Purpose: prove that an invalid SOP host state is rejected before SynthRAN cycles the N320 or selected qhats. The negative proof may fail either at the initial SOP reachability/authentication gate or at the later detailed prerequisite preflight; both are part of the early host-viability boundary.
 
 Use an authorized validation window in which the selected SOP hosts are genuinely incomplete for `preserve`—for example, a clean POS Ubuntu baseline that has not yet received the SynthRAN Kubernetes prerequisites.
 
@@ -44,8 +44,8 @@ Run the ordinary deployment controller and select OAI core, OAI RAN, R2Lab/N320,
 Expected result:
 
 - reservation authority may succeed;
-- SOP preflight evidence is written for both selected SOP nodes;
-- preserve fails on a missing/unhealthy prerequisite;
+- if SSH reachability succeeds, detailed SOP preflight evidence is written for both selected SOP nodes;
+- preserve fails either because the selected SOP host is not reachable/authenticatable or because a required prerequisite is missing/unhealthy;
 - controller exit code is non-zero;
 - no `r2lab_rru_setup` timing exists;
 - no `ue_setup` timing exists;
