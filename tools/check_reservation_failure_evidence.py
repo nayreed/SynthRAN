@@ -65,6 +65,11 @@ def pos_failure(tmp: Path) -> None:
             result = done(command, out="42\n")
         elif command[:3] == ["pos", "allocations", "allocate"]:
             result = done(command)
+        elif command[:3] == ["pos", "allocations", "show"]:
+            # Provider allocation metadata is an optimization proof. This
+            # fixture models an older/unavailable show surface, which must not
+            # prevent a newly acquired allocation from proceeding.
+            result = done(command, rc=1, err="allocation metadata unavailable")
         elif command[:3] == ["pos", "nodes", "image"]:
             result = done(command, rc=9, err="image provider rejected selected node")
         else:

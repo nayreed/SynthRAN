@@ -3,6 +3,22 @@
   hosts: sopnodes
   become: true
   any_errors_fatal: true
+  pre_tasks:
+    - name: Start Kubernetes bootstrap phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - kubernetes_bootstrap
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
   roles:
     - role: setup/common
       when: synthran_host_preparation in ['fresh', 'bootstrap']
@@ -435,3 +451,18 @@
         mode: '0644'
       delegate_to: localhost
       become: false
+
+    - name: Finish Kubernetes bootstrap phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - kubernetes_bootstrap
+      delegate_to: localhost
+      become: false
+      changed_when: false

@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import shutil
 import socket
+import sys
 
 import yaml
 
@@ -264,6 +265,7 @@ def main(argv=None):
     variables = {
         **d.get("ansible_vars", {}),
         "synthran_root": str(Path.cwd()),
+        "synthran_controller_python": sys.executable,
         "synthran_execution_root": str(context.resolve()),
         "synthran_execution_reference_file": str(
             (context / "reference/EXECUTION_REFERENCE.json").resolve()

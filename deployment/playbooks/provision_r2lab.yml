@@ -13,8 +13,40 @@
 - name: Power ON RRU on R2Lab
   hosts: faraday
   gather_facts: false
+  pre_tasks:
+    - name: Start R2Lab RRU setup phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - r2lab_rru_setup
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+      when: platform == 'r2lab'
   roles:
     - role: r2lab/rru
+      when: platform == 'r2lab'
+  post_tasks:
+    - name: Finish R2Lab RRU setup phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - r2lab_rru_setup
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
       when: platform == 'r2lab'
 
 - name: Prepare selected UEs on R2Lab
@@ -22,6 +54,22 @@
   gather_facts: false
   any_errors_fatal: true
   tasks:
+    - name: Start R2Lab UE setup phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - ue_setup
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+      when: platform == 'r2lab'
+
     - name: Resolve the run-scoped nested SSH trust directory
       ansible.builtin.set_fact:
         synthran_nested_ssh_dir: "/tmp/synthran-ssh-{{ run_dir | basename }}"
@@ -57,4 +105,20 @@
           environment:
             PATH: "{{ synthran_nested_ssh_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             SYNTHRAN_SSH_KNOWN_HOSTS: "{{ synthran_nested_ssh_dir }}/known_hosts"
+      when: platform == 'r2lab'
+
+    - name: Finish R2Lab UE setup phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - ue_setup
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
       when: platform == 'r2lab'

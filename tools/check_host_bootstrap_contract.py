@@ -216,6 +216,8 @@ def main() -> None:
         "Verify preserved NetworkAttachmentDefinition API",
     }
     shared_tasks = {
+        "Start Kubernetes bootstrap phase timing",
+        "Finish Kubernetes bootstrap phase timing",
         "Read the effective containerd mount",
         "Read CNI DHCP daemon state",
         "Read registered Kubernetes nodes",

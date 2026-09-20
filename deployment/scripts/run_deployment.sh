@@ -62,13 +62,30 @@ fi
 
 record_exit() {
   local original_status=$?
+  local timing_status=0
   local safety_status=0
   local status=$original_status
+  local timing_closure_status=incomplete
+  local timing_reason="controller exited with an unfinished deployment phase"
   trap - EXIT
+
+  if (( original_status != 0 )); then
+    timing_closure_status=failed
+    timing_reason="controller exited with status $original_status"
+  fi
+  if [[ -d "$RUN_DIR" ]]; then
+    "$SYNTHRAN_PYTHON" -m synthran.phase_timing close-open \
+      --run-dir "$RUN_DIR" \
+      --status "$timing_closure_status" \
+      --reason "$timing_reason" || timing_status=$?
+  fi
 
   if [[ -n "${SYNTHRAN_PRIVATE_DIR:-}" && -d "$RUN_DIR" ]]; then
     "$SYNTHRAN_PYTHON" -m synthran.result_safety \
       --run-dir "$RUN_DIR" --private-dir "$SYNTHRAN_PRIVATE_DIR" || safety_status=$?
+  fi
+  if (( status == 0 && timing_status != 0 )); then
+    status=$timing_status
   fi
   if (( status == 0 && safety_status != 0 )); then
     status=$safety_status
@@ -247,9 +264,13 @@ if [[ "$ACCEPTANCE_REPLACED" != true ]]; then
 fi
 
 echo "Running path-specific accepted-testbed UE/session/user-plane verification."
+"$SYNTHRAN_PYTHON" -m synthran.phase_timing start \
+  --run-dir "$RUN_DIR" --phase verification
 ACCEPTANCE_ANSIBLE_RC=0
 run_step "${ACCEPTANCE_COMMAND[@]}" </dev/null >>"$RUN_DIR/ansible.log" 2>&1 || ACCEPTANCE_ANSIBLE_RC=$?
 if (( ACCEPTANCE_ANSIBLE_RC != 0 )); then
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase verification --status failed || true
   echo "Accepted-testbed live verification failed with status $ACCEPTANCE_ANSIBLE_RC; deployment was not published for reuse." >&2
   mark_failed "accepted-testbed-probe" "$ACCEPTANCE_ANSIBLE_RC" "path-specific UE/session/user-plane verification failed"
   collect_failure_diagnostics "accepted-testbed live verification failure"
@@ -266,11 +287,16 @@ run_step "$SYNTHRAN_PYTHON" -m synthran.acceptance accept \
   --endpoint "$ACTIVE_DEPLOYMENT_ENDPOINT" \
   --private-dir "$SYNTHRAN_PRIVATE_DIR" || ACCEPT_RC=$?
 if (( ACCEPT_RC != 0 )); then
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase verification --status failed || true
   echo "Accepted-testbed validation failed with status $ACCEPT_RC; deployment was not published for reuse." >&2
   mark_failed "accepted-testbed" "$ACCEPT_RC" "fresh selected workload/UE/user-plane acceptance failed"
   collect_failure_diagnostics "accepted-testbed rejection"
   exit "$ACCEPT_RC"
 fi
+
+"$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+  --run-dir "$RUN_DIR" --phase verification
 
 echo "State: accepted-testbed."
 echo "Accepted deployment endpoint: $ACTIVE_DEPLOYMENT_ENDPOINT"

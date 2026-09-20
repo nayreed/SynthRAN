@@ -822,6 +822,8 @@ PY
 
   R2LAB_END=$(TZ=Europe/Paris date -d "@$R2LAB_END_EPOCH" +'%Y-%m-%dT%H:%M')
   echo "Resolving provider-backed R2Lab coverage for $R2LAB_START to $R2LAB_END"
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing start \
+    --run-dir "$RUN_DIR" --phase reservation --scope r2lab
   if ! printf '%s\n' "${R2LAB_PASSWORD:-}" | \
     "$SYNTHRAN_PYTHON" deployment/scripts/reserve_r2lab.py \
       --host "$R2LAB_HOST" \
@@ -833,9 +835,13 @@ PY
       --end "$R2LAB_END" \
       --output "$RUN_DIR/r2lab-lease.json" \
       --log "$RUN_DIR/r2lab-reservation.log"; then
+    "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+      --run-dir "$RUN_DIR" --phase reservation --scope r2lab --status failed || true
     echo "R2Lab reservation/coverage verification failed; the separate SOP allocation was left intact" >&2
     exit 1
   fi
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase reservation --scope r2lab
 fi
 
 deployment_section "Preparing Ansible dependencies"

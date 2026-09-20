@@ -328,7 +328,9 @@ def allocation_probe_output_checks() -> dict[str, str]:
         reservation.run = Fake(already_allocated)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            state = reservation._probe_allocation_for_fresh("sopnode-f3")
+            state = reservation._probe_allocation_for_fresh(
+                "sopnode-f3", result_folder="ci-probe"
+            )
         captured = out.getvalue()
         assert state == "already-active"
         assert "existing allocation detected" in captured
@@ -342,7 +344,9 @@ def allocation_probe_output_checks() -> dict[str, str]:
 
         reservation.run = Fake(real_failure)
         expect_error(
-            lambda: reservation._probe_allocation_for_fresh("sopnode-f3"),
+            lambda: reservation._probe_allocation_for_fresh(
+                "sopnode-f3", result_folder="ci-probe"
+            ),
             "provider unavailable",
         )
         return {
@@ -447,6 +451,231 @@ def preparation_checks() -> dict[str, str]:
             os.environ.pop("SYNTHRAN_POS_READY_INTERVAL_SECONDS", None)
         else:
             os.environ["SYNTHRAN_POS_READY_INTERVAL_SECONDS"] = old_interval
+
+
+
+def allocation_reuse_checks() -> dict[str, str]:
+    original = reservation.run
+    original_state = reservation.STATE_PATH
+    state_tmp = tempfile.TemporaryDirectory(prefix="synthran-allocation-reuse-")
+    reservation.STATE_PATH = Path(state_tmp.name) / "pos-reservation.json"
+    old_attempts = os.environ.get("SYNTHRAN_POS_READY_ATTEMPTS")
+    old_interval = os.environ.get("SYNTHRAN_POS_READY_INTERVAL_SECONDS")
+    os.environ["SYNTHRAN_POS_READY_ATTEMPTS"] = "1"
+    os.environ["SYNTHRAN_POS_READY_INTERVAL_SECONDS"] = "0"
+    node = "sopnode-f3"
+    authority = {
+        "managed_by": "synthran",
+        "event_id": "42",
+        "owner": "ci-user",
+        "nodes": [node],
+        "allocation_result_folder": "synthran-ci-token",
+        "allocations": {
+            node: {
+                "id": "alloc-42",
+                "result_folder": "synthran-ci-token",
+            }
+        },
+    }
+    reservation._write_json(reservation.STATE_PATH, authority)
+    try:
+        def matching(argv, _stdin, _n):
+            if argv[:3] == ["pos", "allocations", "allocate"]:
+                assert argv[3:5] == ["--result-folder", "synthran-ci-token"]
+                assert argv[-1] == node
+                return done(argv, rc=1, err=f"Nodes are already allocated: {node}")
+            if argv == ["pos", "allocations", "show", node]:
+                return done(argv, out=json.dumps({"id": "alloc-42"}))
+            if argv == ["pos", "allocations", "show", "alloc-42"]:
+                return done(
+                    argv,
+                    out=json.dumps({"result_folder": "synthran-ci-token"}),
+                )
+            if argv[:3] in (
+                ["pos", "nodes", "image"],
+                ["pos", "nodes", "bootparameter"],
+                ["pos", "nodes", "reset"],
+            ) or argv[0] == "ssh":
+                return done(argv)
+            raise CheckError(f"unexpected managed-reuse command {argv}")
+
+        reuse = Fake(matching)
+        reservation.run = reuse
+        result = reservation.prepare_hosts(
+            {"host_preparation": "fresh", "image": "configured-image"},
+            selected=[node],
+            calendar={
+                "status": "reused",
+                "id": "42",
+                "owner": "ci-user",
+                "nodes": [node],
+            },
+            allocation_authority=json.loads(json.dumps(authority)),
+        )
+        record = result["nodes"][node]
+        assert record["allocation"] == "managed-existing"
+        assert record["allocation_id"] == "alloc-42"
+        assert not any(
+            call["argv"][:4] == ["pos", "allocations", "free", "-k"]
+            for call in reuse.calls
+        )
+
+        reclaimed = False
+
+        def mismatch(argv, _stdin, _n):
+            nonlocal reclaimed
+            if argv[:3] == ["pos", "allocations", "allocate"]:
+                assert argv[3:5] == ["--result-folder", "synthran-ci-token"]
+                if not reclaimed:
+                    return done(argv, rc=1, err=f"Nodes are already allocated: {node}")
+                return done(argv, out="allocated\n")
+            if argv[:4] == ["pos", "allocations", "free", "-k"]:
+                reclaimed = True
+                return done(argv)
+            if argv == ["pos", "allocations", "show", node]:
+                return done(
+                    argv,
+                    out=json.dumps({"id": "alloc-new" if reclaimed else "alloc-other"}),
+                )
+            if argv == ["pos", "allocations", "show", "alloc-other"]:
+                return done(
+                    argv,
+                    out=json.dumps({"result_folder": "someone-else"}),
+                )
+            if argv == ["pos", "allocations", "show", "alloc-new"]:
+                return done(
+                    argv,
+                    out=json.dumps({"result_folder": "synthran-ci-token"}),
+                )
+            if argv[:3] in (
+                ["pos", "nodes", "image"],
+                ["pos", "nodes", "bootparameter"],
+                ["pos", "nodes", "reset"],
+            ) or argv[0] == "ssh":
+                return done(argv)
+            raise CheckError(f"unexpected mismatched-allocation command {argv}")
+
+        stale = Fake(mismatch)
+        reservation.run = stale
+        stale_authority = json.loads(json.dumps(authority))
+        reservation._write_json(reservation.STATE_PATH, stale_authority)
+        result = reservation.prepare_hosts(
+            {"host_preparation": "fresh", "image": "configured-image"},
+            selected=[node],
+            calendar={
+                "status": "reused",
+                "id": "42",
+                "owner": "ci-user",
+                "nodes": [node],
+            },
+            allocation_authority=stale_authority,
+        )
+        record = result["nodes"][node]
+        assert record["allocation"] == "reclaimed"
+        assert record["allocation_id"] == "alloc-new"
+        assert sum(
+            call["argv"][:4] == ["pos", "allocations", "free", "-k"]
+            for call in stale.calls
+        ) == 1
+        assert stale_authority["allocations"][node]["id"] == "alloc-new"
+
+        # Direct callers have no retained calendar identity and must therefore
+        # never reuse an already-active allocation from metadata alone.
+        direct_allocations = 0
+
+        def direct(argv, _stdin, _n):
+            nonlocal direct_allocations
+            if argv[:3] == ["pos", "allocations", "allocate"]:
+                direct_allocations += 1
+                if direct_allocations == 1:
+                    return done(argv, rc=1, err=f"Nodes are already allocated: {node}")
+                return done(argv)
+            if argv[:4] == ["pos", "allocations", "free", "-k"]:
+                return done(argv)
+            if argv[:3] in (
+                ["pos", "nodes", "image"],
+                ["pos", "nodes", "bootparameter"],
+                ["pos", "nodes", "reset"],
+            ) or argv[0] == "ssh":
+                return done(argv)
+            if argv[:3] == ["pos", "allocations", "show"]:
+                raise CheckError("direct caller attempted managed allocation reuse")
+            raise CheckError(f"unexpected direct-allocation command {argv}")
+
+        direct_fake = Fake(direct)
+        reservation.run = direct_fake
+        direct_result = reservation.prepare_hosts(
+            {"host_preparation": "fresh", "image": "configured-image"},
+            selected=[node],
+            calendar={"status": "required-existing"},
+        )
+        assert direct_result["nodes"][node]["allocation"] == "reclaimed"
+        assert sum(
+            call["argv"][:4] == ["pos", "allocations", "free", "-k"]
+            for call in direct_fake.calls
+        ) == 1
+
+        return {
+            "provider_identity_reuse": "passed",
+            "mismatch_reclaims": "passed",
+            "direct_call_fail_closed": "passed",
+        }
+    finally:
+        reservation.run = original
+        reservation.STATE_PATH = original_state
+        state_tmp.cleanup()
+        if old_attempts is None:
+            os.environ.pop("SYNTHRAN_POS_READY_ATTEMPTS", None)
+        else:
+            os.environ["SYNTHRAN_POS_READY_ATTEMPTS"] = old_attempts
+        if old_interval is None:
+            os.environ.pop("SYNTHRAN_POS_READY_INTERVAL_SECONDS", None)
+        else:
+            os.environ["SYNTHRAN_POS_READY_INTERVAL_SECONDS"] = old_interval
+
+
+def managed_state_checks() -> dict[str, str]:
+    original_state = reservation.STATE_PATH
+    try:
+        with tempfile.TemporaryDirectory(prefix="synthran-pos-state-") as value:
+            reservation.STATE_PATH = Path(value) / "pos-reservation.json"
+            roles = {"core": "sopnode-f2", "ran": "sopnode-f3", "broker": "sopnode-f2"}
+            calendar = {
+                "status": "created",
+                "id": "42",
+                "owner": "ci-user",
+                "nodes": ["sopnode-f2", "sopnode-f3"],
+                "start": "2026-09-20T08:00:00+00:00",
+                "end": "2026-09-20T10:00:00+00:00",
+            }
+            first = reservation._save_state(calendar, roles)
+            token = first["allocation_result_folder"]
+            first["allocations"]["sopnode-f2"] = {
+                "id": "alloc-42",
+                "result_folder": token,
+            }
+            reservation._write_json(reservation.STATE_PATH, first)
+
+            same = reservation._save_state(
+                dict(calendar, status="reused"),
+                roles,
+            )
+            assert same["allocation_result_folder"] == token
+            assert same["allocations"]["sopnode-f2"]["id"] == "alloc-42"
+
+            changed = reservation._save_state(
+                dict(calendar, id="43", status="created"),
+                roles,
+            )
+            assert changed["allocation_result_folder"] != token
+            assert changed["allocations"] == {}
+
+        return {
+            "same_calendar_retains_allocation_identity": "passed",
+            "new_calendar_rotates_allocation_identity": "passed",
+        }
+    finally:
+        reservation.STATE_PATH = original_state
 
 
 def load_r2lab():
@@ -640,6 +869,8 @@ def main() -> int:
         "provider": provider_checks(),
         "pos_calendar": pos_checks(),
         "allocation_probe_output": allocation_probe_output_checks(),
+        "allocation_reuse": allocation_reuse_checks(),
+        "managed_state": managed_state_checks(),
         "host_preparation": preparation_checks(),
         "r2lab": r2lab_checks(),
         "noninteractive": no_input_checks(),

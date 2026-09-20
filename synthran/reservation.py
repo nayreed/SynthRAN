@@ -5,6 +5,7 @@ import json
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -13,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from . import phase_timing
 from .host_preparation import BOOTSTRAP, validate_preparation_mode
 
 
@@ -468,30 +470,101 @@ def _allocation_state(node: str, result: subprocess.CompletedProcess[str]) -> st
     raise ReservationError(f"POS allocation failed for {node}: {text or result.returncode}")
 
 
-def _probe_allocation_for_fresh(node: str) -> str:
+def _allocation_command(node: str, result_folder: str) -> list[str]:
+    return [
+        "pos",
+        "allocations",
+        "allocate",
+        "--result-folder",
+        result_folder,
+        node,
+    ]
+
+
+def _live_allocation_record(node: str) -> dict[str, str] | None:
+    """Return provider-backed allocation identity when POS exposes it.
+
+    SLICES documents pos allocations show <node> for resolving the live
+    allocation id and pos allocations show <id> for the result folder.
+    This metadata is an optimization proof only: inability to read it never
+    weakens the normal reclaim/reacquire safety path.
+    """
+
+    shown = run(["pos", "allocations", "show", node], check=False)
+    if shown.returncode or not shown.stdout.strip():
+        return None
+    try:
+        node_record = json.loads(shown.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(node_record, dict):
+        return None
+    allocation_id = str(node_record.get("id", "")).strip()
+    if not allocation_id:
+        return None
+
+    detail = run(["pos", "allocations", "show", allocation_id], check=False)
+    if detail.returncode or not detail.stdout.strip():
+        return None
+    try:
+        allocation_record = json.loads(detail.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(allocation_record, dict):
+        return None
+    result_folder = str(allocation_record.get("result_folder", "")).strip()
+    if not result_folder:
+        return None
+    return {
+        "id": allocation_id,
+        "result_folder": result_folder,
+    }
+
+
+def _managed_allocation_matches(
+    node: str,
+    *,
+    expected: Mapping[str, Any] | None,
+    result_folder: str,
+) -> dict[str, str] | None:
+    if not isinstance(expected, Mapping):
+        return None
+    expected_id = str(expected.get("id", "")).strip()
+    expected_folder = str(expected.get("result_folder", "")).strip()
+    if not expected_id or expected_folder != result_folder:
+        return None
+    live = _live_allocation_record(node)
+    if live is None:
+        return None
+    if live["id"] != expected_id or live["result_folder"] != expected_folder:
+        return None
+    return live
+
+
+def _probe_allocation_for_fresh(node: str, *, result_folder: str) -> str:
     print(f"[POS allocation] Probing {node}", flush=True)
     # POS logs a provider-level ERROR before returning its expected
     # "already allocated" state. Capture the probe so that known existing
     # allocation state is classified here instead of emitted as a false-red
     # operator error. Real failures are still surfaced by _allocation_state().
-    result = run(["pos", "allocations", "allocate", node], check=False)
+    result = run(_allocation_command(node, result_folder), check=False)
     state = _allocation_state(node, result)
     if state == "new":
         print(f"[POS allocation] {node}: fresh allocation acquired", flush=True)
     else:
         print(
-            f"[POS allocation] {node}: existing allocation detected; fresh preparation will "
-            "reclaim it only after every selected SOP node has been probed",
+            f"[POS allocation] {node}: existing allocation detected; ownership "
+            "will be checked against retained provider-backed SynthRAN evidence",
             flush=True,
         )
     return state
 
 
-def _reclaim_allocation_for_fresh(node: str) -> str:
-    print(f"[POS allocation] {node}: reclaiming existing allocation", flush=True)
+def _reclaim_allocation_for_fresh(node: str, *, result_folder: str) -> str:
+    print(f"[POS allocation] {node}: reclaiming unproven existing allocation", flush=True)
     released = run_visible(["pos", "allocations", "free", "-k", node], check=False)
     print(f"[POS allocation] {node}: requesting fresh allocation after reclaim", flush=True)
-    retry = run_visible(["pos", "allocations", "allocate", node], check=False)
+    retry = run_visible(_allocation_command(node, result_folder), check=False)
     retry_state = _allocation_state(node, retry)
     if retry_state != "new":
         detail = _output(retry) or _output(released)
@@ -503,12 +576,12 @@ def _reclaim_allocation_for_fresh(node: str) -> str:
     return "reclaimed"
 
 
-def _allocate_for_fresh(node: str) -> str:
+def _allocate_for_fresh(node: str, *, result_folder: str) -> str:
     """Compatibility helper for callers that prepare a single node."""
-    state = _probe_allocation_for_fresh(node)
+    state = _probe_allocation_for_fresh(node, result_folder=result_folder)
     if state == "new":
         return state
-    return _reclaim_allocation_for_fresh(node)
+    return _reclaim_allocation_for_fresh(node, result_folder=result_folder)
 
 
 def _boot_parameters(node: str) -> tuple[str, str]:
@@ -567,12 +640,15 @@ def _prepare_fresh_node(
     node: str,
     *,
     allocation: str,
+    allocation_id: str | None,
     image: str,
     stop_event: threading.Event,
+    timing_run_dir: Path | None,
 ) -> dict[str, Any]:
     boot_profile, boot_parameters = _boot_parameters(node)
     record: dict[str, Any] = {
         "allocation": allocation,
+        "allocation_id": allocation_id,
         "image": image,
         "boot_profile": boot_profile,
         "status": "preparing",
@@ -593,7 +669,27 @@ def _prepare_fresh_node(
             "take several minutes",
             flush=True,
         )
-        run_visible(["pos", "nodes", "image", "--staging", node, image])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "image", "--staging", node, image])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_image_staging",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_image_staging",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("image-staging")
         print(f"[POS prepare] {node}: image staging completed", flush=True)
 
@@ -603,7 +699,27 @@ def _prepare_fresh_node(
             f"[POS prepare] {node}: applying boot parameters ({boot_profile})",
             flush=True,
         )
-        run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "boot_parameter_mutation",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "boot_parameter_mutation",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("boot-parameters")
         print(f"[POS prepare] {node}: boot parameters applied", flush=True)
 
@@ -614,14 +730,54 @@ def _prepare_fresh_node(
             "returns only after POS reports reset completion",
             flush=True,
         )
-        run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_reset",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_reset",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("reset")
         record["reset"] = "blocking"
         print(f"[POS prepare] {node}: POS reset completed", flush=True)
 
         phase = "ssh-readiness"
         stop_if_peer_failed("ssh-readiness")
-        ready_attempt = _wait_for_ssh(node)
+        timing = phase_timing.capture_start()
+        try:
+            ready_attempt = _wait_for_ssh(node)
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "ssh_readiness",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "ssh_readiness",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("ssh-readiness")
         record["ssh_ready_attempt"] = ready_attempt
         record["status"] = "ready"
@@ -644,6 +800,8 @@ def prepare_hosts(
     *,
     selected: Sequence[str],
     calendar: Mapping[str, Any],
+    allocation_authority: dict[str, Any] | None = None,
+    timing_run_dir: Path | None = None,
 ) -> dict[str, Any]:
     try:
         mode = validate_preparation_mode(reservation.get("host_preparation", ""))
@@ -693,13 +851,70 @@ def prepare_hosts(
         "Preparing selected SOP nodes: first proving allocation authority for every node before image/reset mutation",
         flush=True,
     )
+    allocation_authority = allocation_authority or {}
+    persisted_allocation_authority = _read_managed_state()
+    persistent_allocation_authority = (
+        bool(str(allocation_authority.get("event_id", "")).strip())
+        and _same_calendar_authority(allocation_authority, calendar)
+        and persisted_allocation_authority == allocation_authority
+    )
+    result_folder = str(
+        allocation_authority.get("allocation_result_folder", "")
+    ).strip()
+    if not result_folder:
+        # Direct/library callers that bypass execute() still receive a unique
+        # provider result folder, but cannot claim cross-run reuse authority.
+        result_folder = "synthran-" + secrets.token_hex(12)
+
+    retained_allocations = allocation_authority.get("allocations")
+    if not isinstance(retained_allocations, Mapping):
+        retained_allocations = {}
+
     allocation_states: dict[str, str] = {}
+    allocation_records: dict[str, dict[str, str]] = {}
     for node in selected:
-        allocation_states[node] = _probe_allocation_for_fresh(node)
+        state = _probe_allocation_for_fresh(node, result_folder=result_folder)
+        allocation_states[node] = state
+        if state == "new" and persistent_allocation_authority:
+            live = _live_allocation_record(node)
+            if live is not None and live.get("result_folder") == result_folder:
+                allocation_records[node] = live
+                _record_managed_allocation(allocation_authority, node, live)
 
     for node in selected:
-        if allocation_states[node] == "already-active":
-            allocation_states[node] = _reclaim_allocation_for_fresh(node)
+        if allocation_states[node] != "already-active":
+            continue
+        live = (
+            _managed_allocation_matches(
+                node,
+                expected=retained_allocations.get(node),
+                result_folder=result_folder,
+            )
+            if persistent_allocation_authority
+            else None
+        )
+        if live is not None:
+            allocation_states[node] = "managed-existing"
+            allocation_records[node] = live
+            print(
+                f"[POS allocation] {node}: provider allocation {live['id']} matches "
+                "retained SynthRAN authority; skipping release/reacquire",
+                flush=True,
+            )
+            continue
+
+        allocation_states[node] = _reclaim_allocation_for_fresh(
+            node,
+            result_folder=result_folder,
+        )
+        live = (
+            _live_allocation_record(node)
+            if persistent_allocation_authority
+            else None
+        )
+        if live is not None and live.get("result_folder") == result_folder:
+            allocation_records[node] = live
+            _record_managed_allocation(allocation_authority, node, live)
 
     print(
         "Allocation authority proven for all selected SOP nodes; preparing independent nodes concurrently",
@@ -707,7 +922,7 @@ def prepare_hosts(
     )
 
     for node in selected:
-        if allocation_states[node] not in {"new", "reclaimed"}:
+        if allocation_states[node] not in {"new", "reclaimed", "managed-existing"}:
             raise ReservationError(
                 f"internal allocation state for {node} is not safe to prepare: "
                 f"{allocation_states[node]}"
@@ -726,8 +941,10 @@ def prepare_hosts(
                 _prepare_fresh_node,
                 node,
                 allocation=allocation_states[node],
+                allocation_id=allocation_records.get(node, {}).get("id"),
                 image=image,
                 stop_event=stop_event,
+                timing_run_dir=timing_run_dir,
             ): node
             for node in selected
         }
@@ -743,6 +960,7 @@ def prepare_hosts(
         if future.cancelled():
             node_records[node] = {
                 "allocation": allocation_states[node],
+                "allocation_id": allocation_records.get(node, {}).get("id"),
                 "image": image,
                 "boot_profile": _boot_parameters(node)[0],
                 "status": "cancelled-after-peer-failure",
@@ -770,21 +988,91 @@ def prepare_hosts(
     }
 
 
-def _save_state(calendar: Mapping[str, Any], role_nodes: Mapping[str, str]) -> None:
-    if calendar.get("status") == "disabled":
-        return
-    _write_json(
-        STATE_PATH,
-        {
-            "managed_by": "synthran",
-            "event_id": str(calendar.get("id", "")),
-            "owner": str(calendar.get("owner", "")),
-            "nodes": list(calendar.get("nodes", [])),
-            "roles": dict(role_nodes),
-            "start": str(calendar.get("start", "")),
-            "end": str(calendar.get("end", "")),
-        },
+def _read_managed_state() -> dict[str, Any]:
+    try:
+        value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _same_calendar_authority(
+    state: Mapping[str, Any],
+    calendar: Mapping[str, Any],
+) -> bool:
+    if not state or calendar.get("status") == "disabled":
+        return False
+    state_nodes = state.get("nodes")
+    calendar_nodes = calendar.get("nodes")
+    return (
+        state.get("managed_by") == "synthran"
+        and str(state.get("event_id", "")) == str(calendar.get("id", ""))
+        and str(state.get("owner", "")) == str(calendar.get("owner", ""))
+        and isinstance(state_nodes, list)
+        and isinstance(calendar_nodes, list)
+        and set(map(str, state_nodes)) == set(map(str, calendar_nodes))
     )
+
+
+def _save_state(
+    calendar: Mapping[str, Any],
+    role_nodes: Mapping[str, str],
+) -> dict[str, Any]:
+    if calendar.get("status") == "disabled":
+        return {}
+
+    previous = _read_managed_state()
+    if _same_calendar_authority(previous, calendar):
+        result_folder = str(previous.get("allocation_result_folder", "")).strip()
+        allocations = previous.get("allocations")
+        if not isinstance(allocations, dict):
+            allocations = {}
+    else:
+        result_folder = ""
+        allocations = {}
+
+    if not result_folder:
+        result_folder = "synthran-" + secrets.token_hex(12)
+
+    state: dict[str, Any] = {
+        "managed_by": "synthran",
+        "event_id": str(calendar.get("id", "")),
+        "owner": str(calendar.get("owner", "")),
+        "nodes": list(calendar.get("nodes", [])),
+        "roles": dict(role_nodes),
+        "start": str(calendar.get("start", "")),
+        "end": str(calendar.get("end", "")),
+        "allocation_result_folder": result_folder,
+        "allocations": allocations,
+    }
+    _write_json(STATE_PATH, state)
+    try:
+        STATE_PATH.chmod(0o600)
+    except OSError:
+        pass
+    return state
+
+
+def _record_managed_allocation(
+    authority: dict[str, Any],
+    node: str,
+    live: Mapping[str, Any] | None,
+) -> None:
+    if not authority or live is None:
+        return
+    allocations = authority.setdefault("allocations", {})
+    if not isinstance(allocations, dict):
+        allocations = {}
+        authority["allocations"] = allocations
+    allocations[node] = {
+        "id": str(live.get("id", "")),
+        "result_folder": str(live.get("result_folder", "")),
+    }
+    _write_json(STATE_PATH, authority)
+    try:
+        STATE_PATH.chmod(0o600)
+    except OSError:
+        pass
 
 
 def execute(config_path: Path, run_dir: Path) -> dict[str, Any]:
@@ -815,20 +1103,44 @@ def execute(config_path: Path, run_dir: Path) -> dict[str, Any]:
     _write_json(evidence_path, evidence)
 
     try:
-        evidence["provider"] = provider_context(provider)
-        _write_json(evidence_path, evidence)
+        reservation_timing = phase_timing.capture_start()
+        try:
+            evidence["provider"] = provider_context(provider)
+            _write_json(evidence_path, evidence)
 
-        now = dt.datetime.now().astimezone()
-        owner = _owner()
-        calendar = acquire_calendar(
-            reservation, selected=selected, owner=owner, now=now
-        )
+            now = dt.datetime.now().astimezone()
+            owner = _owner()
+            calendar = acquire_calendar(
+                reservation, selected=selected, owner=owner, now=now
+            )
+        except Exception:
+            phase_timing.record_interval(
+                run_dir,
+                "reservation",
+                scope="sop",
+                started=reservation_timing,
+                status="failed",
+                details={"mode": str(reservation.get("mode", ""))},
+            )
+            raise
+        else:
+            phase_timing.record_interval(
+                run_dir,
+                "reservation",
+                scope="sop",
+                started=reservation_timing,
+                details={"mode": str(reservation.get("mode", ""))},
+            )
         evidence["pos_calendar"] = calendar
-        _save_state(calendar, role_nodes)
+        allocation_authority = _save_state(calendar, role_nodes)
         _write_json(evidence_path, evidence)
 
         evidence["host_preparation"] = prepare_hosts(
-            reservation, selected=selected, calendar=calendar
+            reservation,
+            selected=selected,
+            calendar=calendar,
+            allocation_authority=allocation_authority,
+            timing_run_dir=run_dir,
         )
         evidence["status"] = "ready"
         evidence["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
