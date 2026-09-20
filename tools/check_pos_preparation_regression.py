@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from typing import Any
 
 from synthran import reservation
@@ -225,6 +226,7 @@ def independent_fresh_preparation_overlaps() -> None:
 def parallel_failure_retains_per_node_evidence() -> None:
     selected = ["sopnode-f2", "sopnode-f3"]
     image_barrier = threading.Barrier(2, timeout=10)
+    failed_image_returned = threading.Event()
 
     def handler(argv: list[str], _n: int):
         if argv[:3] == ["pos", "allocations", "allocate"]:
@@ -236,7 +238,13 @@ def parallel_failure_retains_per_node_evidence() -> None:
                 raise CheckError("parallel failure fixture never reached both image workers") from exc
             node = argv[-2]
             if node == "sopnode-f2":
+                failed_image_returned.set()
                 return done(argv, rc=9, err="synthetic image failure")
+            if not failed_image_returned.wait(timeout=5):
+                raise CheckError("peer image failure was not released in the fixture")
+            # Let the failing worker propagate its error and set the shared
+            # stop signal before this worker crosses the next phase boundary.
+            time.sleep(0.05)
             return done(argv)
         if argv[:3] in (
             ["pos", "nodes", "bootparameter"],
@@ -268,8 +276,12 @@ def parallel_failure_retains_per_node_evidence() -> None:
                 raise CheckError(f"failed node evidence is incomplete: {failed}")
             if "synthetic image failure" not in failed.get("failure", {}).get("message", ""):
                 raise CheckError(f"failed node provider error was lost: {failed}")
-            if sibling.get("status") != "ready":
-                raise CheckError(f"independent sibling did not finish cleanly: {sibling}")
+            if sibling.get("status") != "cancelled-after-peer-failure":
+                raise CheckError(f"peer did not stop after selected-node failure: {sibling}")
+            if sibling.get("completed_phases") != ["image-staging"]:
+                raise CheckError(f"peer crossed too many phases after failure: {sibling}")
+            if sibling.get("cancelled_before_phase") != "boot-parameters":
+                raise CheckError(f"peer cancellation boundary is wrong: {sibling}")
         else:
             raise CheckError("expected parallel fresh preparation failure")
     finally:
