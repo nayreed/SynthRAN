@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from .host_preparation import BOOTSTRAP, PREPARATION_MODES, validate_preparation_mode
+from .host_preparation import BOOTSTRAP, validate_preparation_mode
 
 
 STATE_PATH = Path(".synthran/pos-reservation.json")
