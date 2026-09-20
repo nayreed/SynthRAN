@@ -7,8 +7,8 @@ import argparse
 import json
 import os
 from pathlib import Path
-import subprocess
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +20,7 @@ from synthran.experiments import load_scenario, remap_gateways, scientific_setti
 from synthran.scenario import load_scenario as load_testbed
 from synthran.testbed_attachment import (
     attach_active_deployment,
+    prove_experiment_eligible,
     requirements_from_deployment,
 )
 
@@ -27,7 +28,7 @@ EXPERIMENT_ANSIBLE = ROOT / "synthran/experiment_runtime/ansible"
 
 
 def _attachment(requirements: dict | None = None) -> dict:
-    """Resolve the accepted deployment without mutating its authority state."""
+    """Resolve historical accepted-testbed state without mutating authority state."""
 
     return attach_active_deployment(requirements)
 
@@ -43,7 +44,7 @@ def _active_private_dir(
         and attachment["deployment_hash"] != expected_deployment_hash
     ):
         raise ValueError(
-            "the active deployment changed after experiment preparation; "
+            "the accepted deployment changed after experiment preparation; "
             "refusing to attach the experiment to different infrastructure"
         )
     private = Path(attachment["private_execution_dir"]).resolve()
@@ -188,12 +189,25 @@ def prepare(
     (run / "experiment-vars.yml").write_text(yaml.safe_dump(variables, sort_keys=False))
 
 
-def _run_playbook(run: Path, playbook: Path) -> None:
+def _run_playbook(
+    run: Path,
+    playbook: Path,
+    *,
+    private: Path | None = None,
+    extra_vars_file: Path | None = None,
+) -> None:
+    if private is None:
+        private = _active_private_dir(
+            expected_deployment_hash=_expected_attachment_hash(run)
+        )
+    else:
+        private = private.resolve()
+        os.environ["SYNTHRAN_PRIVATE_DIR"] = str(private)
+
     environment = dict(os.environ)
-    environment["ANSIBLE_CONFIG"] = str(ROOT / "deployment/ansible.cfg")
-    environment["ANSIBLE_ROLES_PATH"] = str(EXPERIMENT_ANSIBLE / "roles")
-    private = _active_private_dir(
-        expected_deployment_hash=_expected_attachment_hash(run)
+    environment["ANSIBLE_CONFIG"] = str(private / "ansible/ansible.cfg")
+    environment["ANSIBLE_ROLES_PATH"] = os.pathsep.join(
+        [str(EXPERIMENT_ANSIBLE / "roles"), str(private / "ansible/roles")]
     )
     environment["SYNTHRAN_PRIVATE_DIR"] = str(private)
     secrets_file = private / "experiment-secrets.yml"
@@ -205,20 +219,65 @@ def _run_playbook(run: Path, playbook: Path) -> None:
         "-i",
         str(private / "inventory.yml"),
         "-e",
-        "@" + str(ROOT / "deployment/group_vars/all/all.yml"),
+        "@" + str(private / "ansible/group_vars/all/all.yml"),
         "-e",
         "@" + str(private / "deployment-vars.yml"),
         "-e",
         "@" + str(run / "experiment-vars.yml"),
         "-e",
         "@" + str(secrets_file),
-        str(playbook),
     ]
+    if extra_vars_file is not None:
+        command.extend(["-e", "@" + str(extra_vars_file)])
+    command.append(str(playbook))
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
 
 
+def _refresh_experiment_eligibility(run: Path) -> dict:
+    expected_hash = _expected_attachment_hash(run)
+    attachment = _attachment({"deployment_hash": expected_hash})
+    private = Path(attachment["private_execution_dir"]).resolve()
+    evidence = run / "experiment-eligibility-evidence.json"
+    cluster = run / "experiment-eligibility-cluster.json"
+    variables = {
+        "run_dir": str(run),
+        "synthran_live_evidence_file": str(evidence.resolve()),
+        "synthran_live_cluster_file": str(cluster.resolve()),
+    }
+    vars_file = run / "experiment-eligibility-vars.yml"
+    vars_file.write_text(yaml.safe_dump(variables, sort_keys=False), encoding="utf-8")
+    _run_playbook(
+        run,
+        private / "ansible/playbooks/verify_live_testbed.yml",
+        private=private,
+        extra_vars_file=vars_file,
+    )
+    eligible = prove_experiment_eligible(
+        evidence,
+        {"deployment_hash": expected_hash},
+        attachment=attachment,
+        cluster_snapshot_path=cluster,
+        max_age_seconds=120,
+    )
+    snapshot = {
+        key: value
+        for key, value in eligible.items()
+        if key != "private_execution_dir"
+    }
+    (run / "experiment-eligible.json").write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return eligible
+
+
 def run_workload(run: Path) -> None:
-    _run_playbook(run, EXPERIMENT_ANSIBLE / "playbooks/mqtt.yml")
+    eligible = _refresh_experiment_eligibility(run)
+    _run_playbook(
+        run,
+        EXPERIMENT_ANSIBLE / "playbooks/mqtt.yml",
+        private=Path(eligible["private_execution_dir"]),
+    )
 
 
 def cleanup(run: Path) -> None:

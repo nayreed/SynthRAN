@@ -5,40 +5,33 @@
       {{ mqtt_broker_address if mqtt_broker_address else
          hostvars[groups['broker_node'][0]].ansible_default_ipv4.address }}
 
-- name: Install UE-tunnel discovery helper
-  copy:
-    src: discover_ue_tunnels.py
-    dest: /tmp/synthran-discover-ue-tunnels.py
-    mode: '0755'
-- name: Stage the expected deployment identity on the RAN host
-  copy:
-    content: "{{ lookup('ansible.builtin.file', synthran_deployment_contract_file) }}\n"
-    dest: /tmp/synthran-expected-deployment.json
-    mode: '0600'
-- name: Prove the exact software UE identities and tunnels
-  command: >-
-    python3 /tmp/synthran-discover-ue-tunnels.py
-    --expected /tmp/synthran-expected-deployment.json
-  register: synthran_discovery
-  changed_when: false
-  retries: 30
-  delay: 5
-  until: synthran_discovery.rc == 0
-- name: Decode proved UE tunnel bindings
+- name: Load the fresh experiment-eligibility decision
   set_fact:
-    synthran_software_tunnels: "{{ synthran_discovery.stdout | from_json }}"
-- name: Use the exact proved tunnel order
+    synthran_experiment_eligibility: >-
+      {{ lookup('ansible.builtin.file', run_dir ~ '/experiment-eligible.json') | from_json }}
+    synthran_experiment_eligibility_evidence: >-
+      {{ lookup('ansible.builtin.file', run_dir ~ '/experiment-eligibility-evidence.json') | from_json }}
+
+- name: Require a fresh eligibility decision for this accepted deployment
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_experiment_eligibility.status == 'experiment-eligible'
+      - synthran_experiment_eligibility.experiment_eligible is sameas true
+      - >-
+        synthran_experiment_eligibility.deployment_hash
+        == synthran_experiment_eligibility_evidence.deployment_hash
+      - synthran_experiment_eligibility_evidence.cluster_identity_verified is sameas true
+      - synthran_experiment_eligibility_evidence.bindings | length == synthran_ue_map | length
+    fail_msg: >-
+      Software workload replay requires the fresh experiment-eligibility decision
+      produced immediately before this run. Experiment code cannot manufacture or
+      substitute deployment acceptance evidence.
+
+- name: Use the freshly proved software UE bindings in accepted order
   set_fact:
-    synthran_assigned_tunnels: "{{ synthran_software_tunnels }}"
-- name: Retain live deployment evidence with the run
-  delegate_to: localhost
-  become: false
-  copy:
-    content: >-
-      {{ {'deployment_hash': synthran_deployment_contract.deployment_hash,
-           'cluster_identity_verified': true,
-           'bindings': synthran_assigned_tunnels} | to_nice_json }}
-    dest: "{{ run_dir }}/live-deployment-evidence.json"
+    synthran_assigned_tunnels: "{{ synthran_experiment_eligibility_evidence.bindings }}"
+
 - name: Build unique UE pod list
   set_fact:
     synthran_software_pods: "{{ synthran_assigned_tunnels | unique(attribute='pod') | list }}"

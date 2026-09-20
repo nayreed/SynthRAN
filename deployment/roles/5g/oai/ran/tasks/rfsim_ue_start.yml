@@ -1,0 +1,226 @@
+---
+- name: Resolve the selected OAI RFSIM launch identity
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_release: >-
+      {{ 'oai-nr-ue'
+         if (synthran_rfsim_ue.index | int) == 1
+         else 'oai-nr-ue' ~ (synthran_rfsim_ue.index | string) }}
+    synthran_oai_rfsim_command: >-
+      {{ 'start-nr-ue'
+         if (synthran_rfsim_ue.index | int) == 1
+         else 'start-nr-ue' ~ (synthran_rfsim_ue.index | string) }}
+
+- name: Launch the selected OAI RFSIM UE through the pinned helper
+  ansible.builtin.command:
+    argv:
+      - "{{ demo_oai_script }}"
+      - "{{ synthran_oai_rfsim_command }}"
+  args:
+    chdir: "{{ repo_dest }}"
+  register: synthran_oai_rfsim_launch
+  changed_when: synthran_oai_rfsim_launch.rc == 0
+  failed_when: false
+
+- name: Read the selected OAI RFSIM Helm release
+  ansible.builtin.command:
+    argv:
+      - helm
+      - status
+      - "{{ synthran_oai_rfsim_release }}"
+      - --namespace
+      - "{{ core }}"
+      - --output
+      - json
+  register: synthran_oai_rfsim_helm
+  changed_when: false
+  failed_when: false
+
+- name: Read the selected OAI RFSIM pod set
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - pods
+      - --namespace
+      - "{{ core }}"
+      - --selector
+      - "app.kubernetes.io/instance={{ synthran_oai_rfsim_release }}"
+      - --output
+      - json
+  register: synthran_oai_rfsim_pods_raw
+  changed_when: false
+  failed_when: false
+
+- name: Decode the selected OAI RFSIM runtime state
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_helm_document: >-
+      {{ (synthran_oai_rfsim_helm.stdout | default('{}', true)) | from_json }}
+    synthran_oai_rfsim_pods_document: >-
+      {{ (synthran_oai_rfsim_pods_raw.stdout | default('{"items":[]}', true)) | from_json }}
+
+- name: Resolve the selected OAI RFSIM pod candidate
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_pod: >-
+      {{ synthran_oai_rfsim_pods_document.get('items', []) | first | default({}) }}
+
+- name: Resolve the selected OAI RFSIM UE container runtime
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_spec_container: >-
+      {{ synthran_oai_rfsim_pod.get('spec', {}).get('containers', [])
+         | selectattr('name', 'equalto', 'nr-ue') | list | first | default({}) }}
+    synthran_oai_rfsim_status_container: >-
+      {{ synthran_oai_rfsim_pod.get('status', {}).get('containerStatuses', [])
+         | selectattr('name', 'equalto', 'nr-ue') | list | first | default({}) }}
+
+- name: Classify the selected OAI RFSIM release and pod readiness
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_release_ready: >-
+      {{
+        synthran_oai_rfsim_helm.rc == 0 and
+        synthran_oai_rfsim_helm_document.get('info', {}).get('status', '') == 'deployed'
+      }}
+    synthran_oai_rfsim_pod_ready: >-
+      {{
+        synthran_oai_rfsim_pods_raw.rc == 0 and
+        (synthran_oai_rfsim_pods_document.get('items', []) | length) == 1 and
+        synthran_oai_rfsim_pod.get('status', {}).get('phase', '') == 'Running' and
+        (
+          synthran_oai_rfsim_pod.get('status', {}).get('conditions', [])
+          | selectattr('type', 'equalto', 'Ready')
+          | map(attribute='status')
+          | list
+          | first
+          | default('False')
+        ) == 'True'
+      }}
+
+- name: Probe the selected OAI RFSIM UE tunnel and source-bound user plane
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ synthran_oai_rfsim_probe_script }}"
+      - --expected
+      - "{{ synthran_oai_rfsim_probe_contract }}"
+      - --device
+      - "{{ synthran_rfsim_ue.device }}"
+  register: synthran_oai_rfsim_probe
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 5
+  until: synthran_oai_rfsim_probe.rc == 0
+
+- name: Collect bounded OAI RFSIM UE failure evidence
+  ansible.builtin.shell: |
+    set +e
+    RELEASE="$SYNTHRAN_RELEASE"
+    NS="$SYNTHRAN_NAMESPACE"
+    echo "device=$SYNTHRAN_DEVICE"
+    echo "release=$RELEASE"
+    echo "launch_rc=$SYNTHRAN_LAUNCH_RC"
+    echo "probe_rc=$SYNTHRAN_PROBE_RC"
+    echo "=== helm status ==="
+    helm status "$RELEASE" --namespace "$NS" --output json 2>&1
+    echo "=== selected pods ==="
+    kubectl get pods --namespace "$NS"       --selector "app.kubernetes.io/instance=$RELEASE" -o wide 2>&1
+    POD="$(kubectl get pods --namespace "$NS"       --selector "app.kubernetes.io/instance=$RELEASE"       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+    if [ -n "$POD" ]; then
+      echo "=== pod describe ==="
+      kubectl describe pod --namespace "$NS" "$POD" 2>&1
+      echo "=== pod logs (tail 200, all containers) ==="
+      kubectl logs --namespace "$NS" "$POD" --all-containers --tail=200 2>&1
+      echo "=== interfaces ==="
+      kubectl exec --namespace "$NS" "$POD" -c nr-ue -- ip -o link show 2>&1
+      echo "=== IPv4 addresses ==="
+      kubectl exec --namespace "$NS" "$POD" -c nr-ue -- ip -4 -o addr show 2>&1
+    fi
+    echo "=== acceptance probe ==="
+    printf '%s\n' "$SYNTHRAN_PROBE_STDERR"
+  args:
+    executable: /bin/bash
+  environment:
+    SYNTHRAN_DEVICE: "{{ synthran_rfsim_ue.device }}"
+    SYNTHRAN_RELEASE: "{{ synthran_oai_rfsim_release }}"
+    SYNTHRAN_NAMESPACE: "{{ core }}"
+    SYNTHRAN_LAUNCH_RC: "{{ synthran_oai_rfsim_launch.rc | string }}"
+    SYNTHRAN_PROBE_RC: "{{ synthran_oai_rfsim_probe.rc | string }}"
+    SYNTHRAN_PROBE_STDERR: >-
+      {{ (synthran_oai_rfsim_probe.stderr | default('')) ~
+         (synthran_oai_rfsim_probe.stdout | default('')) }}
+  register: synthran_oai_rfsim_failure_evidence
+  changed_when: false
+  failed_when: false
+  when: >-
+    synthran_oai_rfsim_launch.rc != 0 or
+    not (synthran_oai_rfsim_release_ready | bool) or
+    not (synthran_oai_rfsim_pod_ready | bool) or
+    synthran_oai_rfsim_probe.rc != 0
+
+- name: Retain bounded OAI RFSIM UE failure evidence
+  ansible.builtin.copy:
+    mode: '0644'
+    dest: "{{ run_dir }}/oai-rfsim-{{ synthran_rfsim_ue.device }}-failure.log"
+    content: "{{ synthran_oai_rfsim_failure_evidence.stdout }}\n"
+  delegate_to: localhost
+  become: false
+  when: synthran_oai_rfsim_failure_evidence is not skipped
+
+- name: Require selected OAI RFSIM UE launch and live binding
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_launch.rc == 0
+      - synthran_oai_rfsim_release_ready | bool
+      - synthran_oai_rfsim_pod_ready | bool
+      - synthran_oai_rfsim_spec_container.image | default('') == synthran_oai_rfsim_ue_repository ~ ':' ~ synthran_oai_rfsim_runtime_release ~ '@' ~ synthran_oai_rfsim_ue_index_digest
+      - "'@sha256:' in (synthran_oai_rfsim_status_container.imageID | default(''))"
+      - synthran_oai_rfsim_probe.rc == 0
+    fail_msg: >-
+      OAI RFSIM UE {{ synthran_rfsim_ue.device }} failed its immediate
+      contract-authoritative readiness gate. release={{ synthran_oai_rfsim_release }},
+      launch_rc={{ synthran_oai_rfsim_launch.rc }},
+      release_ready={{ synthran_oai_rfsim_release_ready }},
+      pod_ready={{ synthran_oai_rfsim_pod_ready }},
+      probe_rc={{ synthran_oai_rfsim_probe.rc }}.
+      See {{ run_dir }}/oai-rfsim-{{ synthran_rfsim_ue.device }}-failure.log.
+
+- name: Decode the selected OAI RFSIM live binding
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_binding: "{{ (synthran_oai_rfsim_probe.stdout | from_json) | first }}"
+
+- name: Require the immediate OAI RFSIM binding identity
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_binding.device == synthran_rfsim_ue.device
+      - synthran_oai_rfsim_binding.imsi | string == synthran_rfsim_ue.imsi | string
+      - synthran_oai_rfsim_binding.dnn | string == synthran_rfsim_ue.dnn | string
+      - synthran_oai_rfsim_binding.sst | string == synthran_rfsim_ue.sst | string
+      - synthran_oai_rfsim_binding.sd | string == synthran_rfsim_ue.sd | string
+      - synthran_oai_rfsim_binding.user_plane.verified | bool
+    fail_msg: >-
+      Immediate live binding for {{ synthran_rfsim_ue.device }} does not match
+      the sealed deployment identity.
+
+- name: Record the selected OAI RFSIM readiness evidence
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_readiness: >-
+      {{ synthran_oai_rfsim_readiness + [
+           {
+             'device': synthran_rfsim_ue.device,
+             'release': synthran_oai_rfsim_release,
+             'pod': synthran_oai_rfsim_binding.pod,
+             'address': synthran_oai_rfsim_binding.address,
+             'interface': synthran_oai_rfsim_binding.interface,
+             'runtime_release': synthran_oai_rfsim_runtime_release,
+             'index_digest': synthran_oai_rfsim_ue_index_digest,
+             'image': synthran_oai_rfsim_spec_container.image,
+             'image_id': synthran_oai_rfsim_status_container.imageID,
+             'restart_count': synthran_oai_rfsim_status_container.restartCount | default(0),
+             'slice': synthran_rfsim_ue.slice,
+             'dnn': synthran_rfsim_ue.dnn,
+             'sst': synthran_rfsim_ue.sst | string,
+             'sd': synthran_rfsim_ue.sd | string,
+             'user_plane': synthran_oai_rfsim_binding.user_plane
+           }
+         ] }}

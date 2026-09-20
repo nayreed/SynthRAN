@@ -1,28 +1,56 @@
 ---
 
-- name: Kill existing processes if any
-  ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} --
-    /bin/sh -lc "pkill -9 srsue; pkill -9 python3; true"
+- name: Stop stale RFSIM UE and broker processes before a new baseline
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ ue_pod_name }}"
+      - --
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        pkill -TERM -x srsue 2>/dev/null || true
+        pkill -TERM -f '[m]ulti_ue_scenario.py' 2>/dev/null || true
+        for _ in $(seq 1 10); do
+          if ! pgrep -x srsue >/dev/null 2>&1 &&
+             ! pgrep -f '[m]ulti_ue_scenario.py' >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep 1
+        done
+        pkill -KILL -x srsue 2>/dev/null || true
+        pkill -KILL -f '[m]ulti_ue_scenario.py' 2>/dev/null || true
+        for _ in $(seq 1 5); do
+          if ! pgrep -x srsue >/dev/null 2>&1 &&
+             ! pgrep -f '[m]ulti_ue_scenario.py' >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep 1
+        done
+        echo 'stale RFSIM UE or GNU Radio process survived targeted cleanup' >&2
+        exit 1
   changed_when: true
-  failed_when: false
 
 - name: Start GNU Radio broker in tmux window 'gnu'
   ansible.builtin.command: >
     {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} --
     /bin/sh -lc "
-      tmux list-windows -t ran | grep -q '^\s*[0-9]\+: gnu\b' \
-        && tmux kill-window -t ran:gnu || true;
+      if tmux list-windows -t ran -F '#W' | grep -Fxq gnu; then
+        tmux kill-window -t ran:gnu;
+      fi;
       tmux new-window -t ran -n gnu \
-        'bash -lc \"/srsran/config/start_gnu.sh {{ ue_count }} 2>&1 | tee /var/log/gnu_multi_ue.log\"'
+        'bash -lc \"/srsran/config/start_gnu.sh {{ ue_count }}\"'
     "
   changed_when: true
-  failed_when: false
 
-- name: Wait for GNU Radio broker to be ready
+- name: Wait for GNU Radio broker to be ready and alive
   ansible.builtin.command: >
     {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/sh -lc
-    "grep -q 'Press Enter to quit' /var/log/gnu_multi_ue.log 2>/dev/null"
+    "pgrep -f '[m]ulti_ue_scenario.py' >/dev/null 2>&1 && grep -q 'GNU Radio broker ready' /var/log/gnu_multi_ue.log 2>/dev/null"
   register: gnu_log_wait
   changed_when: false
   failed_when: false
@@ -30,16 +58,9 @@
   delay: 2
   until: gnu_log_wait.rc == 0
 
-- name: Get gNB pod name
-  ansible.builtin.command: >
-    {{ kubectl_bin }} get pod -n {{ ran_ns }} -l app=srsran,component=gnb
-    -o jsonpath='{.items[0].metadata.name}'
-  register: gnb_pod_name_result
-  changed_when: false
-
 - name: Wait for gNB cell to be activated
   ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ gnb_pod_name_result.stdout }} -c gnb-logs -- /bin/sh -lc
+    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ synthran_gnb_logging_pod }} -c gnb -- /bin/sh -lc
     "grep -q 'Cell was activated' /var/log/gnb.log 2>/dev/null"
   register: gnb_cell_wait
   changed_when: false
@@ -64,8 +85,8 @@
 
 - name: Wait for the gNB NGAP association with the AMF
   ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ gnb_pod_name_result.stdout }} -c gnb-logs -- /bin/sh -lc
-    "grep -Eq 'N2: Connection to AMF .* (completed|was established)|AMF connection established|Connected to AMF' /var/log/gnb.log"
+    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ synthran_gnb_logging_pod }} -c gnb -- /bin/sh -lc
+    "grep -Fq 'NGSetupResponse' /var/log/gnb.log"
   register: gnb_amf_wait
   changed_when: false
   failed_when: false
@@ -76,7 +97,7 @@
 - name: Collect control-plane diagnostics when NGAP is unavailable
   ansible.builtin.shell: |
     echo '--- gNB log ---'
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ gnb_pod_name_result.stdout }} -c gnb-logs -- tail -n 120 /var/log/gnb.log 2>&1 || true
+    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ synthran_gnb_logging_pod }} -c gnb -- tail -n 120 /var/log/gnb.log 2>&1 || true
     echo '--- AMF candidates ---'
     {{ kubectl_bin }} get pods -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null |
     while read ns pod; do
@@ -110,14 +131,14 @@
       - exec
       - "{{ ue_pod_name }}"
       - --
-      - /bin/sh
+      - /bin/bash
       - -lc
       - |
-        for i in {{ ue_indices | join(" ") }}; do
+        set -euo pipefail
+        for i in {{ ue_list | map(attribute='index') | map('int') | join(' ') }}; do
           tmux kill-window -t "ran:ue${i}" 2>/dev/null || true
-          rm -f "/var/log/ue${i}.log"
           tmux new-window -t ran -n "ue${i}" \
-            "bash -lc \"/srsran/config/start_ue.sh ${i} 2>&1 | tee /var/log/ue${i}.log\""
+            "bash -lc \"/srsran/config/start_ue.sh ${i}\""
         done
   changed_when: true
 
@@ -125,7 +146,7 @@
   ansible.builtin.command: >
     {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/sh -lc
     'ok=1;
-     for i in {{ ue_indices | join(" ") }}; do
+     for i in {{ ue_list | map(attribute="index") | map("int") | join(" ") }}; do
        if ! pgrep -af "srsue .*ue_${i}\.conf" >/dev/null 2>&1; then
          ok=0; break;
        fi;
@@ -150,9 +171,9 @@
       - /bin/sh
       - -lc
       - |
-        for i in {{ ue_indices | join(' ') }}; do
+        for i in {{ ue_list | map(attribute='index') | map('int') | join(' ') }}; do
           echo "=== UE ${i} console ==="
-          tail -n 160 "/var/log/ue${i}.log" 2>/dev/null || true
+          tail -n 160 "/var/log/ue${i}.console.log" 2>/dev/null || true
           echo "=== UE ${i} native log ==="
           tail -n 160 "/tmp/ue${i}.log" 2>/dev/null || true
         done
@@ -173,7 +194,7 @@
   ansible.builtin.command: >
     {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/sh -lc
     'missing="";
-     for i in {{ ue_indices | join(" ") }}; do
+     for i in {{ ue_list | map(attribute="index") | map("int") | join(" ") }}; do
        if ! ip -4 -o addr show dev "tun_srsue${i}" | grep -q "inet "; then
          missing="${missing} tun_srsue${i}";
        fi;
@@ -182,7 +203,7 @@
   register: all_ue_tunnels_wait
   changed_when: false
   failed_when: false
-  retries: 30
+  retries: 60
   delay: 2
   until: all_ue_tunnels_wait.rc == 0
 
@@ -218,7 +239,7 @@
       - -lc
       - |
         echo '--- srsUE console ---'
-        tail -n 220 /var/log/ue{{ item.index }}.log 2>/dev/null || true
+        tail -n 220 /var/log/ue{{ item.index }}.console.log 2>/dev/null || true
         echo '--- relevant native events ---'
         grep -Ei 'RACH|RNTI|RRC|NAS|registration|authentication|security|PDU|session|slice|NSSAI|reject|fail|error' \
           /tmp/ue{{ item.index }}.log 2>/dev/null | tail -n 220 || true
@@ -244,7 +265,7 @@
     echo '--- GNU Radio broker ---'
     {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- tail -n 160 /var/log/gnu_multi_ue.log 2>&1 || true
     echo '--- gNB relevant events ---'
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ gnb_pod_name_result.stdout }} -c gnb-logs -- /bin/sh -lc \
+    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ synthran_gnb_logging_pod }} -c gnb -- /bin/sh -lc \
       "grep -Ei 'RACH|RNTI|RRC|NGAP|PDU|UE|reject|fail|error' /var/log/gnb.log | tail -n 300" 2>&1 || true
     echo '--- core AMF/SMF candidates ---'
     {{ kubectl_bin }} get pods -A --no-headers -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name' 2>/dev/null |
@@ -275,7 +296,13 @@
       {% endfor %}
       {{ failed_ue_control_plane_logs.stdout | default('No radio/core diagnostics were produced.') }}
 
-- name: Capture srsUE runtime provenance
+- name: Require the GNU Radio broker to remain alive after UE establishment
+  ansible.builtin.command: >
+    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/sh -lc
+    "pgrep -f '[m]ulti_ue_scenario.py' >/dev/null 2>&1"
+  changed_when: false
+
+- name: Capture srsUE build provenance
   ansible.builtin.command:
     argv:
       - "{{ kubectl_bin }}"
@@ -287,48 +314,38 @@
       - /bin/sh
       - -lc
       - |
-        grep -m1 'Built in Release mode using commit' /var/log/ue1.log 2>/dev/null || true
+        grep -m1 'Built in Release mode using commit' /var/log/ue1.console.log 2>/dev/null || true
   register: srsue_build_provenance
   changed_when: false
   failed_when: false
 
-- name: Capture srsUE container image identity
-  ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} get pod {{ ue_pod_name }}
-    -o jsonpath='{.status.containerStatuses[0].imageID}'
-  register: srsue_image_identity
-  changed_when: false
-  failed_when: false
-
-- name: Report srsUE runtime provenance
+- name: Report srsUE build provenance
   ansible.builtin.debug:
-    msg:
-      - "{{ srsue_build_provenance.stdout | default('srsUE source commit unavailable') }}"
-      - "imageID={{ srsue_image_identity.stdout | default('unavailable') }}"
+    msg: "{{ srsue_build_provenance.stdout | default('srsUE source commit unavailable') }}"
 
-# --- Routes ---
-
-- name: Add routes in UE pod
-  ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/bash -lc
-    'UE_COUNT={{ ue_count }} /srsran/config/add_route.sh'
-  changed_when: false
-  failed_when: false
-
-# --- Show UE IPs ---
-
-- name: Extract UE IP addresses from logs
-  ansible.builtin.command: >
-    {{ kubectl_bin }} -n {{ ran_ns }} exec {{ ue_pod_name }} -- /bin/sh -lc
-    "grep -m1 'PDU Session Establishment successful' /var/log/ue{{ item.index }}.log 2>/dev/null | awk '{print \$NF}'"
+- name: Read live UE tunnel addresses
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ ue_pod_name }}"
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        addr="$(ip -4 -o addr show dev tun_srsue{{ item.index }} |
+        awk '{print $4}' | head -1)";
+        test -n "$addr";
+        printf '%s\n' "$addr"
   loop: "{{ ue_list }}"
   register: ue_ips
   changed_when: false
-  failed_when: false
 
 - name: Report UE tunnel addresses
   ansible.builtin.debug:
-    msg: "{{ item.item.name }} ({{ item.item.imsi }}) → {{ item.stdout | default('N/A') }}"
+    msg: "{{ item.item.name }} ({{ item.item.imsi }}) → {{ item.stdout }}"
   loop: "{{ ue_ips.results }}"
   loop_control:
     label: "{{ item.item.name }}"
@@ -336,8 +353,8 @@
 - name: Summary
   ansible.builtin.debug:
     msg:
-      - "UEs started in tmux session 'ran': windows ue1..ue{{ ue_count }}"
+      - "UEs started in tmux session 'ran': {{ ue_list | map(attribute='name') | list }}"
       - "GNU Radio broker in tmux window 'gnu'"
-      - "Logs: /var/log/ue1.log .. /var/log/ue{{ ue_count }}.log"
       - "GNU Radio log: /var/log/gnu_multi_ue.log"
+      - "UE console logs: /var/log/ue<N>.console.log; native logs: /tmp/ue<N>.log"
       - "Inspect: {{ kubectl_bin }} -n {{ ran_ns }} exec -it {{ ue_pod_name }} -- tmux attach -t ran"

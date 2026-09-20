@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from .reference_checkout import ensure_execution_reference
+
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 VENV_PYTHON = VENV / "bin" / "python"
@@ -68,6 +70,8 @@ def main() -> None:
     if args.log is None:
         parser.error("--log is required when preparing a runtime extra")
     ensure(args.action, args.log)
+    if args.action == "deployment":
+        ensure_execution_reference()
 
 
 if __name__ == "__main__":

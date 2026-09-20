@@ -1,0 +1,425 @@
+---
+- name: Read the stable physical gNB workload before health observation
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ ran_ns }}"
+    label_selectors: "{{ srs_gnb_label_selectors }}"
+  register: synthran_srsran_health_initial
+  changed_when: false
+  retries: 20
+  delay: 3
+  until: >-
+    (synthran_srsran_health_initial.resources | length == 1) and
+    ((synthran_srsran_health_initial.resources[0].status.containerStatuses | default([]) |
+      selectattr('name', 'equalto', 'gnb') | selectattr('ready', 'equalto', true) |
+      list | length) == 1)
+
+- name: Resolve the initial physical gNB status
+  ansible.builtin.set_fact:
+    synthran_srsran_health_initial_statuses: >-
+      {{ synthran_srsran_health_initial.resources[0].status.containerStatuses | default([]) |
+         selectattr('name', 'equalto', 'gnb') | list }}
+
+- name: Require the physical health gate to observe the already-verified gNB
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsran_health_initial_statuses | length == 1
+      - synthran_srsran_health_initial.resources[0].metadata.name == synthran_gnb_logging_pod
+      - synthran_srsran_health_initial.resources[0].metadata.uid == synthran_gnb_logging_uid
+    fail_msg: >-
+      Physical health observation did not start from the gNB workload already
+      accepted by the generic runtime/log gate.
+
+- name: Pin the physical gNB identity for the health window
+  ansible.builtin.set_fact:
+    synthran_srsran_health_pod: "{{ synthran_srsran_health_initial.resources[0].metadata.name }}"
+    synthran_srsran_health_uid: "{{ synthran_srsran_health_initial.resources[0].metadata.uid }}"
+    synthran_srsran_health_restart_initial: >-
+      {{ synthran_srsran_health_initial_statuses[0].restartCount | int }}
+
+- name: Prove the gNB process exists inside the accepted container
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        for comm in /proc/[0-9]*/comm; do
+          [ -r "$comm" ] || continue;
+          if [ "$(cat "$comm")" = gnb ]; then
+            pid=${comm#/proc/}; pid=${pid%/comm}; printf '%s\n' "$pid"; exit 0;
+          fi;
+        done;
+        exit 1
+  register: synthran_srsran_gnb_process
+  changed_when: false
+
+- name: Wait for live N2 SCTP association before RF-health observation
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        ss -H -n -A sctp state established |
+        grep -F -- '{{ srsran_network.n2.amf_ip }}:{{ srsran_network.n2.amf_port }}'
+  register: synthran_srsran_live_n2_initial
+  changed_when: false
+  retries: 60
+  delay: 2
+  until: synthran_srsran_live_n2_initial.rc == 0
+
+- name: Require completed NG Setup in the authoritative gNB log
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        grep -Fm1 'NGSetupResponse' /var/log/gnb.log
+  register: synthran_srsran_ng_setup_signal
+  changed_when: false
+  retries: 30
+  delay: 2
+  until: synthran_srsran_ng_setup_signal.rc == 0
+
+- name: Capture the authoritative log position before RF-health windows
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - wc -l < /var/log/gnb.log
+  register: synthran_srsran_health_line_start
+  changed_when: false
+
+- name: Observe the first post-stability RF-health window
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: Capture the end of the first RF-health window
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - wc -l < /var/log/gnb.log
+  register: synthran_srsran_health_line_mid
+  changed_when: false
+
+- name: Require the authoritative gNB log to remain monotonic through the first window
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (synthran_srsran_health_line_mid.stdout | int) >= (synthran_srsran_health_line_start.stdout | int)
+    fail_msg: >-
+      /var/log/gnb.log was truncated or replaced during the first RF-health
+      window, so the health evidence is not trustworthy.
+
+- name: Read only log lines produced in the first RF-health window
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        sed -n '{{ (synthran_srsran_health_line_start.stdout | int) + 1 }},{{ synthran_srsran_health_line_mid.stdout | int }}p'
+        /var/log/gnb.log
+  register: synthran_srsran_health_window1
+  changed_when: false
+
+- name: Observe the second post-stability RF-health window
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: Capture the end of the second RF-health window
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - wc -l < /var/log/gnb.log
+  register: synthran_srsran_health_line_end
+  changed_when: false
+
+- name: Require the authoritative gNB log to remain monotonic through the second window
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (synthran_srsran_health_line_end.stdout | int) >= (synthran_srsran_health_line_mid.stdout | int)
+    fail_msg: >-
+      /var/log/gnb.log was truncated or replaced during the second RF-health
+      window, so the health evidence is not trustworthy.
+
+- name: Read only log lines produced in the second RF-health window
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        sed -n '{{ (synthran_srsran_health_line_mid.stdout | int) + 1 }},{{ synthran_srsran_health_line_end.stdout | int }}p'
+        /var/log/gnb.log
+  register: synthran_srsran_health_window2
+  changed_when: false
+
+- name: Classify post-stability RF and PHY failures
+  ansible.builtin.set_fact:
+    synthran_srsran_health_window1_counts:
+      reference_fatal: >-
+        {{ synthran_srsran_health_window1.stdout |
+           regex_findall('Unable to create radio session|Failure to create rfnoc_graph|RFNOC::MGMT.*Connection refused|Failed to open device', ignorecase=true) |
+           length }}
+      rf_realtime: >-
+        {{ synthran_srsran_health_window1.stdout |
+           regex_findall('Real-time failure in RF:\\s*(?:late|underflow)', ignorecase=true) |
+           length }}
+      dl_queue_full: >-
+        {{ synthran_srsran_health_window1.stdout |
+           regex_findall('DL task queue is full', ignorecase=true) | length }}
+      fapi_late: >-
+        {{ synthran_srsran_health_window1.stdout |
+           regex_findall('(?:late.*(?:DL_TTI|UL_TTI)|(?:DL_TTI|UL_TTI).*late)', ignorecase=true) |
+           length }}
+      downlink_data_late: >-
+        {{ synthran_srsran_health_window1.stdout |
+           regex_findall('Downlink data late', ignorecase=true) | length }}
+    synthran_srsran_health_window2_counts:
+      reference_fatal: >-
+        {{ synthran_srsran_health_window2.stdout |
+           regex_findall('Unable to create radio session|Failure to create rfnoc_graph|RFNOC::MGMT.*Connection refused|Failed to open device', ignorecase=true) |
+           length }}
+      rf_realtime: >-
+        {{ synthran_srsran_health_window2.stdout |
+           regex_findall('Real-time failure in RF:\\s*(?:late|underflow)', ignorecase=true) |
+           length }}
+      dl_queue_full: >-
+        {{ synthran_srsran_health_window2.stdout |
+           regex_findall('DL task queue is full', ignorecase=true) | length }}
+      fapi_late: >-
+        {{ synthran_srsran_health_window2.stdout |
+           regex_findall('(?:late.*(?:DL_TTI|UL_TTI)|(?:DL_TTI|UL_TTI).*late)', ignorecase=true) |
+           length }}
+      downlink_data_late: >-
+        {{ synthran_srsran_health_window2.stdout |
+           regex_findall('Downlink data late', ignorecase=true) | length }}
+
+- name: Identify failure families that persist across both health windows
+  ansible.builtin.set_fact:
+    synthran_srsran_persistent_rf_failures: >-
+      {{
+        (['rf_realtime']
+         if (synthran_srsran_health_window1_counts.rf_realtime | int) > 0 and
+            (synthran_srsran_health_window2_counts.rf_realtime | int) > 0 else []) +
+        (['dl_queue_full']
+         if (synthran_srsran_health_window1_counts.dl_queue_full | int) > 0 and
+            (synthran_srsran_health_window2_counts.dl_queue_full | int) > 0 else []) +
+        (['fapi_late']
+         if (synthran_srsran_health_window1_counts.fapi_late | int) > 0 and
+            (synthran_srsran_health_window2_counts.fapi_late | int) > 0 else []) +
+        (['downlink_data_late']
+         if (synthran_srsran_health_window1_counts.downlink_data_late | int) > 0 and
+            (synthran_srsran_health_window2_counts.downlink_data_late | int) > 0 else [])
+      }}
+
+- name: Read the physical gNB workload after health observation
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ ran_ns }}"
+    name: "{{ synthran_srsran_health_pod }}"
+  register: synthran_srsran_health_final
+  changed_when: false
+
+- name: Require the physical gNB workload to survive the health window
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsran_health_final.resources | length == 1
+      - synthran_srsran_health_final.resources[0].metadata.uid == synthran_srsran_health_uid
+    fail_msg: >-
+      The physical gNB workload disappeared or changed identity during the
+      RF-health observation window.
+
+- name: Resolve the final physical gNB configured image and status
+  ansible.builtin.set_fact:
+    synthran_srsran_health_final_images: >-
+      {{ synthran_srsran_health_final.resources[0].spec.containers | default([]) |
+         selectattr('name', 'equalto', 'gnb') | map(attribute='image') | list }}
+    synthran_srsran_health_final_statuses: >-
+      {{ synthran_srsran_health_final.resources[0].status.containerStatuses | default([]) |
+         selectattr('name', 'equalto', 'gnb') | list }}
+
+- name: Require exactly one final configured and live physical gNB container
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsran_health_final_images | length == 1
+      - synthran_srsran_health_final_statuses | length == 1
+    fail_msg: >-
+      The physical gNB pod no longer exposes exactly one configured/live `gnb`
+      container.
+
+- name: Capture live and configured gNB image identity
+  ansible.builtin.set_fact:
+    synthran_srsran_live_image_id: >-
+      {{ synthran_srsran_health_final_statuses[0].imageID | default('') }}
+    synthran_srsran_expected_image_digest: >-
+      {{ synthran_srsran_image_reference |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+
+- name: Extract the live gNB image digest
+  ansible.builtin.set_fact:
+    synthran_srsran_live_image_digest: >-
+      {{ synthran_srsran_live_image_id |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+
+- name: Require live N2 SCTP association after RF-health observation
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_srsran_health_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        ss -H -n -A sctp state established |
+        grep -F -- '{{ srsran_network.n2.amf_ip }}:{{ srsran_network.n2.amf_port }}'
+  register: synthran_srsran_live_n2
+  changed_when: false
+
+- name: Require the same stable gNB workload after health observation
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsran_health_pod == synthran_gnb_logging_pod
+      - synthran_srsran_health_final_images[0] == synthran_srsran_image_reference
+      - (synthran_srsran_health_final_statuses[0].restartCount | int) == (synthran_srsran_health_restart_initial | int)
+      - synthran_srsran_health_final_statuses[0].ready | default(false) | bool
+      - synthran_srsran_gnb_process.rc == 0
+      - synthran_srsran_live_n2_initial.rc == 0
+      - synthran_srsran_ng_setup_signal.rc == 0
+      - synthran_srsran_live_n2.rc == 0
+      - synthran_srsran_expected_image_digest | length > 0
+      - synthran_srsran_live_image_digest | length > 0
+      - (synthran_srsran_health_window1_counts.reference_fatal | int) == 0
+      - (synthran_srsran_health_window2_counts.reference_fatal | int) == 0
+      - synthran_srsran_persistent_rf_failures | length == 0
+    fail_msg: >-
+      Physical srsRAN failed its RAN-local acceptance window. The workload must
+      keep the same UID/restart state and exact immutable pod-spec image, expose
+      a digest-qualified runtime imageID, complete NG Setup, keep the gNB process
+      and live N2 SCTP association present before and after RF-health observation,
+      contain no reference-fatal radio errors, and avoid persistent RF/PHY timing
+      failures across consecutive post-stability windows.
+
+- name: Retain physical srsRAN RAN-local health evidence
+  ansible.builtin.copy:
+    dest: "{{ run_dir }}/provenance/srsran-ran-health.json"
+    mode: '0644'
+    content: >-
+      {{ {
+           'schema_version': 5,
+           'radio': rru,
+           'namespace': ran_ns,
+           'pod': synthran_srsran_health_pod,
+           'pod_uid': synthran_srsran_health_uid,
+           'restart_count_before': synthran_srsran_health_restart_initial | int,
+           'restart_count_after': synthran_srsran_health_final_statuses[0].restartCount | int,
+           'gnb_pid': synthran_srsran_gnb_process.stdout | trim,
+           'log_path': '/var/log/gnb.log',
+           'log_config_verified': synthran_gnb_logging_config.rc == 0,
+           'log_process_command': synthran_gnb_logging_cmdline.stdout | trim,
+           'log_line_start': synthran_srsran_health_line_start.stdout | int,
+           'log_line_mid': synthran_srsran_health_line_mid.stdout | int,
+           'log_line_end': synthran_srsran_health_line_end.stdout | int,
+           'ng_setup_signal': synthran_srsran_ng_setup_signal.stdout | trim,
+           'live_n2_sctp_before': synthran_srsran_live_n2_initial.stdout | trim,
+           'live_n2_sctp_after': synthran_srsran_live_n2.stdout | trim,
+           'n2_endpoint': {
+             'amf_ip': srsran_network.n2.amf_ip,
+             'amf_port': srsran_network.n2.amf_port
+           },
+           'window_seconds': 10,
+           'window1_counts': synthran_srsran_health_window1_counts,
+           'window2_counts': synthran_srsran_health_window2_counts,
+           'persistent_failure_families': synthran_srsran_persistent_rf_failures,
+           'reference': {
+             'repository': synthran_srsran_reference.repository,
+             'commit': synthran_srsran_reference.commit
+           },
+           'chart': {
+             'repository': repo_url,
+             'revision': version
+           },
+           'configured_image': synthran_srsran_image_reference,
+           'pod_spec_image': synthran_srsran_health_final_images[0],
+           'live_image_id': synthran_srsran_live_image_id,
+           'configured_image_digest': synthran_srsran_expected_image_digest,
+           'live_image_digest': synthran_srsran_live_image_digest,
+           'selected_network': synthran_topology.network,
+           'selected_transport': synthran_topology.transport
+         } | to_nice_json }}
+  delegate_to: localhost
+  become: false

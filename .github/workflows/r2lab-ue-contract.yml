@@ -1,0 +1,110 @@
+name: R2Lab UE lifecycle contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  r2lab-ue-contract:
+    name: Issue 56 selected UE lifecycle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deployment validation runtime
+        run: python -m pip install --disable-pip-version-check -e '.[deployment]'
+
+      - name: Materialize exact upstream execution reference
+        run: |
+          set -euo pipefail
+          reference_root="$(python -m synthran.reference_checkout)"
+          test -d "$reference_root/.git"
+          echo "SYNTHRAN_REFERENCE_ROOT=$reference_root" >>"$GITHUB_ENV"
+          git -C "$reference_root" rev-parse HEAD
+
+      - name: Install pinned Ansible collections
+        run: ansible-galaxy collection install -r deployment/collections/requirements.yml
+
+      - name: Compile Sub 09 validation surfaces
+        run: >-
+          python -m compileall -q
+          tools/check_r2lab_ue_lifecycle_contract.py
+          tools/check_r2lab_experiment_reuse_contract.py
+          deployment/scripts/probe_r2lab_ue.py
+          synthran/deployment_state.py
+          synthran/profile_validation.py
+
+      - name: Parse Sub 09 Ansible YAML
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          paths = [
+              Path("deployment/playbooks/provision_r2lab.yml"),
+              Path("deployment/playbooks/connect_ues.yml"),
+              Path("deployment/roles/r2lab/ue/setup/tasks/main.yml"),
+              Path("deployment/roles/r2lab/ue/setup/tasks/prepare_one.yml"),
+              Path("deployment/roles/r2lab/ue/connect/tasks/main.yml"),
+              Path("deployment/roles/r2lab/ue/connect/tasks/qmi.yml"),
+              Path("deployment/roles/synthran/r2lab_ue_verify/tasks/main.yml"),
+          ]
+          for path in paths:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+          print(f"parsed {len(paths)} R2Lab UE lifecycle task files")
+          PY
+
+      - name: Validate original-upstream and local UE lifecycle contracts
+        run: >-
+          python tools/check_r2lab_ue_lifecycle_contract.py
+          --reference "$SYNTHRAN_REFERENCE_ROOT"
+
+      - name: Validate read-only experiment reuse of accepted R2Lab UEs
+        run: python tools/check_r2lab_experiment_reuse_contract.py
+
+      - name: Syntax-check R2Lab UE lifecycle playbooks
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/r2lab-ue-contract"
+          mkdir -p "$fixture"
+          cat >"$fixture/inventory.yml" <<'YAML'
+          all:
+            children:
+              faraday:
+                hosts:
+                  faraday-ci:
+                    ansible_connection: local
+              qhats:
+                hosts:
+                  qhat01:
+                    ansible_connection: local
+                    mode: mbim
+                    interface: wwan0
+                    mbim_session: 0
+              qfits:
+                hosts: {}
+              physical_ues:
+                children:
+                  qhats: {}
+                  qfits: {}
+          YAML
+          ansible-playbook -i "$fixture/inventory.yml" deployment/playbooks/provision_r2lab.yml --syntax-check
+          ansible-playbook -i "$fixture/inventory.yml" deployment/playbooks/connect_ues.yml --syntax-check

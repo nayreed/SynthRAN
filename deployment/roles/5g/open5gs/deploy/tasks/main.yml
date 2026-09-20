@@ -1,45 +1,4 @@
 ---
-- name: Reload and restart kubelet
-  ansible.builtin.shell: |
-    systemctl daemon-reload
-    systemctl restart kubelet
-  become: true
-  changed_when: false
-
-- name: Restart CoreDNS pods after kubelet restart
-  ansible.builtin.shell: |
-    kubectl -n kube-system delete pod -l k8s-app=kube-dns --ignore-not-found
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  changed_when: false
-
-- name: Wait for CoreDNS to be Ready
-  ansible.builtin.shell: |
-    kubectl wait -n kube-system --for=condition=Ready pod -l k8s-app=kube-dns --timeout=180s
-  args:
-    executable: /bin/bash
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: wait_coredns
-  retries: 3
-  delay: 10
-  until: wait_coredns.rc == 0
-  changed_when: false
-
-- name: Test CoreDNS resolution from core node
-  become: true
-  delegate_to: "{{ groups['core_node'][0] }}"
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ansible.builtin.shell: |
-    set -eux
-    for NODE in {{ groups['core_node'][0] }}; do
-      kubectl run dns-test-$NODE --image=busybox:1.36 --restart=Never \
-        --overrides='{"spec": {"nodeName": "'"${NODE}"'"}}' --command -- sh -c 'nslookup kubernetes.default.svc.cluster.local' || true
-    done
-    kubectl delete pod dns-test-{{ groups['core_node'][0] }} --ignore-not-found
-  changed_when: false
-
 - name: Ensure Open5GS namespace exists
   kubernetes.core.k8s:
     api_version: v1
@@ -47,30 +6,16 @@
     name: "{{ open5gs_ns }}"
     state: present
 
-- name: Force Open5GS workloads on core_node
-  ansible.builtin.copy:
-    dest: "{{ repo_dest }}/{{ deployment_option }}/open5gs-node-patch.yaml"
-    content: |
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: any
-      spec:
-        template:
-          spec:
-            nodeName: "{{ core_node_name }}"
-      ---
-      apiVersion: apps/v1
-      kind: StatefulSet
-      metadata:
-        name: any
-      spec:
-        template:
-          spec:
-            nodeName: "{{ core_node_name }}"
-
-- name: Apply MongoDB with Kustomize
-  ansible.builtin.command: kubectl apply -k "{{ repo_dest }}/mongodb" -n {{ open5gs_ns }}
+- name: Apply MongoDB with the pinned Open5GS source
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - apply
+      - -k
+      - "{{ repo_dest }}/mongodb"
+      - -n
+      - "{{ open5gs_ns }}"
+  changed_when: true
 
 - name: Wait for MongoDB pod to be Ready
   kubernetes.core.k8s_info:
@@ -79,167 +24,110 @@
     label_selectors:
       - app.kubernetes.io/name=mongodb
   register: mongo_pods
-  until: >
+  until: >-
     mongo_pods.resources | length > 0 and
     (mongo_pods.resources[0].status.containerStatuses is defined) and
-    (mongo_pods.resources[0].status.containerStatuses[0].ready | default(false))
+    (mongo_pods.resources[0].status.containerStatuses | length > 0) and
+    (mongo_pods.resources[0].status.containerStatuses | map(attribute='ready') | min)
   retries: 40
   delay: 10
 
-- name: Apply NADs with Kustomize
-  ansible.builtin.command: kubectl apply -k "{{ repo_dest }}/networks5g" -n {{ open5gs_ns }}
-
-- name: Wait for kube-apiserver to be responsive
-  ansible.builtin.command: kubectl get --raw=/healthz
-  register: api_health
-  retries: 30
-  delay: 10
-  until: api_health.rc == 0
+- name: Require the Multus NetworkAttachmentDefinition API prepared by bootstrap
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - crd
+      - network-attachment-definitions.k8s.cni.cncf.io
+      - -o
+      - name
   changed_when: false
 
-- name: Wait for CRD registration to be ready
-  ansible.builtin.command: kubectl get crds
-  register: crd_list
-  retries: 20
-  delay: 5
-  until: "'network-attachment-definitions.k8s.cni.cncf.io' in crd_list.stdout"
-  changed_when: false
+- name: Apply Open5GS NetworkAttachmentDefinitions from the pinned source
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - apply
+      - -k
+      - "{{ repo_dest }}/networks5g"
+      - -n
+      - "{{ open5gs_ns }}"
+  changed_when: true
 
-- name: Wait for Multus CRD
-  ansible.builtin.command: kubectl get crd network-attachment-definitions.k8s.cni.cncf.io
-  register: multus_crd_check
-  retries: 60
-  delay: 5
-  until: multus_crd_check.rc == 0
-  changed_when: false
-  failed_when: false
-
-- name: Patch NADs to use unique interface names
-  ansible.builtin.shell: |
-    set -eu
-    for nad in n2network n3network n4network; do
-      case "$nad" in
-        n2network) ifname=n2 ;;
-        n3network) ifname=n3 ;;
-        n4network) ifname=n4 ;;
-      esac
-      if ! kubectl get networkattachmentdefinition "$nad" -n {{ open5gs_ns }} &>/dev/null; then
-        continue
-      fi
-      config=$(kubectl get networkattachmentdefinition "$nad" -n {{ open5gs_ns }} -o jsonpath='{.spec.config}')
-      newconfig=$(echo "$config" | jq --arg n "$ifname" '.ifname = $n')
-      kubectl patch networkattachmentdefinition "$nad" -n {{ open5gs_ns }} --type=merge -p "{\"spec\":{\"config\":$newconfig}}"
-    done
-  args:
-    executable: /bin/bash
-  register: patch_nad
-  failed_when: false
-  changed_when: false
-
-- name: Verify required NADs exist
+- name: Verify required Open5GS NetworkAttachmentDefinitions
   kubernetes.core.k8s_info:
     kind: NetworkAttachmentDefinition
     namespace: "{{ open5gs_ns }}"
   register: nad_info
 
-- name: Fail if a required NAD is missing
-  ansible.builtin.fail:
-    msg: "NAD {{ item }} is missing in {{ open5gs_ns }}"
+- name: Require every Open5GS NetworkAttachmentDefinition
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item in (nad_info.resources | map(attribute='metadata.name') | list)
+    fail_msg: "NAD {{ item }} is missing in {{ open5gs_ns }}"
   loop: "{{ nad_list }}"
-  when: item not in (nad_info.resources | map(attribute='metadata.name') | list)
 
-- name: Bring OVS bridges up for single-node Open5GS
-  ansible.builtin.shell: |
-    ip link set dev n2br up
-    ip link set dev n3br up
-    ip link set dev n4br up
-    for br in n2br n3br n4br; do
-      for port in $(ovs-vsctl list-ports "$br" 2>/dev/null | grep veth || true); do
-        ovs-vsctl del-port "$br" "$port" || true
-      done
-    done
+- name: Verify topology-owned Open5GS bridges are present
+  ansible.builtin.command:
+    argv:
+      - ovs-vsctl
+      - br-exists
+      - "{{ item }}"
+  loop: "{{ synthran_topology.transport.bridges.core }}"
+  changed_when: false
+  when: bridge_enabled
   become: true
-  changed_when: false
-  when: core_node_name == ran_node_name and core == 'open5gs'
 
-- name: Assign gateway IPs to OVS bridges for single-node SCTP bind
+- name: Apply Open5GS network functions from the pinned source
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - apply
+      - -k
+      - "{{ repo_dest }}/{{ deployment_option }}"
+      - -n
+      - "{{ open5gs_ns }}"
+  changed_when: true
+
+- name: Wait for every Open5GS core network function to be Ready
   ansible.builtin.shell: |
-    ip addr add 10.10.2.254/24 dev n2br || true
-    ip addr add 10.10.3.254/24 dev n3br || true
-    ip addr add 10.10.4.254/24 dev n4br || true
-  become: true
-  changed_when: false
-  when: core_node_name == ran_node_name and core == 'open5gs'
-
-- name: Force cleanup existing Open5GS pods
-  ansible.builtin.shell: kubectl delete pods -n {{ open5gs_ns }} -l app=open5gs --force --grace-period=0 || true
-  when: core_node_name == ran_node_name and core == 'open5gs'
-  changed_when: false
-
-- name: Apply Open5GS NFs with Kustomize
-  ansible.builtin.command: kubectl apply -k "{{ repo_dest }}/{{ deployment_option }}" -n {{ open5gs_ns }}
-
-- name: Wait for all Open5GS core NFs to be Ready
-  ansible.builtin.shell: |
+    set -eu
     missing=""
     for nf in {{ nfs | join(' ') }}; do
-      ready=$(
+      ready="$(
         kubectl get pods -n {{ open5gs_ns }} -l "nf=${nf}" \
-          -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' \
-          2>/dev/null || true
-      )
+          -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}'
+      )"
       if [ -z "$ready" ] || printf '%s\n' "$ready" | grep -qvx True; then
         missing="${missing} ${nf}"
       fi
     done
-    if [ -n "$missing" ]; then
-      echo "Not Ready:${missing}"
-      exit 1
-    fi
+    test -z "$missing" || { echo "Not Ready:${missing}"; exit 1; }
   args:
     executable: /bin/bash
   register: open5gs_nf_wait
   changed_when: false
-  failed_when: false
   retries: 40
   delay: 5
   until: open5gs_nf_wait.rc == 0
 
-- name: Collect Open5GS pod diagnostics after a readiness timeout
-  ansible.builtin.command:
-    argv:
-      - kubectl
-      - get
-      - pods
-      - -n
-      - "{{ open5gs_ns }}"
-      - -o
-      - wide
-  register: open5gs_nf_diagnostics
-  changed_when: false
-  when: open5gs_nf_wait.rc != 0
-
-- name: Require all Open5GS core NFs to be Ready
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - open5gs_nf_wait.rc == 0
-    fail_msg: |-
-      Open5GS core readiness timed out. {{ open5gs_nf_wait.stdout | default('') }}
-      {{ open5gs_nf_diagnostics.stdout | default('No pod diagnostics were available.') }}
-
-- name: Verify the AMF NGAP endpoint on the shared srsRAN compatibility network
+- name: Verify the AMF NGAP endpoint on the topology-selected network
   ansible.builtin.shell: |
-    AMF_POD=$(kubectl get pods -n {{ open5gs_ns }} -l nf=amf -o jsonpath='{.items[0].metadata.name}')
-    kubectl exec -n {{ open5gs_ns }} $AMF_POD -- ip addr show n3 | grep "inet 10.10.3.200"
+    set -eu
+    AMF_POD="$(kubectl get pods -n {{ open5gs_ns }} -l nf=amf -o jsonpath='{.items[0].metadata.name}')"
+    test -n "$AMF_POD"
+    kubectl exec -n {{ open5gs_ns }} "$AMF_POD" -- ip addr show n3 | \
+      grep -F "inet {{ synthran_topology.transport.endpoints.amf_ngap_ip }}"
+  args:
+    executable: /bin/bash
   register: amf_ngap_check
   until: amf_ngap_check.rc == 0
   retries: 15
   delay: 5
-  when: core == 'open5gs'
   changed_when: false
 
-- name: Install Open5GS subscriber tooling
+- name: Install Open5GS subscriber runtime on a fresh host
   ansible.builtin.apt:
     name:
       - python3-venv
@@ -248,58 +136,69 @@
       - python3-wheel
     state: present
   become: true
+  when: synthran_host_preparation == 'fresh'
 
-- name: Create Python virtual environment
+- name: Create the Open5GS subscriber virtual environment on a fresh host
   ansible.builtin.command:
-    cmd: python3 -m venv "{{ repo_dest }}/venv"
-    creates: "{{ repo_dest }}/venv/bin/activate"
+    argv:
+      - python3
+      - -m
+      - venv
+      - "{{ repo_dest }}/venv"
+    creates: "{{ repo_dest }}/venv/bin/python"
   become: true
+  when: synthran_host_preparation == 'fresh'
 
-- name: Bootstrap pip, setuptools and wheel in venv
+- name: Install pinned-source Open5GS subscriber requirements on a fresh host
   ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/python -m ensurepip --upgrade"
+    argv:
+      - "{{ repo_dest }}/venv/bin/pip"
+      - install
+      - -r
+      - "{{ repo_dest }}/requirements.txt"
   become: true
+  register: open5gs_requirements_install
+  changed_when: >-
+    'Successfully installed' in (open5gs_requirements_install.stdout | default('')) or
+    'Successfully installed' in (open5gs_requirements_install.stderr | default(''))
+  when: synthran_host_preparation == 'fresh'
 
-- name: Upgrade pip, setuptools and wheel explicitly in venv
+- name: Require a prepared Open5GS subscriber runtime
   ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/pip install --upgrade pip setuptools wheel"
-  become: true
+    argv:
+      - "{{ repo_dest }}/venv/bin/python"
+      - -c
+      - "import pymongo, ruamel.yaml"
+  changed_when: false
 
-- name: Install Python requirements in venv
-  ansible.builtin.command:
-    cmd: "{{ repo_dest }}/venv/bin/pip install -r {{ repo_dest }}/requirements.txt"
-  become: true
-
-- name: Generate the selected Open5GS subscriber records
+- name: Generate selected Open5GS subscriber records from the effective profile
   ansible.builtin.command:
     argv:
       - "{{ repo_dest }}/venv/bin/python"
       - "{{ repo_dest }}/mongo-tools/generate-data-fiveg.py"
     chdir: "{{ repo_dest }}"
-  register: open5gs_subscriber_generation
   changed_when: true
+  no_log: true
 
-- name: Remove stale records for the selected Open5GS subscribers
+- name: Remove every existing Open5GS subscriber before reconciliation
   ansible.builtin.command:
-    argv: >-
-      {{ [repo_dest ~ '/venv/bin/python',
-          repo_dest ~ '/mongo-tools/delete-subscribers.py']
-         + (fiveg.ues | list) }}
+    argv:
+      - "{{ repo_dest }}/venv/bin/python"
+      - "{{ repo_dest }}/mongo-tools/delete-subscribers.py"
     chdir: "{{ repo_dest }}"
-  register: open5gs_subscriber_removal
   changed_when: true
+  no_log: true
 
-- name: Insert the selected Open5GS subscribers from the effective profile
+- name: Insert the complete selected Open5GS subscriber set
   ansible.builtin.command:
-    argv: >-
-      {{ [repo_dest ~ '/venv/bin/python',
-          repo_dest ~ '/mongo-tools/add-subscribers.py']
-         + (fiveg.ues | list) }}
+    argv:
+      - "{{ repo_dest }}/venv/bin/python"
+      - "{{ repo_dest }}/mongo-tools/add-subscribers.py"
     chdir: "{{ repo_dest }}"
-  register: open5gs_subscriber_insertion
   changed_when: true
+  no_log: true
 
-- name: Confirm every selected Open5GS subscriber was inserted
+- name: Read Open5GS subscriber identifiers
   ansible.builtin.command:
     argv:
       - "{{ repo_dest }}/venv/bin/python"
@@ -307,27 +206,37 @@
     chdir: "{{ repo_dest }}"
   register: open5gs_subscriber_listing
   changed_when: false
+  no_log: true
 
 - name: Require every selected Open5GS subscriber in the database
   ansible.builtin.assert:
     quiet: true
     that:
       - >-
-        item in ((open5gs_subscriber_listing.stdout | default(''))
-                 ~ (open5gs_subscriber_listing.stderr | default('')))
+        item in ((open5gs_subscriber_listing.stdout | default('')) ~
+                 (open5gs_subscriber_listing.stderr | default('')))
     fail_msg: >-
-      Open5GS subscriber {{ item }} was not found after database reconciliation.
-      {{ open5gs_subscriber_listing.stdout | default('') }}
-      {{ open5gs_subscriber_listing.stderr | default('') }}
+      A selected Open5GS subscriber was not found after database reconciliation.
   loop: "{{ fiveg.ues | list }}"
   loop_control:
-    label: "{{ item }}"
+    label: selected-subscriber
+  no_log: true
+
+- name: Reject any Open5GS subscriber outside the generated effective profile
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - "'Subscriber not found for IMSI' not in ((open5gs_subscriber_listing.stdout | default('')) ~ (open5gs_subscriber_listing.stderr | default('')) )"
+    fail_msg: >-
+      Open5GS MongoDB contains a subscriber that is not represented by the
+      generated effective profile.
+  no_log: true
 
 - name: Provision the optional Open5GS WebUI and administrator account
   ansible.builtin.include_tasks: webui.yml
   when: open5gs_webui_enabled | bool
 
-- name: Check Open5GS deployment
+- name: Check Open5GS deployment details when explicitly requested
   ansible.builtin.include_role:
     name: 5g/open5gs/check_all
   when: show_open5gs_config | default(false)

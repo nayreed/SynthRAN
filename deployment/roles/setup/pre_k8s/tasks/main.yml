@@ -1,7 +1,8 @@
 ---
-# To avoid Pod eviction issues on live and persistent systems
+# Prepare the selected real filesystem before Kubernetes is installed. This role
+# owns containerd storage binding only; kubelet configuration is generated and
+# patched later by the cluster-creation role.
 
-# --- Detect if running from a live Ubuntu image ---
 - name: Detect live Ubuntu system
   ansible.builtin.shell: |
     grep -q "boot=live" /proc/cmdline && echo "live" || echo "persistent"
@@ -9,261 +10,193 @@
   changed_when: false
   become: true
 
-# --- Handle containerd storage for live system ---
-- name: Prepare persistent containerd storage on the live system
-  block:
-    - name: Create containerd directory
-      ansible.builtin.file:
-        path: /var/lib/containerd
-        state: directory
-        mode: '0755'
-
-    # FIX: purge all /var/lib/containerd entries from fstab — previous runs of
-    #      ansible.builtin.mount wrote both tmpfs and ext4 entries here; systemd
-    #      replayed both at containerd restart creating a stacked mount → InvalidDiskCapacity.
-    - name: Remove all /var/lib/containerd entries from fstab
-      ansible.builtin.lineinfile:
-        path: /etc/fstab
-        regexp: '.*/var/lib/containerd.*'
-        state: absent
-
-    - name: Stop containerd before unmounting
-      ansible.builtin.systemd:
-        name: containerd
-        state: stopped
-
-    # FIX: unmount all stacked mounts via shell loop — avoids ansible.builtin.mount
-    #      state: unmounted which would write a new fstab entry.
-    - name: Clear stale containerd mounts
-      ansible.builtin.shell: |
-        for i in $(seq 1 10); do
-          findmnt /var/lib/containerd &>/dev/null || break
-          umount /var/lib/containerd 2>/dev/null || umount -l /var/lib/containerd 2>/dev/null || break
-          sleep 1
-        done
-
-    # Detect whether /dev/{{ storage }} is already mounted elsewhere on this node
-    - name: Find the existing storage-device mountpoint
-      ansible.builtin.shell: |
-        findmnt -n -o TARGET /dev/{{ storage }} 2>/dev/null || echo "none"
-      register: storage_existing_mount
-      changed_when: false
-
-    # Strategy A: disk already mounted elsewhere → bind-mount a subdir
-    - name: Create the containerd directory on mounted storage
-      ansible.builtin.file:
-        path: "{{ storage_existing_mount.stdout | trim }}/containerd"
-        state: directory
-        mode: '0755'
-      when:
-        - storage_existing_mount.stdout | trim != "none"
-        - storage_existing_mount.stdout | trim != "/var/lib/containerd"
-
-    # FIX: use shell mount --bind instead of ansible.builtin.mount to avoid fstab write
-    - name: Bind mounted storage to the containerd data directory
-      ansible.builtin.shell: |
-        mount --bind "{{ storage_existing_mount.stdout | trim }}/containerd" /var/lib/containerd
-      when:
-        - storage_existing_mount.stdout | trim != "none"
-        - storage_existing_mount.stdout | trim != "/var/lib/containerd"
-
-    # Strategy B: disk not mounted anywhere → mount directly
-    # FIX: use shell mount instead of ansible.builtin.mount to avoid fstab write
-    - name: Mount the storage device at the containerd data directory
-      ansible.builtin.shell: |
-        mount -t ext4 -o defaults,noatime /dev/{{ storage }} /var/lib/containerd
-      when:
-        - storage_existing_mount.stdout | trim == "none"
-
-    # FIX: containerd 1.7 does not report capacityBytes via CRI stats when the
-    #      overlayfs snapshotter directory is a plain subdirectory (not a mountpoint).
-    #      kubelet receives capacity=0 → InvalidDiskCapacity warning.
-    #      Bind-mounting the overlayfs dir onto itself makes it a real mountpoint,
-    #      so statfs() returns the correct capacity and containerd forwards it via CRI.
-    - name: Create overlayfs snapshotter directory
-      ansible.builtin.file:
-        path: /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
-        state: directory
-        mode: '0755'
-
-    - name: Expose overlayfs capacity statistics to CRI
-      ansible.builtin.shell: |
-        findmnt /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs &>/dev/null || \
-          mount --bind /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs \
-                       /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
-
-    # kubelet on tmpfs is acceptable — kubelet workdir does not need statfs capacity
-    - name: Ensure /var/lib/kubelet directory exists
-      ansible.builtin.file:
-        path: /var/lib/kubelet
-        state: directory
-        mode: '0755'
-      when: ran_node_name == core_node_name
-
-    - name: Mount tmpfs on /var/lib/kubelet (5G) — shared node only
-      ansible.builtin.mount:
-        path: /var/lib/kubelet
-        src: tmpfs
-        fstype: tmpfs
-        opts: size=5G
-        state: mounted
-      when: ran_node_name == core_node_name
-
-  when: live_image_check.stdout == "live"
-  become: true
-  tags: ['live-fix']
-
-# --- Handle containerd storage for persistent system ---
-- name: Ensure storage device exists
+- name: Ensure selected storage device exists
   ansible.builtin.stat:
     path: "/dev/{{ storage }}"
   register: storage_device
   become: true
 
-- name: Validate the containerd storage device
+- name: Validate the selected containerd storage device
   ansible.builtin.assert:
-    that: storage_device.stat.exists
-    fail_msg: "Storage device /dev/{{ storage }} does not exist"
-    success_msg: "Storage device /dev/{{ storage }} is available"
+    quiet: true
+    that:
+      - storage_device.stat.exists
+      - storage_device.stat.isblk | default(false)
+    fail_msg: "Storage device /dev/{{ storage }} does not exist or is not a block device"
 
 - name: Create containerd mount point
   ansible.builtin.file:
     path: /var/lib/containerd
     state: directory
     mode: '0755'
-
-- name: Mount persistent storage for containerd
-  ansible.builtin.mount:
-    path: /var/lib/containerd
-    src: "/dev/{{ storage }}"
-    fstype: ext4
-    state: mounted
-  when: live_image_check.stdout != "live"
   become: true
 
-# --- Kubelet preparation ---
+- name: Detect whether selected storage already backs containerd
+  ansible.builtin.shell: |
+    set -eu
+    current="$(findmnt --nofsroot -n -o SOURCE /var/lib/containerd 2>/dev/null || true)"
+    selected="$(readlink -f /dev/{{ storage }})"
+    if [ -n "$current" ] && [ "$(readlink -f "$current")" = "$selected" ]; then
+      echo selected
+    else
+      echo other
+    fi
+  args:
+    executable: /bin/bash
+  register: containerd_existing_binding
+  changed_when: false
+  become: true
+
+- name: Stop containerd before changing its storage binding
+  ansible.builtin.systemd:
+    name: containerd
+    state: stopped
+  become: true
+  when: containerd_existing_binding.stdout | trim != 'selected'
+
+- name: Remove stale /var/lib/containerd fstab entries
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '.*/var/lib/containerd.*'
+    state: absent
+  become: true
+  when: containerd_existing_binding.stdout | trim != 'selected'
+
+- name: Clear stale containerd mounts
+  ansible.builtin.shell: |
+    for i in $(seq 1 10); do
+      findmnt /var/lib/containerd &>/dev/null || break
+      umount /var/lib/containerd 2>/dev/null || umount -l /var/lib/containerd 2>/dev/null || break
+      sleep 1
+    done
+  changed_when: false
+  become: true
+  when: containerd_existing_binding.stdout | trim != 'selected'
+
+- name: Find an existing mountpoint for the selected storage device
+  ansible.builtin.shell: |
+    findmnt -nr -S /dev/{{ storage }} -o TARGET 2>/dev/null | head -n 1 || true
+  register: storage_existing_mount
+  changed_when: false
+  become: true
+
+- name: Read the selected storage filesystem type
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -s
+      - TYPE
+      - -o
+      - value
+      - "/dev/{{ storage }}"
+  register: storage_fstype
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Require a supported selected storage filesystem
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        (containerd_existing_binding.stdout | trim == 'selected' and
+         storage_fstype.stdout | trim in ['ext4', 'xfs', 'btrfs']) or
+        (containerd_existing_binding.stdout | trim != 'selected' and
+         storage_existing_mount.stdout | trim | length > 0 and
+         storage_fstype.stdout | trim in ['ext4', 'xfs', 'btrfs']) or
+        (containerd_existing_binding.stdout | trim != 'selected' and
+         storage_existing_mount.stdout | trim | length == 0 and
+         storage_fstype.stdout | trim == 'ext4')
+    fail_msg: >-
+      Selected storage /dev/{{ storage }} uses '{{ storage_fstype.stdout | trim }}'.
+      Mounted storage must use ext4/xfs/btrfs; unmounted storage must already be
+      ext4. SynthRAN will not format the device.
+
+- name: Create the containerd directory on already-mounted storage
+  ansible.builtin.file:
+    path: "{{ storage_existing_mount.stdout | trim }}/containerd"
+    state: directory
+    mode: '0755'
+  become: true
+  when:
+    - containerd_existing_binding.stdout | trim != 'selected'
+    - storage_existing_mount.stdout | trim | length > 0
+
+- name: Bind already-mounted storage to the containerd data directory
+  ansible.builtin.shell: |
+    mount --bind "{{ storage_existing_mount.stdout | trim }}/containerd" /var/lib/containerd
+  become: true
+  when:
+    - containerd_existing_binding.stdout | trim != 'selected'
+    - storage_existing_mount.stdout | trim | length > 0
+
+- name: Mount unmounted ext4 storage at the containerd data directory
+  ansible.builtin.shell: |
+    mount -t ext4 -o defaults,noatime /dev/{{ storage }} /var/lib/containerd
+  become: true
+  when:
+    - containerd_existing_binding.stdout | trim != 'selected'
+    - storage_existing_mount.stdout | trim | length == 0
+
+- name: Verify containerd storage is on a real filesystem
+  ansible.builtin.shell: |
+    fstype=$(findmnt -n -o FSTYPE /var/lib/containerd 2>/dev/null | head -1 || echo "NOT_MOUNTED")
+    echo "$fstype"
+    case "$fstype" in
+      ext4|xfs|btrfs) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  register: containerd_storage_fstype
+  changed_when: false
+  become: true
+
+- name: Report the selected containerd storage binding
+  ansible.builtin.debug:
+    msg: >-
+      /dev/{{ storage }} ({{ storage_fstype.stdout | trim }}) ->
+      {{ 'retained /var/lib/containerd' if containerd_existing_binding.stdout | trim == 'selected' else (storage_existing_mount.stdout | trim if storage_existing_mount.stdout | trim | length > 0 else '/var/lib/containerd') }} ->
+      /var/lib/containerd ({{ containerd_storage_fstype.stdout | trim }})
+
 - name: Ensure kubelet base directory exists
   ansible.builtin.file:
     path: /var/lib/kubelet
     state: directory
     mode: '0755'
-
-- name: Check if kubelet config exists
-  ansible.builtin.stat:
-    path: /var/lib/kubelet/config.yaml
-  register: kubelet_cfg
-
-- name: Backup existing kubelet config if present
-  ansible.builtin.copy:
-    src: /var/lib/kubelet/config.yaml
-    dest: /var/lib/kubelet/config.yaml.bak.{{ ansible_date_time.epoch }}
-    remote_src: true
-  when: kubelet_cfg.stat.exists
-
-- name: Ensure kubelet config exists
-  ansible.builtin.file:
-    path: /var/lib/kubelet/config.yaml
-    state: touch
-    mode: '0644'
-    access_time: preserve
-    modification_time: preserve
-
-# FIX: remove any existing rootDir line before patching — blockinfile only adds
-#      its own block, it does not clean up lines written by previous role runs
-#      (e.g. k8s_cpu_tuning). rootDir must be absent: it is kubelet's workdir
-#      (default /var/lib/kubelet) and must NOT point to /var/lib/containerd.
-- name: Remove rootDir from kubelet config if present
-  ansible.builtin.lineinfile:
-    path: /var/lib/kubelet/config.yaml
-    regexp: '^\s*rootDir:'
-    state: absent
   become: true
 
-- name: Configure kubelet storage eviction thresholds
-  ansible.builtin.blockinfile:
-    path: /var/lib/kubelet/config.yaml
-    block: |
-      evictionHard:
-        nodefs.available: "{{ '2%' if (core_node_name == ran_node_name) else '10%' }}"
-        imagefs.available: "{{ '2%' if (core_node_name == ran_node_name) else '10%' }}"
-      {% if core_node_name == ran_node_name %}
-      evictionMinimumReclaim:
-        nodefs.available: "500Mi"
-      {% endif %}
-      imageGCHighThresholdPercent: 85
-      imageGCLowThresholdPercent: 80
-    marker: "# {mark} KUBELET STORAGE PATCH"
+- name: Mount tmpfs on /var/lib/kubelet for a colocated live 5G node
+  ansible.builtin.mount:
+    path: /var/lib/kubelet
+    src: tmpfs
+    fstype: tmpfs
+    opts: size=5G
+    state: mounted
   become: true
+  when:
+    - live_image_check.stdout == "live"
+    - ran_node_name == core_node_name
 
-
-# --- Restart services only if present ---
-- name: Check if containerd service exists
-  ansible.builtin.shell: systemctl list-unit-files | grep -q '^containerd\.service'
-  register: containerd_service
-  changed_when: false
-  failed_when: false
-
-- name: Reload systemd and restart containerd
+- name: Restart containerd after changing its storage binding
   ansible.builtin.systemd:
     name: containerd
     state: restarted
-    enabled: yes
-    daemon_reload: yes
-  when: containerd_service.rc == 0
+    enabled: true
+    daemon_reload: true
+  become: true
+  when: containerd_existing_binding.stdout | trim != 'selected'
 
-- name: Check if kubelet service exists
-  ansible.builtin.shell: systemctl list-unit-files | grep -q '^kubelet\.service'
-  register: kubelet_service
-  changed_when: false
-  failed_when: false
-
-- name: Restart kubelet
+- name: Keep containerd running on the retained storage binding
   ansible.builtin.systemd:
-    name: kubelet
-    state: restarted
-    enabled: yes
-    daemon_reload: yes
-  when: kubelet_service.rc == 0
-
-# --- Validation of disk pressure fix ---
-# FIX: use findmnt -n -o FSTYPE (returns just "ext4") instead of "mount | grep"
-#      which returned the full mount line — the old regex matched "tmpfs" inside
-#      that string even when the check ran after a successful remount.
-- name: Check /var/lib/containerd mount fstype
-  ansible.builtin.shell: |
-    findmnt -n -o FSTYPE /var/lib/containerd 2>/dev/null | head -1 || echo "NOT_MOUNTED"
-  register: containerd_mount
-  changed_when: false
+    name: containerd
+    state: started
+    enabled: true
   become: true
+  when: containerd_existing_binding.stdout | trim == 'selected'
 
-- name: Report the containerd storage filesystem
-  ansible.builtin.debug:
-    msg: "/var/lib/containerd uses {{ containerd_mount.stdout | trim }} on /dev/{{ storage }}"
-
-- name: Fail if /var/lib/containerd is on a virtual filesystem
-  ansible.builtin.fail:
-    msg: >
-      /var/lib/containerd fstype is '{{ containerd_mount.stdout }}' — kubelet will report
-      InvalidDiskCapacity. Ensure /dev/{{ storage }} is ext4-formatted and mounted.
-  when: containerd_mount.stdout in ['NOT_MOUNTED', 'tmpfs', 'squashfs', 'ramfs', 'none']
-
-- name: Verify kubelet evictionHard and imageGC
-  ansible.builtin.shell: |
-    grep 'evictionHard' /var/lib/kubelet/config.yaml && echo "OK" || echo "MISSING"
-  register: kubelet_config_check
+- name: Wait for containerd to accept requests
+  ansible.builtin.command: ctr version
+  register: pre_k8s_containerd_ready
   changed_when: false
-  become: true
-
-- name: Report kubelet storage policy validation
-  ansible.builtin.debug:
-    msg: "Kubelet eviction policy: {{ 'configured' if 'evictionHard' in kubelet_config_check.stdout else 'missing' }}"
-
-- name: Fail if /var/lib/containerd is not on a real filesystem
-  ansible.builtin.fail:
-    msg: "/var/lib/containerd fstype is '{{ containerd_mount.stdout }}' — kubelet will report InvalidDiskCapacity"
-  when: containerd_mount.stdout | trim in ['', 'NOT_MOUNTED', 'tmpfs', 'squashfs', 'ramfs', 'none']
-
-- name: Fail if evictionHard is missing from kubelet config
-  ansible.builtin.fail:
-    msg: "evictionHard not found in /var/lib/kubelet/config.yaml"
-  when: '"evictionHard" not in kubelet_config_check.stdout'
+  retries: 30
+  delay: 1
+  until: pre_k8s_containerd_ready.rc == 0

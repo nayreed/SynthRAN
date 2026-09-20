@@ -10,43 +10,19 @@
     name: "{{ core_ns }}"
     state: present
 
-- name: Check if yq is already installed
-  ansible.builtin.stat:
-    path: "{{ yq_bin_path }}"
-  register: yq_bin
-
-- name: Download yq binary using curl or wget
-  ansible.builtin.shell: |
-    set -e
-    if command -v curl >/dev/null 2>&1; then
-      curl -L --fail "{{ yq_url }}" -o "{{ yq_bin_path }}"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -O "{{ yq_bin_path }}" "{{ yq_url }}"
-    else
-      echo "Neither curl nor wget found" >&2
-      exit 1
-    fi
-  args:
-    creates: "{{ yq_bin_path }}"
-  when: not yq_bin.stat.exists
-  become: true
-
-- name: Ensure yq is executable
-  ansible.builtin.file:
-    path: "{{ yq_bin_path }}"
-    mode: '0755'
-    state: file
-  become: true
-
 # ============================================================
 # Step 1: Clean up any existing Helm release (including stuck)
 # ============================================================
 
 - name: Check if free5gc Helm release exists (including pending/failed states)
-  ansible.builtin.shell: helm list -n "{{ core_ns }}" -a -q | grep -w "^free5gc$" | wc -l
+  ansible.builtin.shell: |
+    set -o pipefail
+    helm list -n "{{ core_ns }}" -a -q | \
+      awk '$0 == "free5gc" { count++ } END { print count + 0 }'
+  args:
+    executable: /bin/bash
   register: helm_release_exists
   changed_when: false
-  failed_when: false
 
 - name: Uninstall existing free5gc Helm release (handles pending-install/upgrade/failed)
   ansible.builtin.shell: helm uninstall free5gc -n "{{ core_ns }}" --no-hooks --timeout 120s
@@ -54,21 +30,28 @@
   failed_when: false
   register: helm_uninstall_result
 
-- name: Report the previous Free5GC release removal
-  ansible.builtin.debug:
-    msg: "{{ helm_uninstall_result.stderr | default('no output') }}"
-  when:
-    - helm_release_exists.stdout | trim | int > 0
-    - helm_uninstall_result is defined
-
 - name: Wait for Helm release to be fully removed
-  ansible.builtin.shell: helm list -n "{{ core_ns }}" -a -q | grep -w "^free5gc$" | wc -l
+  ansible.builtin.shell: |
+    set -o pipefail
+    helm list -n "{{ core_ns }}" -a -q | \
+      awk '$0 == "free5gc" { count++ } END { print count + 0 }'
+  args:
+    executable: /bin/bash
   register: helm_gone
   until: helm_gone.stdout | trim | int == 0
   retries: 24
   delay: 5
   changed_when: false
-  failed_when: false
+  when: helm_release_exists.stdout | trim | int > 0
+
+- name: Require the previous Free5GC Helm release to be absent
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - helm_gone.stdout | trim | int == 0
+    fail_msg: >-
+      The previous Free5GC Helm release could not be removed cleanly.
+      {{ helm_uninstall_result.stderr | default('No uninstall diagnostics were available.') }}
   when: helm_release_exists.stdout | trim | int > 0
 
 - name: Wait after Helm uninstall before cleaning resources
@@ -89,13 +72,27 @@
   failed_when: false
 
 - name: Wait for cert-pv to be fully deleted
-  ansible.builtin.shell: kubectl get pv cert-pv --no-headers 2>/dev/null | wc -l
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - pv
+      - cert-pv
+      - --ignore-not-found
+      - -o
+      - name
   register: pv_static_check
-  until: pv_static_check.stdout | trim | int == 0
+  until: pv_static_check.stdout | trim | length == 0
   retries: 20
   delay: 5
   changed_when: false
-  failed_when: false
+
+- name: Require the previous static cert-pv to be absent
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - pv_static_check.stdout | trim | length == 0
+    fail_msg: "The previous Free5GC cert-pv could not be removed."
 
 # ============================================================
 # Step 3: Clean up cert-pvc and any dynamically bound PV
@@ -108,7 +105,6 @@
     name: cert-pvc
     namespace: "{{ core_ns }}"
   register: cert_pvc_info
-  failed_when: false
 
 - name: Patch cert-pvc finalizers to unblock deletion
   ansible.builtin.shell: >
@@ -137,13 +133,25 @@
   until: pvc_check.resources | length == 0
   retries: 30
   delay: 5
-  failed_when: false
+  when: cert_pvc_info.resources | length > 0
+
+- name: Require the previous cert-pvc to be absent
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - pvc_check.resources | length == 0
+    fail_msg: "The previous Free5GC cert-pvc could not be removed."
+  when: cert_pvc_info.resources | length > 0
 
 - name: Find any remaining PV bound to cert-pvc
-  ansible.builtin.shell: kubectl get pv --no-headers | grep "{{ core_ns }}/cert-pvc" | awk '{print $1}'
+  ansible.builtin.shell: |
+    set -o pipefail
+    kubectl get pv --no-headers | \
+      awk '$0 ~ /{{ core_ns }}\/cert-pvc/ { print $1 }'
+  args:
+    executable: /bin/bash
   register: cert_pv_dynamic
   changed_when: false
-  failed_when: false
 
 - name: Patch dynamic PV finalizers to unblock deletion
   ansible.builtin.shell: >
@@ -158,13 +166,25 @@
   failed_when: false
 
 - name: Wait for dynamic PV to be fully deleted
-  ansible.builtin.shell: kubectl get pv --no-headers | grep "{{ core_ns }}/cert-pvc" | wc -l
+  ansible.builtin.shell: |
+    set -o pipefail
+    kubectl get pv --no-headers | \
+      awk '$0 ~ /{{ core_ns }}\/cert-pvc/ { count++ } END { print count + 0 }'
+  args:
+    executable: /bin/bash
   register: pv_dynamic_check
   until: pv_dynamic_check.stdout | trim | int == 0
   retries: 30
   delay: 5
   changed_when: false
-  failed_when: false
+  when: cert_pv_dynamic.stdout | trim | length > 0
+
+- name: Require dynamic cert PV cleanup to complete
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - pv_dynamic_check.stdout | trim | int == 0
+    fail_msg: "A dynamically bound Free5GC cert PV survived cleanup."
   when: cert_pv_dynamic.stdout | trim | length > 0
 
 # ============================================================
@@ -208,7 +228,14 @@
                       - "{{ core_node_name }}"
 
 - name: Wait for cert-pv to be Available
-  ansible.builtin.shell: kubectl get pv cert-pv --no-headers | awk '{print $5}'
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - pv
+      - cert-pv
+      - -o
+      - jsonpath={.status.phase}
   register: pv_status
   until: pv_status.stdout | trim == "Available"
   retries: 20
@@ -221,12 +248,20 @@
 
 - name: Remove orphan NGAP service if not owned by Helm
   ansible.builtin.shell: |
-    if kubectl get svc free5gc-free5gc-amf-amf-n2 -n {{ core_ns }}        -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null | grep -q "Helm"; then
+    set -euo pipefail
+    managed_by="$(
+      kubectl get svc free5gc-free5gc-amf-amf-n2 -n {{ core_ns }} \
+        --ignore-not-found \
+        -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}'
+    )"
+    if [ "$managed_by" = "Helm" ]; then
       echo "owned by Helm, skipping"
     else
       kubectl delete svc free5gc-free5gc-amf-amf-n2 -n {{ core_ns }} --ignore-not-found
       echo "deleted orphan service"
     fi
+  args:
+    executable: /bin/bash
   register: cleanup_ngap_svc
   changed_when: "'deleted' in cleanup_ngap_svc.stdout"
 
@@ -265,10 +300,10 @@
             - SYS_MODULE
 
 # ============================================================
-# Step 6: Provision MongoDB subscribers from the network profile
+# Step 6: Provision MongoDB subscribers from the effective profile
 # ============================================================
 
-- name: Wait for dbpython pod to be Running
+- name: Wait for dbpython pod to be Running and Ready
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Pod
@@ -277,15 +312,17 @@
       - app.kubernetes.io/name=free5gc-dbpython
   register: dbpython_pod
   until:
-    - dbpython_pod.resources | length > 0
+    - dbpython_pod.resources | length == 1
     - dbpython_pod.resources[0].status.phase == "Running"
+    - dbpython_pod.resources[0].status.containerStatuses is defined
+    - dbpython_pod.resources[0].status.containerStatuses | length > 0
     - dbpython_pod.resources[0].status.containerStatuses |
       selectattr('ready', 'equalto', true) | list | length ==
       dbpython_pod.resources[0].status.containerStatuses | length
   retries: 30
   delay: 10
 
-- name: Wait for MongoDB to be ready
+- name: Wait for MongoDB to be Running and Ready
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Pod
@@ -296,47 +333,79 @@
   until:
     - mongodb_pod.resources | length > 0
     - mongodb_pod.resources[0].status.phase == "Running"
+    - mongodb_pod.resources[0].status.containerStatuses is defined
+    - mongodb_pod.resources[0].status.containerStatuses | length > 0
     - mongodb_pod.resources[0].status.containerStatuses |
       selectattr('ready', 'equalto', true) | list | length ==
       mongodb_pod.resources[0].status.containerStatuses | length
   retries: 30
   delay: 10
 
-- name: Find add_subscribers.py path in dbpython pod
+- name: Copy selected-profile subscriber utility to the pinned dbpython path
   ansible.builtin.shell: |
-    kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      find / -name "add_subscribers.py" 2>/dev/null | head -1
-  register: subscribers_script_path
+    set -euo pipefail
+    pod="$(kubectl get pod -n {{ core_ns }} -l app.kubernetes.io/name=free5gc-dbpython \
+      -o jsonpath='{.items[0].metadata.name}')"
+    test -n "$pod"
+    kubectl cp \
+      {{ free5gc_repo_dest }}/docker/free5gc/free5gc-dbpython/add_subscribers.py \
+      "{{ core_ns }}/${pod}:/free5gc/add_subscribers.py"
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+
+- name: Require the selected-profile subscriber utility at the pinned path
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - exec
+      - -n
+      - "{{ core_ns }}"
+      - deployment/free5gc-free5gc-dbpython-dbpython
+      - --
+      - test
+      - -f
+      - /free5gc/add_subscribers.py
   changed_when: false
+  no_log: true
 
-- name: Copy generated add_subscribers.py into dbpython pod
-  ansible.builtin.shell: |
-    kubectl cp {{ free5gc_repo_dest }}/docker/free5gc/free5gc-dbpython/add_subscribers.py \
-      {{ core_ns }}/$(kubectl get pod -n {{ core_ns }} -l app.kubernetes.io/name=free5gc-dbpython \
-      -o jsonpath='{.items[0].metadata.name}'):/free5gc/add_subscribers.py
+- name: Clean existing Free5GC subscribers
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - exec
+      - -n
+      - "{{ core_ns }}"
+      - deployment/free5gc-free5gc-dbpython-dbpython
+      - --
+      - python3
+      - /free5gc/add_subscribers.py
+      - -a
+      - clean
   changed_when: true
+  no_log: true
 
-- name: Clean existing MongoDB subscribers
-  ansible.builtin.shell: |
-    kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      python3 {{ subscribers_script_path.stdout | trim }} -a clean
+- name: Add selected subscribers from the effective profile
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - exec
+      - -n
+      - "{{ core_ns }}"
+      - deployment/free5gc-free5gc-dbpython-dbpython
+      - --
+      - python3
+      - /free5gc/add_subscribers.py
+      - -a
+      - add
   changed_when: true
-
-- name: Add subscribers from network profile to MongoDB
-  ansible.builtin.shell: |
-    kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      python3 {{ subscribers_script_path.stdout | trim }} -a add
-  register: add_subscribers_result
-  changed_when: true
-
-- name: Report Free5GC subscriber provisioning
-  ansible.builtin.debug:
-    msg: "{{ add_subscribers_result.stdout_lines }}"
+  no_log: true
 
 # ============================================================
-# Step 7: Verify deployment matches the network profile
+# Step 7: Verify deployment matches the effective profile
 # ============================================================
 
-- name: Run free5gc network-profile verification
+- name: Run Free5GC network-profile verification
   ansible.builtin.include_role:
     name: 5g/free5gc/verify

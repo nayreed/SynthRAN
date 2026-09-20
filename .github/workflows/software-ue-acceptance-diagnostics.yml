@@ -1,0 +1,32 @@
+name: Software UE acceptance diagnostics
+
+on:
+  pull_request:
+    paths:
+      - 'deployment/scripts/probe_software_ues.py'
+      - 'deployment/playbooks/verify_live_testbed.yml'
+      - 'tools/check_software_ue_diagnostics.py'
+      - '.github/workflows/software-ue-acceptance-diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Compile diagnostic sources
+        run: |
+          python -m py_compile \
+            deployment/scripts/probe_software_ues.py \
+            tools/check_software_ue_diagnostics.py
+
+      - name: Exercise stage-specific acceptance diagnostics
+        run: python tools/check_software_ue_diagnostics.py

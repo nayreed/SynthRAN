@@ -1,0 +1,357 @@
+---
+- name: Attest the live R2Lab N320 RAN-local contract
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 - \
+      "{{ core }}" \
+      "{{ oai_ran_release_name }}" \
+      "{{ ran_container_name }}" \
+      "{{ oai_n2_release_name }}" \
+      "{{ oai_gnb_mode | default('monolithic') }}" \
+      "{{ oai_r2lab_n320_ru_parent }}" \
+      "{{ oai_r2lab_n320_ru_cni_type }}" \
+      "{{ oai_r2lab_n320_ru_cni_mode }}" \
+      "{{ oai_r2lab_n320_ru_ip }}/{{ oai_r2lab_n320_ru_prefix }}" \
+      "{{ oai_r2lab_n320_ru_mtu }}" \
+      "{{ oai_r2lab_n320_sdr_ip }}" <<'PY'
+    import json
+    import pathlib
+    import re
+    import subprocess
+    import sys
+    import time
+
+    (
+        namespace,
+        radio_release,
+        radio_container,
+        n2_release,
+        mode,
+        parent,
+        cni_type,
+        cni_mode,
+        ru_address,
+        ru_mtu,
+        sdr_ip,
+    ) = sys.argv[1:]
+    expected_mtu = int(ru_mtu)
+    expected_releases = {
+        'monolithic': ['oai-gnb'],
+        'cudu': ['oai-cu', 'oai-du'],
+        'cucpup': ['oai-cu-cp', 'oai-cu-up', 'oai-du'],
+    }[mode]
+    rf_ready_pattern = re.compile(r'RU [0-9]+ rf device ready')
+    n2_marker = 'Received NGSetupResponse from AMF'
+
+    def kubectl(*args):
+        return subprocess.check_output(['kubectl', *args], text=True)
+
+    def current_pod(release):
+        pods = json.loads(kubectl(
+            '-n', namespace, 'get', 'pods',
+            '-l', f'app.kubernetes.io/instance={release}',
+            '-o', 'json',
+        )).get('items', [])
+        if not pods:
+            raise SystemExit(f'no pod found for OAI release {release!r}')
+        return max(
+            pods,
+            key=lambda item: item.get('metadata', {}).get('creationTimestamp', ''),
+        )
+
+    def pod_snapshot(release):
+        pod = current_pod(release)
+        metadata = pod.get('metadata', {})
+        status = pod.get('status', {})
+        pod_name = metadata.get('name', '')
+        pod_uid = metadata.get('uid', '')
+        phase = status.get('phase')
+        if phase != 'Running':
+            raise SystemExit(f'OAI release {release!r} pod {pod_name!r} is not Running: {phase!r}')
+        ready = next(
+            (
+                condition.get('status') == 'True'
+                for condition in status.get('conditions', [])
+                if condition.get('type') == 'Ready'
+            ),
+            False,
+        )
+        if not ready:
+            raise SystemExit(f'OAI release {release!r} pod {pod_name!r} is not Ready')
+
+        container_statuses = status.get('containerStatuses', []) or []
+        if not container_statuses:
+            raise SystemExit(f'OAI release {release!r} pod {pod_name!r} has no container status')
+        not_ready = [
+            item.get('name', '')
+            for item in container_statuses
+            if not item.get('ready', False)
+        ]
+        if not_ready:
+            raise SystemExit(
+                f'OAI release {release!r} pod {pod_name!r} has non-ready containers: {not_ready!r}'
+            )
+        restarts = {
+            item.get('name', ''): int(item.get('restartCount', 0))
+            for item in container_statuses
+        }
+        return pod, {
+            'pod': pod_name,
+            'pod_uid': pod_uid,
+            'restarts': restarts,
+        }
+
+    first = {}
+    for release in expected_releases:
+        _, summary = pod_snapshot(release)
+        first[release] = summary
+
+    time.sleep(10)
+
+    second_pods = {}
+    second = {}
+    for release in expected_releases:
+        pod, summary = pod_snapshot(release)
+        second_pods[release] = pod
+        second[release] = summary
+        if summary['pod_uid'] != first[release]['pod_uid']:
+            raise SystemExit(
+                f'OAI release {release!r} pod identity changed during stability window: '
+                f'{first[release]["pod_uid"]!r} -> {summary["pod_uid"]!r}'
+            )
+        if summary['restarts'] != first[release]['restarts']:
+            raise SystemExit(
+                f'OAI release {release!r} restart counters changed during stability window: '
+                f'{first[release]["restarts"]!r} -> {summary["restarts"]!r}'
+            )
+
+    deployment = json.loads(
+        kubectl('-n', namespace, 'get', 'deployment', radio_release, '-o', 'json')
+    )
+    nad_name = f'{radio_release}-ru'
+    nad = json.loads(
+        kubectl(
+            '-n',
+            namespace,
+            'get',
+            'network-attachment-definition',
+            nad_name,
+            '-o',
+            'json',
+        )
+    )
+    nad_config = json.loads(nad['spec']['config'])
+    plugins = nad_config.get('plugins', [])
+    if len(plugins) != 1:
+        raise SystemExit(f'N320 RU NAD must contain exactly one plugin: {plugins!r}')
+    plugin = plugins[0]
+
+    env = {}
+    pod_spec = deployment['spec']['template']['spec']
+    for group in ('initContainers', 'containers'):
+        for item in pod_spec.get(group, []) or []:
+            for variable in item.get('env', []) or []:
+                if 'value' in variable:
+                    env[variable.get('name', '')] = variable['value']
+    sdr_addrs = env.get('SDR_ADDRS', '')
+    sdr_fields = dict(
+        field.split('=', 1)
+        for field in sdr_addrs.split(',')
+        if '=' in field
+    )
+
+    radio_pod = second_pods[radio_release]
+    radio_status = second[radio_release]
+    pod_name = radio_status['pod']
+    pod_uid = radio_status['pod_uid']
+
+    network_status_raw = radio_pod.get('metadata', {}).get('annotations', {}).get(
+        'k8s.v1.cni.cncf.io/network-status', '[]'
+    )
+    network_status = json.loads(network_status_raw)
+    ru_status = next(
+        (
+            item
+            for item in network_status
+            if item.get('interface') == 'ru'
+            or item.get('name', '').endswith(f'/{nad_name}')
+        ),
+        None,
+    )
+    if ru_status is None:
+        raise SystemExit(f'RU network status missing on pod {pod_name}')
+
+    statuses = radio_pod.get('status', {}).get('containerStatuses', []) or []
+    container_status = next(
+        (item for item in statuses if item.get('name') == radio_container),
+        None,
+    )
+    if container_status is None:
+        raise SystemExit(
+            f'radio container status {radio_container!r} missing on pod {pod_name}'
+        )
+    radio_restart_count = int(container_status.get('restartCount', 0))
+    if radio_restart_count != 0:
+        raise SystemExit(
+            f'N320 radio container restarted during startup: restartCount={radio_restart_count}'
+        )
+    image_id = container_status.get('imageID', '')
+    if 'sha256:' not in image_id:
+        raise SystemExit(f'live OAI imageID is not digest-qualified: {image_id!r}')
+
+    parent_mac = pathlib.Path(f'/sys/class/net/{parent}/address').read_text().strip().lower()
+    parent_mtu = int(pathlib.Path(f'/sys/class/net/{parent}/mtu').read_text().strip())
+    live_ru_mtu = int(
+        kubectl(
+            '-n',
+            namespace,
+            'exec',
+            pod_name,
+            '-c',
+            radio_container,
+            '--',
+            'cat',
+            '/sys/class/net/ru/mtu',
+        ).strip()
+    )
+    ru_mac = str(ru_status.get('mac', '')).lower()
+    ru_ip = ru_address.split('/', 1)[0]
+
+    expected_plugin = {
+        'type': cni_type,
+        'master': parent,
+        'mode': cni_mode,
+        'address': ru_address,
+    }
+    actual_plugin = {
+        'type': plugin.get('type'),
+        'master': plugin.get('master'),
+        'mode': plugin.get('mode'),
+        'address': plugin.get('ipam', {}).get('addresses', [{}])[0].get('address'),
+    }
+    if actual_plugin != expected_plugin:
+        raise SystemExit(
+            f'live N320 NAD mismatch: expected={expected_plugin!r} actual={actual_plugin!r}'
+        )
+    if sdr_fields.get('mgmt_addr') != sdr_ip or sdr_fields.get('addr') != sdr_ip:
+        raise SystemExit(f'live N320 SDR_ADDRS mismatch: {sdr_addrs!r}')
+    if ru_ip not in (ru_status.get('ips') or []):
+        raise SystemExit(
+            f'live N320 RU address missing: expected={ru_ip!r} status={ru_status!r}'
+        )
+    if ru_mac != parent_mac:
+        raise SystemExit(
+            f'live N320 ipvlan MAC mismatch: parent={parent_mac!r} ru={ru_mac!r}'
+        )
+    if parent_mtu != expected_mtu or live_ru_mtu != expected_mtu:
+        raise SystemExit(
+            f'live N320 MTU mismatch: expected={expected_mtu} '
+            f'parent={parent_mtu} ru={live_ru_mtu}'
+        )
+
+    radio_logs = kubectl(
+        '-n', namespace, 'logs', pod_name, '-c', radio_container
+    )
+    if rf_ready_pattern.search(radio_logs) is None:
+        raise SystemExit(
+            f'current radio pod {pod_name!r} no longer exposes RF-ready evidence'
+        )
+
+    n2_pod = second_pods[n2_release]
+    n2_pod_name = second[n2_release]['pod']
+    n2_container = None
+    for status in n2_pod.get('status', {}).get('containerStatuses', []) or []:
+        name = status.get('name', '')
+        result = subprocess.run(
+            ['kubectl', '-n', namespace, 'logs', n2_pod_name, '-c', name],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode == 0 and n2_marker in result.stdout:
+            n2_container = name
+            break
+    if n2_container is None:
+        raise SystemExit(
+            f'OAI N2 owner {n2_release!r} has no {n2_marker!r} evidence '
+            f'on stable pod {n2_pod_name!r}'
+        )
+
+    print(
+        json.dumps(
+            {
+                'schema_version': 2,
+                'mode': mode,
+                'release': radio_release,
+                'pod': pod_name,
+                'pod_uid': pod_uid,
+                'container': radio_container,
+                'restart_count': radio_restart_count,
+                'stability_window_seconds': 10,
+                'workloads': second,
+                'nad': nad_name,
+                'ru': {
+                    'type': actual_plugin['type'],
+                    'master': actual_plugin['master'],
+                    'mode': actual_plugin['mode'],
+                    'address': actual_plugin['address'],
+                    'mac': ru_mac,
+                    'mtu': live_ru_mtu,
+                },
+                'sdr_addrs': sdr_addrs,
+                'rf_ready': True,
+                'n2': {
+                    'release': n2_release,
+                    'pod': n2_pod_name,
+                    'pod_uid': second[n2_release]['pod_uid'],
+                    'container': n2_container,
+                    'signal': n2_marker,
+                },
+                'image': container_status.get('image', ''),
+                'imageID': image_id,
+            },
+            sort_keys=True,
+        )
+    )
+    PY
+  args:
+    executable: /bin/bash
+  register: oai_n320_runtime_attestation
+  changed_when: false
+
+- name: Ensure the run provenance directory exists for N320 attestation
+  ansible.builtin.file:
+    path: "{{ run_dir }}/provenance"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  become: false
+
+- name: Retain the R2Lab N320 runtime and source attestation
+  ansible.builtin.copy:
+    dest: "{{ run_dir }}/provenance/oai-n320-runtime.json"
+    content: >-
+      {{
+        (oai_n320_runtime_attestation.stdout | from_json)
+        | combine({
+            'sources': {
+              'helper_repository': repo_oai5g_rru,
+              'helper_revision': tag_oai5g_rru,
+              'charts_repository': repo_oai_cn5g_fed,
+              'charts_revision': synthran_oai_charts_revision
+            },
+            'launch': {
+              'helper_rc': gnb_script.rc,
+              'wait_timeout_observed': oai_start_wait_timeout | bool,
+              'installation_failed_observed': oai_start_installation_failed | bool
+            },
+            'selected_transport': synthran_topology.transport,
+            'selected_network': synthran_topology.network,
+            'prelaunch_network': oai_n320_network_readiness.stdout | from_json
+          }, recursive=True)
+        | to_nice_json
+      }}
+    mode: '0644'
+  delegate_to: localhost
+  become: false

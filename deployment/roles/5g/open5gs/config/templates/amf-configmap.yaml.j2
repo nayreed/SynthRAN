@@ -64,13 +64,12 @@ data:
   wrapper.sh: |
     #!/bin/bash
 
-    # The upstream Open5GS+srsRAN integration carries logical N2/NGAP and N3
-    # over its shared n3network attachment. Wait for that compatibility
+    # The Open5GS+srsRAN integration carries logical N2/NGAP and N3 over its
+    # shared topology-selected compatibility attachment. Wait for that
     # interface before binding SCTP.
-    echo "Waiting for shared NGAP interface n3 with IP 10.10.3.200..."
-    while ! ip addr show dev n3 | grep -q "10.10.3.200"; do
+    echo "Waiting for shared NGAP interface n3 with IP {{ synthran_topology.transport.endpoints.amf_ngap_ip }}..."
+    while ! ip addr show dev n3 | grep -q "{{ synthran_topology.transport.endpoints.amf_ngap_ip }}"; do
       sleep 2
     done
 
-    # Start the Open5GS AMF daemon
     /open5gs/install/bin/open5gs-amfd -c /open5gs/config/amfcfg.yaml

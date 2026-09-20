@@ -1,0 +1,42 @@
+name: Transport contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transport-contract:
+    name: Issue 54 N2 N3 N4 ownership
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install parser dependency
+        run: python -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Materialize exact upstream execution reference
+        run: |
+          set -euo pipefail
+          reference_root="$(python -m synthran.reference_checkout)"
+          echo "SYNTHRAN_REFERENCE_ROOT=$reference_root" >>"$GITHUB_ENV"
+          git -C "$reference_root" rev-parse HEAD
+
+      - name: Check Python syntax
+        run: python -m compileall -q tools/check_transport_contract.py
+
+      - name: Check N2 N3 N4 transport ownership
+        run: python tools/check_transport_contract.py --reference "$SYNTHRAN_REFERENCE_ROOT"

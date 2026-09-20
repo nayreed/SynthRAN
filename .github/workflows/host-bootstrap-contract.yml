@@ -1,0 +1,346 @@
+name: Host bootstrap contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-contract:
+    name: Host and Kubernetes bootstrap
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deployment runtime
+        run: python -m pip install --disable-pip-version-check -e '.[deployment]'
+
+      - name: Validate host preparation policy contract
+        run: python tools/check_host_preparation_contract.py
+
+      - name: Validate early SOP preflight ordering contract
+        run: python tools/check_sop_preflight_contract.py
+
+      - name: Validate bootstrap reconciliation safety contract
+        run: python tools/check_bootstrap_reconcile_contract.py
+
+      - name: Install pinned Ansible collections
+        run: ansible-galaxy collection install -r deployment/collections/requirements.yml
+
+      - name: Materialize pinned 5g-Ansible reference
+        run: python -m synthran.reference_checkout
+
+      - name: Parse issue 53 YAML and JSON artifacts
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import yaml
+
+          yaml_paths = [
+              Path("deployment/group_vars/all/all.yml"),
+              Path("deployment/playbooks/provision_nodes.yml"),
+              Path("deployment/playbooks/preflight_nodes.yml"),
+              Path("deployment/playbooks/bootstrap_classify.yml"),
+              Path("deployment/playbooks/bootstrap_nodes.yml"),
+              Path("deployment/playbooks/network.yml"),
+              Path("deployment/playbooks/site.yml"),
+              Path("deployment/roles/setup/pre_k8s/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/cluster_create/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/cni_dhcp/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/cluster_join/tasks/main.yml"),
+              Path("deployment/roles/setup/containerd/tasks/main.yml"),
+              Path("deployment/roles/setup/storage/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/add_taint/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/remove_cp_taint/tasks/main.yml"),
+              Path("deployment/roles/setup/k8s/remove_taint/tasks/main.yml"),
+          ]
+          for path in yaml_paths:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+          json.loads(Path(
+              "third_party/sopnode-5g-ansible/HOST_BOOTSTRAP_ADAPTATIONS.json"
+          ).read_text(encoding="utf-8"))
+          print(f"parsed {len(yaml_paths)} bootstrap YAML files and adaptation manifest")
+          PY
+
+      - name: Build staged local Ansible fixture
+        run: |
+          fixture="$RUNNER_TEMP/synthran-bootstrap"
+          private="$fixture/private"
+          mkdir -p "$private"
+          cat >"$fixture/scenario.yml" <<'YAML'
+          deployment:
+            reservation:
+              host_preparation: fresh
+          YAML
+          cat >"$fixture/scenario-preserve.yml" <<'YAML'
+          deployment:
+            reservation:
+              host_preparation: preserve
+          YAML
+          cat >"$fixture/inventory.yml" <<'YAML'
+          all:
+            children:
+              core_node:
+                hosts:
+                  core-ci:
+                    ansible_connection: local
+                    ip: 127.0.0.1
+                    storage: loop0
+              ran_node:
+                hosts:
+                  ran-ci:
+                    ansible_connection: local
+                    ip: 127.0.0.1
+                    storage: loop0
+              broker_node:
+                hosts:
+                  core-ci: {}
+              sopnodes:
+                children:
+                  core_node: {}
+                  ran_node: {}
+              k8s_workers:
+                children:
+                  ran_node: {}
+          YAML
+          cat >"$fixture/vars.yml" <<YAML
+          synthran_root: $GITHUB_WORKSPACE
+          scenario_file: $fixture/scenario.yml
+          synthran_private_dir: $private
+          run_dir: $fixture/result
+          core: open5gs
+          ran: srsRAN
+          platform: rfsim
+          rru: rfsim
+          core_node_name: core-ci
+          ran_node_name: ran-ci
+          broker_node_name: core-ci
+          bridge_enabled: true
+          cpu_low_latency: false
+          YAML
+          mkdir -p "$fixture/result"
+          echo "SYNTHRAN_BOOTSTRAP_FIXTURE=$fixture" >>"$GITHUB_ENV"
+
+      - name: Exercise mounted and unmounted storage validation
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_FORCE_COLOR: "0"
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/synthran-storage.img"
+          mount_dir="$RUNNER_TEMP/synthran-storage-mounted"
+          truncate -s 96M "$image"
+          loop_dev="$(sudo losetup --find --show "$image")"
+          mkdir -p "$mount_dir"
+          cleanup() {
+            mountpoint -q "$mount_dir" && sudo umount "$mount_dir" || true
+            sudo losetup -d "$loop_dev" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sudo mkfs.ext4 -q -F "$loop_dev"
+          storage="$(basename "$loop_dev")"
+          python_bin="$(command -v python)"
+          cat >"$RUNNER_TEMP/storage-inventory.yml" <<YAML
+          all:
+            children:
+              sopnodes:
+                hosts:
+                  storage-ci:
+                    ansible_connection: local
+                    ansible_python_interpreter: $python_bin
+                    storage: $storage
+          YAML
+
+          ansible-playbook \
+            -i "$RUNNER_TEMP/storage-inventory.yml" \
+            -e synthran_host_preparation=fresh \
+            deployment/playbooks/provision_nodes.yml \
+            | tee "$RUNNER_TEMP/storage-unmounted.log"
+          grep -F "source=inventory" "$RUNNER_TEMP/storage-unmounted.log"
+          grep -F "state=unmounted:ext4" "$RUNNER_TEMP/storage-unmounted.log"
+
+          sudo mount "$loop_dev" "$mount_dir"
+          ansible-playbook \
+            -i "$RUNNER_TEMP/storage-inventory.yml" \
+            -e synthran_host_preparation=fresh \
+            deployment/playbooks/provision_nodes.yml \
+            | tee "$RUNNER_TEMP/storage-mounted.log"
+          grep -F "source=inventory" "$RUNNER_TEMP/storage-mounted.log"
+          grep -F "state=mounted:ext4:" "$RUNNER_TEMP/storage-mounted.log"
+
+      - name: Syntax-check node validation and bootstrap
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+        run: |
+          for playbook in provision_nodes.yml preflight_nodes.yml bootstrap_classify.yml bootstrap_nodes.yml; do
+            ansible-playbook \
+              -i "$SYNTHRAN_BOOTSTRAP_FIXTURE/inventory.yml" \
+              -e @deployment/group_vars/all/all.yml \
+              -e @"$SYNTHRAN_BOOTSTRAP_FIXTURE/vars.yml" \
+              "deployment/playbooks/$playbook" \
+              --syntax-check
+          done
+
+      - name: Inspect bootstrap task plan
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+        run: |
+          ansible-playbook \
+            -i "$SYNTHRAN_BOOTSTRAP_FIXTURE/inventory.yml" \
+            -e @deployment/group_vars/all/all.yml \
+            -e @"$SYNTHRAN_BOOTSTRAP_FIXTURE/vars.yml" \
+            deployment/playbooks/bootstrap_nodes.yml \
+            --list-tasks >"$RUNNER_TEMP/bootstrap-tasks.txt"
+          grep -F "setup/k8s/cluster_create" deployment/playbooks/bootstrap_nodes.yml
+          grep -F "Verify preserved Kubernetes control plane is reachable" "$RUNNER_TEMP/bootstrap-tasks.txt"
+          grep -F "Verify preserved CNI DHCP binary exists" "$RUNNER_TEMP/bootstrap-tasks.txt"
+          grep -F "Write shareable bootstrap evidence" "$RUNNER_TEMP/bootstrap-tasks.txt"
+
+      - name: Exercise fresh checksum-pinned yq lifecycle
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+          ANSIBLE_FORCE_COLOR: "0"
+        run: |
+          set -euo pipefail
+          sudo rm -f /usr/local/bin/yq
+          ansible-playbook \
+            -i "$SYNTHRAN_BOOTSTRAP_FIXTURE/inventory.yml" \
+            -e @deployment/group_vars/all/all.yml \
+            -e @"$SYNTHRAN_BOOTSTRAP_FIXTURE/vars.yml" \
+            deployment/playbooks/bootstrap_nodes.yml \
+            --tags fresh_yq \
+            | tee "$RUNNER_TEMP/bootstrap-fresh-yq.log"
+          test -x /usr/local/bin/yq
+          /usr/local/bin/yq --version
+          grep -F "Install the checksum-verified shared yq binary" "$RUNNER_TEMP/bootstrap-fresh-yq.log"
+          grep -F "Require the installed yq binary to match the pinned release" "$RUNNER_TEMP/bootstrap-fresh-yq.log"
+
+      - name: Exercise preserve bootstrap with fresh-only yq absent
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+          ANSIBLE_FORCE_COLOR: "0"
+        run: |
+          set -euo pipefail
+          fixture="$SYNTHRAN_BOOTSTRAP_FIXTURE"
+          fakebin="$RUNNER_TEMP/synthran-preserve-fakebin"
+          backup="$RUNNER_TEMP/synthran-preserve-backup"
+          mkdir -p "$fakebin" "$backup"
+
+          cleanup() {
+            sudo rm -f /opt/cni/bin/dhcp
+            sudo rm -f /usr/local/bin/systemctl /usr/local/bin/kubectl /usr/local/bin/findmnt
+            for command in systemctl kubectl findmnt; do
+              if [ -e "$backup/$command" ]; then
+                sudo cp -a "$backup/$command" "/usr/local/bin/$command"
+              fi
+            done
+          }
+          trap cleanup EXIT
+
+          for command in systemctl kubectl findmnt; do
+            if [ -e "/usr/local/bin/$command" ]; then
+              sudo cp -a "/usr/local/bin/$command" "$backup/$command"
+            fi
+          done
+
+          cat >"$fakebin/systemctl" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "${1:-}" = "is-active" ]; then
+            case "${2:-}" in
+              containerd|kubelet|cni-dhcp.service)
+                echo active
+                exit 0
+                ;;
+            esac
+          fi
+          echo "unexpected systemctl invocation: $*" >&2
+          exit 64
+          SH
+
+          cat >"$fakebin/findmnt" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "$*" in
+            *"/var/lib/containerd"*)
+              echo "/dev/loop0 ext4 /var/lib/containerd"
+              exit 0
+              ;;
+          esac
+          echo "unexpected findmnt invocation: $*" >&2
+          exit 64
+          SH
+
+          cat >"$fakebin/kubectl" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "$*" in
+            *"get --raw=/readyz"*)
+              echo ok
+              ;;
+            *"get node ran-ci -o name"*)
+              echo node/ran-ci
+              ;;
+            *"get crd network-attachment-definitions.k8s.cni.cncf.io -o name"*)
+              echo customresourcedefinition.apiextensions.k8s.io/network-attachment-definitions.k8s.cni.cncf.io
+              ;;
+            *"get nodes -o json"*)
+              printf '%s\n' '{"apiVersion":"v1","items":[{"metadata":{"name":"core-ci"}},{"metadata":{"name":"ran-ci"}}]}'
+              ;;
+            *)
+              echo "unexpected kubectl invocation: $*" >&2
+              exit 64
+              ;;
+          esac
+          SH
+
+          chmod 0755 "$fakebin/systemctl" "$fakebin/findmnt" "$fakebin/kubectl"
+          sudo install -m 0755 "$fakebin/systemctl" /usr/local/bin/systemctl
+          sudo install -m 0755 "$fakebin/findmnt" /usr/local/bin/findmnt
+          sudo install -m 0755 "$fakebin/kubectl" /usr/local/bin/kubectl
+          sudo install -d -m 0755 /opt/cni/bin
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/cni/bin/dhcp >/dev/null
+          sudo chmod 0755 /opt/cni/bin/dhcp
+
+          sudo rm -f /usr/local/bin/yq
+          test ! -e /usr/local/bin/yq
+
+          ansible-playbook \
+            -i "$fixture/inventory.yml" \
+            -e @deployment/group_vars/all/all.yml \
+            -e @"$fixture/vars.yml" \
+            -e "scenario_file=$fixture/scenario-preserve.yml" \
+            deployment/playbooks/bootstrap_nodes.yml \
+            | tee "$RUNNER_TEMP/bootstrap-preserve.log"
+
+          test ! -e /usr/local/bin/yq
+          grep -F "Verify preserved containerd is active" "$RUNNER_TEMP/bootstrap-preserve.log"
+          grep -F "Verify preserved kubelet is active" "$RUNNER_TEMP/bootstrap-preserve.log"
+          grep -F "Verify preserved CNI DHCP daemon is active" "$RUNNER_TEMP/bootstrap-preserve.log"
+          grep -F "Verify preserved Kubernetes control plane is reachable" "$RUNNER_TEMP/bootstrap-preserve.log"
+          grep -F "Verify preserved NetworkAttachmentDefinition API" "$RUNNER_TEMP/bootstrap-preserve.log"
+          grep -F '"host_preparation": "preserve"' "$fixture/result/bootstrap-evidence.json"
+
+      - name: Verify issue 53 ownership contract
+        run: >-
+          python tools/check_host_bootstrap_contract.py
+          --reference .synthran/reference/sopnode-5g-ansible/b73fccf87f55060484b3759e9cb347222253534b

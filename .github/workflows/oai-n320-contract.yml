@@ -1,0 +1,54 @@
+name: OAI N320 contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oai-n320-contract:
+    name: Issue 55 OAI N320 boundary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Check out pinned OAI R2Lab helper
+        uses: actions/checkout@v7
+        with:
+          repository: sopnode/oai5g-rru
+          ref: 9d7f2df8e98527c1a3b05c6352b167e8e9ce7c19
+          path: oai5g-rru-reference
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check contract checker syntax
+        run: python -m compileall -q tools/check_oai_n320_contract.py
+
+      - name: Validate pinned helper prerequisites
+        run: >-
+          python tools/check_oai_n320_contract.py
+          --helper oai5g-rru-reference
+          --section helper
+
+      - name: Validate local N320 adaptation and acceptance
+        run: >-
+          python tools/check_oai_n320_contract.py
+          --helper oai5g-rru-reference
+          --section local
+
+      - name: Validate removed legacy paths stay absent
+        run: >-
+          python tools/check_oai_n320_contract.py
+          --helper oai5g-rru-reference
+          --section legacy

@@ -1,0 +1,97 @@
+---
+- name: Capture host N2/N3/N4 transport state
+  hosts: sopnodes
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Capture OVS state
+      ansible.builtin.command: ovs-vsctl show
+      register: synthran_transport_ovs
+      changed_when: false
+      when: bridge_enabled
+      become: true
+
+    - name: Capture host IPv4 and IPv6 addresses
+      ansible.builtin.command:
+        argv: [ip, -j, address, show]
+      register: synthran_transport_addresses
+      changed_when: false
+
+    - name: Capture host routes
+      ansible.builtin.command:
+        argv: [ip, -j, route, show, table, all]
+      register: synthran_transport_routes
+      changed_when: false
+
+    - name: Record this host's transport evidence
+      ansible.builtin.set_fact:
+        synthran_transport_host_evidence:
+          ovs: "{{ synthran_transport_ovs.stdout | default('bridge transport disabled') }}"
+          addresses: "{{ synthran_transport_addresses.stdout | from_json }}"
+          routes: "{{ synthran_transport_routes.stdout | from_json }}"
+
+- name: Write shareable selected-path transport evidence
+  hosts: core_node
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Capture NetworkAttachmentDefinitions
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - network-attachment-definitions.k8s.cni.cncf.io
+          - -A
+          - -o
+          - json
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: synthran_transport_nads
+      changed_when: false
+      failed_when: false
+
+    - name: Capture Kubernetes workload placement and pod addresses
+      ansible.builtin.command:
+        argv: [kubectl, get, pods, -A, -o, wide]
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: synthran_transport_pods
+      changed_when: false
+      failed_when: false
+
+    - name: Read the exact SynthRAN commit used by the controller
+      ansible.builtin.command:
+        argv: [git, -C, "{{ synthran_root }}", rev-parse, HEAD]
+      delegate_to: localhost
+      become: false
+      register: synthran_transport_commit
+      changed_when: false
+
+    - name: Assemble per-host transport evidence
+      ansible.builtin.set_fact:
+        synthran_transport_hosts: >-
+          {{ synthran_transport_hosts | default({}) |
+             combine({item: hostvars[item].synthran_transport_host_evidence}) }}
+      loop: "{{ groups['sopnodes'] }}"
+
+    - name: Assemble selected-path transport evidence
+      ansible.builtin.set_fact:
+        synthran_transport_evidence:
+          schema_version: 1
+          synthran_commit: "{{ synthran_transport_commit.stdout | trim }}"
+          deployment_hash: "{{ synthran_deployment_contract.deployment_hash }}"
+          selected_topology: "{{ synthran_topology }}"
+          host_state: "{{ synthran_transport_hosts }}"
+          network_attachment_definitions: >-
+            {{ (synthran_transport_nads.stdout | from_json)
+               if synthran_transport_nads.rc == 0
+               else {'error': synthran_transport_nads.stderr | default('NAD query failed')} }}
+          pod_summary: "{{ synthran_transport_pods.stdout | default('') }}"
+
+    - name: Write transport evidence to the run directory
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/transport-evidence.json"
+        content: "{{ synthran_transport_evidence | to_nice_json }}\n"
+        mode: '0644'
+      delegate_to: localhost
+      become: false

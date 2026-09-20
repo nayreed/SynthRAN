@@ -1,12 +1,4 @@
 ---
-- name: Remove NoSchedule taint from control-plane node
-  ansible.builtin.command: >
-    kubectl taint nodes {{ inventory_hostname }} node-role.kubernetes.io/control-plane:NoSchedule-
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: taint_result
-  failed_when: false # ignore possible error
-  changed_when: "'untainted' in taint_result.stdout"
-
-
-
+- name: Delegate control-plane taint lifecycle to pinned 5g-Ansible
+  ansible.builtin.include_tasks:
+    file: "{{ synthran_reference_root }}/roles/setup/k8s/remove_cp_taint/tasks/main.yml"

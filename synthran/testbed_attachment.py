@@ -1,14 +1,9 @@
 """Read-only attachment to an accepted SynthRAN testbed deployment.
 
-Physical experiments may consume infrastructure that ``deploy.sh`` has already
-accepted, but they must not reserve, repair, rebuild, power-cycle, or otherwise
-mutate that infrastructure merely to make an experiment pass. This module
-therefore performs identity and compatibility checks only.
-
-An attachment proves that a deployment was accepted and that its saved identity
-and evidence are internally consistent. It does *not* prove current radio or UE
-liveness; physical experiment phases must collect fresh run-time evidence for
-claims that depend on current state.
+Historical acceptance and current experiment eligibility are deliberately
+separate. Attachment proves that a deployment reached the accepted-testbed
+state with internally consistent identity/evidence. Experiment eligibility
+requires a fresh read-only observation of the same accepted deployment.
 """
 
 from __future__ import annotations
@@ -18,12 +13,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from synthran.deployment_state import (
-    ACTIVE_ENDPOINT_SCHEMA_VERSION,
-    SCHEMA_VERSION,
-    content_hash,
+from synthran.acceptance import (
+    ACCEPTED_ENDPOINT_SCHEMA_VERSION,
     validate_live_evidence,
+    validate_prerequisite_evidence,
 )
+from synthran.deployment_identity import (
+    validate_current_cluster_runtime,
+    validate_retained_execution_context,
+)
+from synthran.deployment_state import SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_DEPLOYMENT_ENDPOINT = ROOT / ".synthran/active-deployment.json"
@@ -46,8 +45,6 @@ def _read_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def _expected(actual: Any, requirement: Any, label: str) -> None:
-    """Validate one scalar against either an exact value or an allowed set."""
-
     if isinstance(requirement, (list, tuple, set, frozenset)):
         if actual not in requirement:
             raise AttachmentError(
@@ -77,6 +74,7 @@ def _ue_matches(binding: dict[str, Any], requirement: dict[str, Any]) -> bool:
         "sd",
         "dnn",
         "address_cidr",
+        "user_plane_target",
     }
     transport = {"host", "namespace", "interface", "mode", "mbim_session"}
     for key, expected in requirement.items():
@@ -113,8 +111,6 @@ def validate_requirements(
     *,
     deployment_hash: str,
 ) -> None:
-    """Validate a declarative experiment requirement against accepted identity."""
-
     requirements = requirements or {}
     allowed = {
         "deployment_hash",
@@ -124,6 +120,8 @@ def validate_requirements(
         "radio_unit",
         "network_profile",
         "bridge_enabled",
+        "reservation_mode",
+        "host_preparation",
         "nodes",
         "minimum_ues",
         "ue_devices",
@@ -146,6 +144,8 @@ def validate_requirements(
         "radio_unit",
         "network_profile",
         "bridge_enabled",
+        "reservation_mode",
+        "host_preparation",
     ):
         if key in requirements:
             _expected(deployment.get(key), requirements[key], key)
@@ -220,11 +220,9 @@ def validate_requirements(
 
 
 def requirements_from_deployment(deployment: dict[str, Any]) -> dict[str, Any]:
-    """Build an exact infrastructure requirement from a resolved scenario."""
-
     if not isinstance(deployment, dict):
         raise AttachmentError("deployment requirement source must be a mapping")
-    required = {
+    return {
         "core": deployment.get("core"),
         "ran": str(deployment.get("ran", "")).lower(),
         "platform": deployment.get("platform"),
@@ -238,7 +236,6 @@ def requirements_from_deployment(deployment: dict[str, Any]) -> dict[str, Any]:
         "ue_devices": list(deployment.get("ues", [])),
         "exact_ue_devices": True,
     }
-    return required
 
 
 def attach_active_deployment(
@@ -247,39 +244,25 @@ def attach_active_deployment(
     endpoint_path: str | Path = ACTIVE_DEPLOYMENT_ENDPOINT,
     evidence_max_age_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Attach read-only to the currently accepted deployment.
+    """Attach read-only to historical accepted-testbed state."""
 
-    ``evidence_max_age_seconds`` defaults to ``None`` deliberately. The saved
-    live evidence proves the deployment was accepted; it is not treated as a
-    fresh liveness measurement. A physical experiment must gather fresh evidence
-    for any current-state claim.
-    """
-
-    endpoint_path = Path(endpoint_path).resolve()
-    endpoint = _read_object(endpoint_path, "active deployment endpoint")
-    if endpoint.get("schema_version") != ACTIVE_ENDPOINT_SCHEMA_VERSION:
-        raise AttachmentError("active deployment endpoint schema is unsupported")
-    if endpoint.get("status") != "active":
-        raise AttachmentError("saved deployment endpoint is not active")
+    endpoint = _read_object(Path(endpoint_path).resolve(), "accepted deployment endpoint")
+    if endpoint.get("schema_version") != ACCEPTED_ENDPOINT_SCHEMA_VERSION:
+        raise AttachmentError("accepted deployment endpoint schema is unsupported")
+    if endpoint.get("status") != "accepted-testbed":
+        raise AttachmentError("saved deployment endpoint is not accepted-testbed")
 
     identity_path = Path(str(endpoint.get("identity_file", ""))).resolve()
     evidence_path = Path(str(endpoint.get("evidence_file", ""))).resolve()
     private_dir = Path(str(endpoint.get("private_execution_dir", ""))).resolve()
     result_dir = Path(str(endpoint.get("result_dir", ""))).resolve()
-    identity = _read_object(identity_path, "active deployment identity")
-
+    identity = _read_object(identity_path, "accepted deployment identity")
     if identity.get("schema_version") != SCHEMA_VERSION:
-        raise AttachmentError("active deployment identity schema is unsupported")
-    if identity.get("status") != "active":
-        raise AttachmentError("active deployment identity is not active")
-    deployment = identity.get("deployment")
-    if not isinstance(deployment, dict):
-        raise AttachmentError("active deployment identity has no deployment mapping")
-    observed_hash = content_hash(deployment)
-    if identity.get("deployment_hash") != observed_hash:
-        raise AttachmentError("active deployment identity failed its integrity check")
-    if endpoint.get("deployment_hash") != observed_hash:
-        raise AttachmentError("active deployment endpoint and identity hashes differ")
+        raise AttachmentError("accepted deployment identity schema is unsupported")
+    if identity.get("status") != "accepted-testbed":
+        raise AttachmentError("accepted deployment identity is not accepted-testbed")
+    if not result_dir.is_dir():
+        raise AttachmentError(f"accepted deployment result directory is missing: {result_dir}")
 
     try:
         evidence = validate_live_evidence(
@@ -287,29 +270,32 @@ def attach_active_deployment(
             evidence_path,
             max_age_seconds=evidence_max_age_seconds,
         )
+        validate_retained_execution_context(identity, result_dir, private_dir)
+        validate_prerequisite_evidence(identity, result_dir)
     except ValueError as exc:
         raise AttachmentError(str(exc)) from exc
 
-    required_private = (private_dir / "inventory.yml", private_dir / "deployment-vars.yml")
-    missing = [str(path) for path in required_private if not path.is_file()]
-    if missing:
-        raise AttachmentError(
-            "accepted deployment execution context is incomplete: " + ", ".join(missing)
-        )
-    if not result_dir.is_dir():
-        raise AttachmentError(f"accepted deployment result directory is missing: {result_dir}")
-
-    validate_requirements(deployment, requirements, deployment_hash=observed_hash)
+    deployment = identity["deployment"]
+    configuration_hash = identity["configuration_hash"]
+    deployment_hash = identity["deployment_hash"]
+    if endpoint.get("deployment_hash") != deployment_hash:
+        raise AttachmentError("accepted deployment endpoint and identity hashes differ")
+    if endpoint.get("configuration_hash") != configuration_hash:
+        raise AttachmentError("accepted deployment endpoint and configuration hashes differ")
+    validate_requirements(deployment, requirements, deployment_hash=deployment_hash)
 
     return {
-        "schema_version": 1,
-        "status": "attached",
+        "schema_version": 2,
+        "status": "accepted-testbed-attached",
+        "acceptance_state": "accepted-testbed",
+        "experiment_eligible": False,
         "mode": "read_only",
-        "deployment_hash": observed_hash,
+        "configuration_hash": configuration_hash,
+        "deployment_hash": deployment_hash,
         "deployment_run_id": endpoint.get("run_id"),
         "endpoint_published_at": endpoint.get("published_at"),
-        "deployment_attested_at": identity.get("attested_at"),
-        "evidence_observed_at": evidence.get("observed_at"),
+        "deployment_accepted_at": identity.get("accepted_at"),
+        "acceptance_evidence_observed_at": evidence.get("observed_at"),
         "identity_file": str(identity_path),
         "evidence_file": str(evidence_path),
         "private_execution_dir": str(private_dir),
@@ -322,6 +308,9 @@ def attach_active_deployment(
                 "ran",
                 "platform",
                 "radio_unit",
+                "reservation_mode",
+                "host_preparation",
+                "pos_image",
                 "network_profile",
                 "bridge_enabled",
                 "nodes",
@@ -330,7 +319,69 @@ def attach_active_deployment(
             )
         },
         "claim_boundary": (
-            "Attachment proves compatibility with a previously accepted deployment; "
+            "Historical attachment proves a previously accepted-testbed identity, "
+            "an intact retained execution context, and intact prerequisite evidence; "
             "it does not prove current RF, UE, session, or user-plane liveness."
         ),
     }
+
+
+def prove_experiment_eligible(
+    eligibility_evidence_path: str | Path,
+    requirements: dict[str, Any] | None = None,
+    *,
+    endpoint_path: str | Path = ACTIVE_DEPLOYMENT_ENDPOINT,
+    max_age_seconds: int = 120,
+    attachment: dict[str, Any] | None = None,
+    cluster_snapshot_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Require one fresh read-only observation of an already accepted deployment."""
+
+    if attachment is None:
+        attachment = attach_active_deployment(requirements, endpoint_path=endpoint_path)
+    else:
+        if attachment.get("status") != "accepted-testbed-attached":
+            raise AttachmentError("provided deployment attachment is not an accepted-testbed attachment")
+        deployment = attachment.get("deployment")
+        if not isinstance(deployment, dict):
+            raise AttachmentError("provided deployment attachment has no deployment mapping")
+        validate_requirements(
+            deployment,
+            requirements,
+            deployment_hash=str(attachment.get("deployment_hash", "")),
+        )
+
+    evidence_path = Path(eligibility_evidence_path).resolve()
+    if cluster_snapshot_path is None:
+        cluster_path = evidence_path.with_name("experiment-eligibility-cluster.json")
+    else:
+        cluster_path = Path(cluster_snapshot_path).resolve()
+    identity = _read_object(Path(attachment["identity_file"]), "accepted deployment identity")
+    try:
+        validate_retained_execution_context(
+            identity,
+            attachment["result_dir"],
+            attachment["private_execution_dir"],
+        )
+        validate_prerequisite_evidence(identity, attachment["result_dir"])
+        validate_current_cluster_runtime(identity, cluster_path)
+        evidence = validate_live_evidence(
+            attachment["identity_file"],
+            evidence_path,
+            max_age_seconds=max_age_seconds,
+        )
+    except ValueError as exc:
+        raise AttachmentError(str(exc)) from exc
+
+    result = copy.deepcopy(attachment)
+    result["status"] = "experiment-eligible"
+    result["experiment_eligible"] = True
+    result["eligibility_evidence_file"] = str(evidence_path)
+    result["eligibility_cluster_snapshot_file"] = str(cluster_path)
+    result["eligibility_observed_at"] = evidence.get("observed_at")
+    result["claim_boundary"] = (
+        "Experiment eligibility proves one fresh selected workload/image/Helm identity, "
+        "UE/session identity, and source-bound user-plane observation for this accepted "
+        "deployment only."
+    )
+    return result

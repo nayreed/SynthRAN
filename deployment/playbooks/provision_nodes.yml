@@ -4,43 +4,131 @@
   gather_facts: false
   any_errors_fatal: true
   tasks:
-    - name: Wait up to 180 seconds for SSH after the blocking POS reset
+    - name: Require a supported host preparation policy
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_host_preparation in ['fresh', 'bootstrap', 'preserve']
+        fail_msg: >-
+          synthran_host_preparation must be 'fresh', 'bootstrap', or 'preserve',
+          got {{ synthran_host_preparation | default('undefined') }}.
+
+    - name: Wait for the selected SOP node to become reachable
       ansible.builtin.wait_for_connection:
         connect_timeout: 10
         sleep: 5
         timeout: 180
-    - name: Gather host facts
+
+    - name: Gather facts from the selected SOP node
       ansible.builtin.setup:
-    - name: Discover safe containerd storage
-      shell: |
+
+    - name: Record explicitly configured containerd storage
+      ansible.builtin.set_fact:
+        synthran_configured_storage: "{{ storage | default('') | string | trim }}"
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Discover containerd storage only when inventory did not select one
+      ansible.builtin.shell: |
         set -eu
-        current="$(findmnt -n -o SOURCE /var/lib/containerd 2>/dev/null || true)"
-        case "$current" in
-          /dev/*) basename "$(readlink -f "$current")"; exit 0 ;;
-        esac
+        current="$(findmnt --nofsroot -n -o SOURCE /var/lib/containerd 2>/dev/null || true)"
+        if [ -n "$current" ] && [ "${current#/dev/}" != "$current" ]; then
+          basename "$(readlink -f "$current")"
+          exit 0
+        fi
         while read -r device type; do
           [ "$type" = part ] || continue
           [ "$(blkid -s TYPE -o value "$device" 2>/dev/null || true)" = ext4 ] || continue
-          [ -z "$(findmnt -n -o TARGET "$device" 2>/dev/null || true)" ] || continue
+          [ -z "$(findmnt -nr -S "$device" -o TARGET 2>/dev/null || true)" ] || continue
           basename "$device"
           exit 0
         done < <(lsblk -pnro NAME,TYPE)
+        echo "No safe ext4 containerd storage candidate was found" >&2
         exit 1
-      args: {executable: /bin/bash}
+      args:
+        executable: /bin/bash
+      become: true
       register: synthran_storage_discovery
       changed_when: false
       failed_when: false
-    - name: Record the selected containerd storage device
-      set_fact:
+      when:
+        - synthran_host_preparation in ['fresh', 'bootstrap']
+        - synthran_configured_storage | length == 0
+
+    - name: Use discovered storage only when inventory did not select one
+      ansible.builtin.set_fact:
         storage: "{{ synthran_storage_discovery.stdout | trim }}"
-    - name: Validate the selected containerd storage device
-      assert:
+      when:
+        - synthran_host_preparation in ['fresh', 'bootstrap']
+        - synthran_configured_storage | length == 0
+        - synthran_storage_discovery.rc == 0
+
+    - name: Require a selected containerd storage device for mutable preparation
+      ansible.builtin.assert:
+        quiet: true
         that:
-          - synthran_storage_discovery.rc == 0
-          - storage | length > 0
+          - storage is defined
+          - storage | string | trim | length > 0
+          - synthran_configured_storage | length > 0 or synthran_storage_discovery.rc == 0
         fail_msg: >-
-          No safe ext4 containerd partition was found on {{ inventory_hostname }}.
-          Existing mounted filesystems are never selected automatically.
-    - name: Report selected containerd storage
-      debug:
-        msg: "Using /dev/{{ storage }} for containerd on {{ inventory_hostname }}"
+          Mutable host preparation requires an explicit inventory storage device or a
+          safely discovered ext4 candidate. Explicit inventory storage is never
+          overwritten by discovery.
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Inspect the selected containerd storage device
+      ansible.builtin.stat:
+        path: "/dev/{{ storage }}"
+      register: synthran_storage_device
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Require the selected storage path to be a block device
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_storage_device.stat.exists
+          - synthran_storage_device.stat.isblk | default(false)
+        fail_msg: "Selected storage /dev/{{ storage }} is not a block device."
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Validate the selected storage filesystem and mounted state
+      ansible.builtin.shell: |
+        set -eu
+        fstype="$(blkid -s TYPE -o value /dev/{{ storage }} 2>/dev/null || true)"
+        target="$(findmnt -nr -S /dev/{{ storage }} -o TARGET 2>/dev/null | head -n 1 || true)"
+        if [ -n "$target" ]; then
+          case "$fstype" in
+            ext4|xfs|btrfs) ;;
+            *)
+              echo "Mounted storage /dev/{{ storage }} uses unsupported filesystem '$fstype'" >&2
+              exit 1
+              ;;
+          esac
+          printf 'mounted:%s:%s\n' "$fstype" "$target"
+        else
+          if [ "$fstype" != "ext4" ]; then
+            echo "Unmounted storage /dev/{{ storage }} must already be ext4; refusing to format '$fstype'" >&2
+            exit 1
+          fi
+          printf 'unmounted:%s\n' "$fstype"
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      register: synthran_storage_state
+      changed_when: false
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Report mutable preparation storage ownership
+      ansible.builtin.debug:
+        msg: >-
+          containerd storage={{ storage }};
+          source={{ 'inventory' if synthran_configured_storage | length > 0 else 'safe-discovery' }};
+          state={{ synthran_storage_state.stdout | trim }}
+      when: synthran_host_preparation in ['fresh', 'bootstrap']
+
+    - name: Report accepted-testbed preservation policy
+      ansible.builtin.debug:
+        msg: >-
+          host_preparation=preserve: storage discovery, mount changes, package
+          installation, kubeadm reset, and cluster join are disabled.
+      when: synthran_host_preparation == 'preserve'

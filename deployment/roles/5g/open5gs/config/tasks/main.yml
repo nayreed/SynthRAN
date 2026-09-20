@@ -12,44 +12,8 @@
     file: "{{ network_profile_file }}"
     name: fiveg
 
-- name: Validate PLMN
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - fiveg.plmn.mcc is defined
-      - fiveg.plmn.mnc is defined
-      - fiveg.plmn.tac is defined
-
-- name: Validate slices
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - slice.name is defined
-      - slice.sst is defined
-      - slice.dnn is defined
-  loop: "{{ fiveg.slices }}"
-  loop_control:
-    loop_var: slice
-    label: "{{ slice.name }}"
-
-- name: Require the two-slice Open5GS deployment layout
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - fiveg.slices | length == 2
-    fail_msg: >-
-      The retained Open5GS Kubernetes layout exposes two SMF/UPF slots; the
-      selected network profile must therefore define exactly two slices.
-
-- name: Validate UE slice references
-  ansible.builtin.assert:
-    quiet: true
-    that:
-      - ue.value.slice in fiveg.slices | map(attribute='name') | list
-  loop: "{{ fiveg.ues | dict2items }}"
-  loop_control:
-    loop_var: ue
-    label: "{{ ue.key }}"
+- name: Validate the effective Open5GS profile
+  ansible.builtin.include_tasks: validate_profile.yml
 
 - name: Update AMF ConfigMap on disk
   ansible.builtin.template:
@@ -97,9 +61,10 @@
   ansible.builtin.template:
     src: generate-data-fiveg.py.j2
     dest: "{{ repo_dest }}/mongo-tools/generate-data-fiveg.py"
-    mode: "0755"
+    mode: "0700"
   vars:
     profile: "{{ fiveg }}"
+  no_log: true
 
 - name: Generate Open5GS network-profile check file
   ansible.builtin.template:

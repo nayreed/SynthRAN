@@ -2,12 +2,6 @@
 free5gc_repo_url: "https://github.com/sopnode/free5gc-helm.git"
 free5gc_repo_dest: "/root/free5gc-helm"
 free5gc_repo_branch: "499ad3d6b0c0c8879f49edcc174f306ee72a4ff4"
-free5gc_root: "{{ repo_dest }}/charts/free5gc"
+free5gc_root: "{{ free5gc_repo_dest }}/charts/free5gc"
 core_ns: "free5gc"
 free5gc_prepare_node: true
-
-# SynthRAN installs and verifies this centrally before the Free5GC role. Keep
-# the legacy fallback fail-closed if the role is invoked outside that workflow.
-yq_version: "v4.45.1"
-yq_bin_path: "/usr/local/bin/yq"
-yq_url: ""

@@ -19,11 +19,16 @@
   ansible.builtin.set_fact:
     synthran_r2lab_contract_ue: "{{ synthran_r2lab_contract_matches | first }}"
 
-- name: Resolve the R2Lab transport from the deployment contract
+- name: Resolve the R2Lab transport and user-plane probe from the deployment contract
   ansible.builtin.set_fact:
     synthran_r2lab_interface: "{{ synthran_r2lab_contract_ue.tunnel.interface }}"
-    synthran_r2lab_upf_address: >-
-      {{ synthran_r2lab_contract_ue.address_cidr | regex_replace('\.0/[0-9]+$', '.1') }}
+    synthran_r2lab_user_plane_address: "{{ synthran_r2lab_contract_ue.user_plane_target }}"
+    synthran_r2lab_user_plane_kind: >-
+      {{ synthran_r2lab_contract_ue.user_plane_probe.kind
+         | default('legacy-user-plane-target') }}
+    synthran_r2lab_user_plane_interface: >-
+      {{ synthran_r2lab_contract_ue.user_plane_probe.interface
+         | default(none) }}
 
 - name: Require the supported upstream R2Lab transport
   ansible.builtin.assert:
@@ -33,7 +38,8 @@
       - synthran_r2lab_interface == 'wwan0'
       - synthran_r2lab_contract_ue.tunnel.mode == (mode | default('mbim'))
       - (mode | default('mbim')) != 'mbim' or synthran_r2lab_contract_ue.tunnel.mbim_session | int == 0
-    fail_msg: The R2Lab contract must use the upstream wwan0 modem transport.
+      - synthran_r2lab_user_plane_address | length > 0
+    fail_msg: The R2Lab contract must use the upstream wwan0 modem transport and an explicit user-plane target.
 
 - name: Read the live R2Lab SIM, DNN configuration, and modem session
   ansible.builtin.script:
@@ -70,7 +76,81 @@
   ansible.builtin.set_fact:
     synthran_r2lab_binding: "{{ (synthran_r2lab_probe.stdout | from_json).binding }}"
 
-- name: Require interface-bound R2Lab user-plane reachability to the selected UPF
+- name: Discover the sealed OAI UPF pod before physical UE probing
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ core }}"
+      - get
+      - pods
+      - -l
+      - app.kubernetes.io/name=oai-upf
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+  register: synthran_r2lab_oai_upf_pods_raw
+  changed_when: false
+  delegate_to: "{{ core_node_name }}"
+  become: true
+  when: synthran_r2lab_user_plane_kind == 'oai-upf-tun0'
+
+- name: Resolve the sealed OAI UPF pod identity
+  ansible.builtin.set_fact:
+    synthran_r2lab_oai_upf_pods: >-
+      {{ synthran_r2lab_oai_upf_pods_raw.stdout_lines
+         | map('trim')
+         | reject('equalto', '')
+         | list }}
+  when: synthran_r2lab_user_plane_kind == 'oai-upf-tun0'
+
+- name: Require exactly one sealed OAI UPF pod
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_r2lab_oai_upf_pods | length == 1
+    fail_msg: >-
+      Expected exactly one OAI UPF pod before physical UE probing,
+      found {{ synthran_r2lab_oai_upf_pods | length }}.
+  when: synthran_r2lab_user_plane_kind == 'oai-upf-tun0'
+
+- name: Attest the sealed OAI UPF endpoint before physical UE probing
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ core }}"
+      - exec
+      - "{{ synthran_r2lab_oai_upf_pods | first }}"
+      - -c
+      - upf
+      - --
+      - ip
+      - -4
+      - -o
+      - addr
+      - show
+      - dev
+      - "{{ synthran_r2lab_user_plane_interface }}"
+  register: synthran_r2lab_user_plane_target_attestation
+  changed_when: false
+  delegate_to: "{{ core_node_name }}"
+  become: true
+  when: synthran_r2lab_user_plane_kind == 'oai-upf-tun0'
+
+- name: Require the sealed OAI UPF endpoint to exist on the sealed interface
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_r2lab_user_plane_target_attestation.rc == 0
+      - >-
+        ('inet ' ~ synthran_r2lab_user_plane_address ~ '/')
+        in synthran_r2lab_user_plane_target_attestation.stdout
+    fail_msg: >-
+      Sealed OAI UPF endpoint {{ synthran_r2lab_user_plane_address }} is not
+      present on {{ synthran_r2lab_user_plane_interface }} in the selected UPF pod.
+  when: synthran_r2lab_user_plane_kind == 'oai-upf-tun0'
+
+- name: Require interface-bound R2Lab user-plane reachability to the sealed endpoint
   ansible.builtin.command:
     argv:
       - ping
@@ -80,9 +160,41 @@
       - '1'
       - -W
       - '3'
-      - "{{ synthran_r2lab_upf_address }}"
+      - "{{ synthran_r2lab_user_plane_address }}"
   register: synthran_r2lab_upf_probe
   changed_when: false
   retries: 5
   delay: 2
   until: synthran_r2lab_upf_probe.rc == 0
+
+- name: Retain the source-bound R2Lab user-plane probe log
+  ansible.builtin.copy:
+    content: |
+      command: ping -I {{ synthran_r2lab_interface }} -c 1 -W 3 {{ synthran_r2lab_user_plane_address }}
+      source_address: {{ synthran_r2lab_binding.address }}
+      target_kind: {{ synthran_r2lab_user_plane_kind }}
+      target_interface: {{ synthran_r2lab_user_plane_interface | default('') }}
+      return_code: {{ synthran_r2lab_upf_probe.rc }}
+      attempts: {{ synthran_r2lab_upf_probe.attempts | default(1) }}
+      stdout:
+      {{ synthran_r2lab_upf_probe.stdout | default('') | indent(2, true) }}
+      stderr:
+      {{ synthran_r2lab_upf_probe.stderr | default('') | indent(2, true) }}
+    dest: "{{ run_dir }}/r2lab-ue-{{ inventory_hostname }}-n6.log"
+  delegate_to: localhost
+  become: false
+
+- name: Add the proved source-bound user plane to the live R2Lab binding
+  ansible.builtin.set_fact:
+    synthran_r2lab_binding: >-
+      {{ synthran_r2lab_binding
+         | combine({'user_plane': {
+             'verified': true,
+             'method': 'icmp_echo',
+             'source_interface': synthran_r2lab_interface,
+             'source_address': synthran_r2lab_binding.address,
+             'target_address': synthran_r2lab_user_plane_address,
+             'target_kind': synthran_r2lab_user_plane_kind,
+             'target_interface': synthran_r2lab_user_plane_interface,
+             'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')
+           }}, recursive=true) }}

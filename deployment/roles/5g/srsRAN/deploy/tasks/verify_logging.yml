@@ -8,15 +8,92 @@
   changed_when: false
   retries: 20
   delay: 3
-  until:
-    - synthran_gnb_logging_pods.resources | length > 0
-    - >-
-      (synthran_gnb_logging_pods.resources[0].status.containerStatuses | default([]) |
-       selectattr('name', 'equalto', 'gnb') | list | length) == 1
+  until: >-
+    (synthran_gnb_logging_pods.resources | length == 1) and
+    ((synthran_gnb_logging_pods.resources[0].status.containerStatuses | default([]) |
+      selectattr('name', 'equalto', 'gnb') | selectattr('ready', 'equalto', true) |
+      list | length) == 1)
 
 - name: Select the deployed gNB pod for log verification
   ansible.builtin.set_fact:
     synthran_gnb_logging_pod: "{{ synthran_gnb_logging_pods.resources[0].metadata.name }}"
+    synthran_gnb_logging_uid: "{{ synthran_gnb_logging_pods.resources[0].metadata.uid }}"
+
+- name: Locate the live gNB process for log ownership
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin | default('/usr/bin/kubectl') }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_gnb_logging_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        for comm in /proc/[0-9]*/comm; do
+          [ -r "$comm" ] || continue;
+          if [ "$(cat "$comm")" = gnb ]; then
+            pid=${comm#/proc/}; pid=${pid%/comm}; printf '%s\n' "$pid"; exit 0;
+          fi;
+        done;
+        exit 1
+  register: synthran_gnb_logging_pid
+  changed_when: false
+  retries: 15
+  delay: 2
+  until: synthran_gnb_logging_pid.rc == 0
+
+- name: Read the live gNB process command line
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin | default('/usr/bin/kubectl') }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_gnb_logging_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        tr '\000' ' ' < /proc/{{ synthran_gnb_logging_pid.stdout | trim }}/cmdline
+  register: synthran_gnb_logging_cmdline
+  changed_when: false
+
+- name: Require the live mounted gNB config to select the authoritative log path
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin | default('/usr/bin/kubectl') }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ synthran_gnb_logging_pod }}"
+      - -c
+      - gnb
+      - --
+      - /bin/sh
+      - -lc
+      - >-
+        grep -Eq '^[[:space:]]*filename:[[:space:]]*/var/log/gnb\.log[[:space:]]*$'
+        /srsran/config/srsran-gnb.yaml
+  register: synthran_gnb_logging_config
+  changed_when: false
+
+- name: Bind the authoritative log path to the deployed gNB process
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_gnb_logging_pid.rc == 0
+      - "'/usr/local/bin/gnb' in synthran_gnb_logging_cmdline.stdout"
+      - "'/srsran/config/srsran-gnb.yaml' in synthran_gnb_logging_cmdline.stdout"
+      - synthran_gnb_logging_config.rc == 0
+    fail_msg: >-
+      The live gNB process is not using the mounted configuration that selects
+      /var/log/gnb.log as the authoritative runtime log.
 
 - name: Require the gNB process to produce the authoritative log file
   ansible.builtin.command:
@@ -46,16 +123,80 @@
   register: synthran_gnb_logging_state
   changed_when: false
 
-- name: Require the gNB and configured log sidecar to be running
+- name: Require the verified gNB workload to still exist with the same identity
   ansible.builtin.assert:
     quiet: true
     that:
-      - >-
-        (synthran_gnb_logging_state.resources[0].status.containerStatuses | default([]) |
-         selectattr('name', 'equalto', 'gnb') | selectattr('ready', 'equalto', true) | list | length) == 1
+      - synthran_gnb_logging_state.resources | length == 1
+      - synthran_gnb_logging_state.resources[0].metadata.uid == synthran_gnb_logging_uid
+    fail_msg: >-
+      The gNB workload disappeared or changed identity during log verification.
+
+- name: Resolve configured and live gNB/log-sidecar identity
+  ansible.builtin.set_fact:
+    synthran_gnb_configured_images: >-
+      {{ synthran_gnb_logging_state.resources[0].spec.containers | default([]) |
+         selectattr('name', 'equalto', 'gnb') | map(attribute='image') | list }}
+    synthran_gnb_log_sidecar_configured_images: >-
+      {{ synthran_gnb_logging_state.resources[0].spec.containers | default([]) |
+         selectattr('name', 'equalto', 'gnb-logs') | map(attribute='image') | list }}
+    synthran_gnb_live_statuses: >-
+      {{ synthran_gnb_logging_state.resources[0].status.containerStatuses | default([]) |
+         selectattr('name', 'equalto', 'gnb') | list }}
+    synthran_gnb_log_sidecar_statuses: >-
+      {{ synthran_gnb_logging_state.resources[0].status.containerStatuses | default([]) |
+         selectattr('name', 'equalto', 'gnb-logs') | list }}
+
+- name: Require unambiguous configured and live gNB containers
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_gnb_configured_images | length == 1
+      - synthran_gnb_live_statuses | length == 1
       - >-
         (not (synthran_srsran_runtime_policy.logs_enabled | bool)) or
-        ((synthran_gnb_logging_state.resources[0].status.containerStatuses | default([]) |
-          selectattr('name', 'equalto', 'gnb-logs') | selectattr('ready', 'equalto', true) | list | length) == 1)
+        ((synthran_gnb_log_sidecar_configured_images | length == 1) and
+         (synthran_gnb_log_sidecar_statuses | length == 1))
     fail_msg: >-
-      srsRAN started without a healthy authoritative /var/log/gnb.log producer/collector path.
+      The verified srsRAN pod does not expose the expected configured/live
+      gNB/log containers.
+
+- name: Resolve configured and live gNB image identity
+  ansible.builtin.set_fact:
+    synthran_gnb_expected_image_digest: >-
+      {{ synthran_srsran_image_reference |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+    synthran_gnb_live_image_id: >-
+      {{ synthran_gnb_live_statuses[0].imageID | default('') }}
+    synthran_gnb_log_sidecar_live_image_id: >-
+      {{ synthran_gnb_log_sidecar_statuses[0].imageID | default('')
+         if (synthran_gnb_log_sidecar_statuses | length == 1) else '' }}
+
+- name: Extract live gNB and log-sidecar image digests
+  ansible.builtin.set_fact:
+    synthran_gnb_live_image_digest: >-
+      {{ synthran_gnb_live_image_id |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+    synthran_gnb_log_sidecar_live_image_digest: >-
+      {{ synthran_gnb_log_sidecar_live_image_id |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+
+- name: Require the gNB and configured log sidecar to be running immutably
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_gnb_configured_images[0] == synthran_srsran_image_reference
+      - synthran_gnb_live_statuses[0].ready | default(false) | bool
+      - synthran_gnb_expected_image_digest | length > 0
+      - synthran_gnb_live_image_digest | length > 0
+      - >-
+        (not (synthran_srsran_runtime_policy.logs_enabled | bool)) or
+        ((synthran_gnb_log_sidecar_configured_images[0] == synthran_log_sidecar_image) and
+         (synthran_gnb_log_sidecar_statuses[0].ready | default(false) | bool) and
+         (synthran_gnb_log_sidecar_live_image_digest | length > 0))
+    fail_msg: >-
+      srsRAN started without a single stable digest-qualified gNB workload and
+      healthy authoritative /var/log/gnb.log producer/collector path. The pod
+      spec must retain the exact immutable configured image references; runtime
+      imageID values must themselves be digest-qualified, but may identify a
+      platform-specific child manifest of an immutable OCI index.

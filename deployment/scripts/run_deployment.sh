@@ -50,15 +50,42 @@ DEPLOYMENT_COMMAND=("$@")
 CHILD_PID=""
 printf '%s\n' "$$" >"$RUN_DIR/controller.pid"
 
+if [[ -n "${SYNTHRAN_PRIVATE_DIR:-}" ]]; then
+  export ANSIBLE_ROLES_PATH="$SYNTHRAN_PRIVATE_DIR/ansible/roles"
+  export ANSIBLE_CONFIG="$SYNTHRAN_PRIVATE_DIR/ansible/ansible.cfg"
+  for ((i = 0; i < ${#DEPLOYMENT_COMMAND[@]}; i++)); do
+    if [[ "${DEPLOYMENT_COMMAND[$i]}" == "@deployment/group_vars/all/all.yml" ]]; then
+      DEPLOYMENT_COMMAND[$i]="@$SYNTHRAN_PRIVATE_DIR/ansible/group_vars/all/all.yml"
+    fi
+  done
+fi
+
 record_exit() {
   local original_status=$?
+  local timing_status=0
   local safety_status=0
   local status=$original_status
+  local timing_closure_status=incomplete
+  local timing_reason="controller exited with an unfinished deployment phase"
   trap - EXIT
+
+  if (( original_status != 0 )); then
+    timing_closure_status=failed
+    timing_reason="controller exited with status $original_status"
+  fi
+  if [[ -d "$RUN_DIR" ]]; then
+    "$SYNTHRAN_PYTHON" -m synthran.phase_timing close-open \
+      --run-dir "$RUN_DIR" \
+      --status "$timing_closure_status" \
+      --reason "$timing_reason" || timing_status=$?
+  fi
 
   if [[ -n "${SYNTHRAN_PRIVATE_DIR:-}" && -d "$RUN_DIR" ]]; then
     "$SYNTHRAN_PYTHON" -m synthran.result_safety \
       --run-dir "$RUN_DIR" --private-dir "$SYNTHRAN_PRIVATE_DIR" || safety_status=$?
+  fi
+  if (( status == 0 && timing_status != 0 )); then
+    status=$timing_status
   fi
   if (( status == 0 && safety_status != 0 )); then
     status=$safety_status
@@ -92,6 +119,15 @@ run_step() {
   return "$status"
 }
 
+mark_failed() {
+  local phase=$1 status=$2 reason=$3
+  "$SYNTHRAN_PYTHON" -m synthran.acceptance fail \
+    --candidate "$RUN_DIR/deployment-fingerprint.json" \
+    --phase "$phase" \
+    --exit-code "$status" \
+    --reason "$reason" >/dev/null 2>&1 || true
+}
+
 collect_failure_diagnostics() {
   local reason=$1
   local diagnostics_rc=0
@@ -107,8 +143,6 @@ collect_failure_diagnostics() {
     return 0
   fi
 
-  # Resume selectors are valid for the deployment playbook but not for the
-  # independent diagnostics playbook. Strip them before replacing the playbook.
   for arg in "${diagnostics_command[@]}"; do
     if [[ "$skip_next" == true ]]; then
       skip_next=false
@@ -158,6 +192,7 @@ CONTROLLER_PROVENANCE_RC=0
 run_step "$SYNTHRAN_PYTHON" -m synthran.provenance --run-dir "$RUN_DIR" || CONTROLLER_PROVENANCE_RC=$?
 if (( CONTROLLER_PROVENANCE_RC != 0 )); then
   echo "Controller dependency provenance failed with status $CONTROLLER_PROVENANCE_RC; provisioning was not started." >&2
+  mark_failed "controller-provenance" "$CONTROLLER_PROVENANCE_RC" "controller dependency provenance failed"
   exit "$CONTROLLER_PROVENANCE_RC"
 fi
 echo "Controller dependency provenance recorded."
@@ -166,26 +201,103 @@ ANSIBLE_RC=0
 run_step "${DEPLOYMENT_COMMAND[@]}" </dev/null >"$RUN_DIR/ansible.log" 2>&1 || ANSIBLE_RC=$?
 if (( ANSIBLE_RC != 0 )); then
   echo "Deployment provisioning failed with status $ANSIBLE_RC; complete Ansible output: $RUN_DIR/ansible.log" >&2
+  mark_failed "provisioning" "$ANSIBLE_RC" "Ansible provisioning or path-specific verification failed"
   collect_failure_diagnostics "provisioning failure"
   exit "$ANSIBLE_RC"
 fi
 
-echo "Provisioning, UE verification, and runtime provenance completed; validating fresh live deployment evidence."
+echo "Provisioning owners completed; sealing executable deployment identity."
+PROVISIONED_RC=0
+run_step "$SYNTHRAN_PYTHON" -m synthran.acceptance provisioning-complete \
+  --candidate "$RUN_DIR/deployment-fingerprint.json" \
+  --evidence "$RUN_DIR/live-deployment-evidence.json" \
+  --run-dir "$RUN_DIR" \
+  --private-dir "$SYNTHRAN_PRIVATE_DIR" || PROVISIONED_RC=$?
+if (( PROVISIONED_RC != 0 )); then
+  echo "Provisioning-complete identity sealing failed with status $PROVISIONED_RC; deployment was not accepted." >&2
+  mark_failed "provisioning-complete" "$PROVISIONED_RC" "executable deployment identity could not be sealed"
+  collect_failure_diagnostics "provisioning-complete rejection"
+  exit "$PROVISIONED_RC"
+fi
+echo "State: provisioning-complete."
+
+ACCEPTANCE_PLAYBOOK="$SYNTHRAN_PRIVATE_DIR/ansible/playbooks/acceptance.yml"
+if [[ ! -f "$ACCEPTANCE_PLAYBOOK" ]]; then
+  echo "Staged accepted-testbed verification playbook is missing: $ACCEPTANCE_PLAYBOOK" >&2
+  mark_failed "accepted-testbed-probe" 2 "staged acceptance playbook is missing"
+  exit 2
+fi
+
+ACCEPTANCE_COMMAND=()
+ACCEPTANCE_SKIP_NEXT=false
+for arg in "${DEPLOYMENT_COMMAND[@]}"; do
+  if [[ "$ACCEPTANCE_SKIP_NEXT" == true ]]; then
+    ACCEPTANCE_SKIP_NEXT=false
+    continue
+  fi
+  case "$arg" in
+    --start-at-task)
+      ACCEPTANCE_SKIP_NEXT=true
+      continue
+      ;;
+    --start-at-task=*)
+      continue
+      ;;
+  esac
+  ACCEPTANCE_COMMAND+=("$arg")
+done
+
+ACCEPTANCE_REPLACED=false
+for ((i = 0; i < ${#ACCEPTANCE_COMMAND[@]}; i++)); do
+  case "${ACCEPTANCE_COMMAND[$i]}" in
+    "$SYNTHRAN_PRIVATE_DIR"/ansible/playbooks/*.yml)
+      ACCEPTANCE_COMMAND[$i]="$ACCEPTANCE_PLAYBOOK"
+      ACCEPTANCE_REPLACED=true
+      break
+      ;;
+  esac
+done
+if [[ "$ACCEPTANCE_REPLACED" != true ]]; then
+  echo "Accepted-testbed verification cannot locate the staged deployment playbook argument." >&2
+  mark_failed "accepted-testbed-probe" 2 "deployment playbook argument could not be replaced"
+  exit 2
+fi
+
+echo "Running path-specific accepted-testbed UE/session/user-plane verification."
+"$SYNTHRAN_PYTHON" -m synthran.phase_timing start \
+  --run-dir "$RUN_DIR" --phase verification
+ACCEPTANCE_ANSIBLE_RC=0
+run_step "${ACCEPTANCE_COMMAND[@]}" </dev/null >>"$RUN_DIR/ansible.log" 2>&1 || ACCEPTANCE_ANSIBLE_RC=$?
+if (( ACCEPTANCE_ANSIBLE_RC != 0 )); then
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase verification --status failed || true
+  echo "Accepted-testbed live verification failed with status $ACCEPTANCE_ANSIBLE_RC; deployment was not published for reuse." >&2
+  mark_failed "accepted-testbed-probe" "$ACCEPTANCE_ANSIBLE_RC" "path-specific UE/session/user-plane verification failed"
+  collect_failure_diagnostics "accepted-testbed live verification failure"
+  exit "$ACCEPTANCE_ANSIBLE_RC"
+fi
 
 ACTIVE_DEPLOYMENT_ENDPOINT="$PWD/.synthran/active-deployment.json"
-STATE_RC=0
-run_step "$SYNTHRAN_PYTHON" -m synthran.deployment_state activate \
+ACCEPT_RC=0
+run_step "$SYNTHRAN_PYTHON" -m synthran.acceptance accept \
   --candidate "$RUN_DIR/deployment-fingerprint.json" \
   --active "$ACTIVE_DEPLOYMENT_STATE" \
   --evidence "$RUN_DIR/live-deployment-evidence.json" \
+  --cluster-snapshot "$RUN_DIR/acceptance-cluster.json" \
   --endpoint "$ACTIVE_DEPLOYMENT_ENDPOINT" \
-  --private-dir "$SYNTHRAN_PRIVATE_DIR" || STATE_RC=$?
-if (( STATE_RC != 0 )); then
-  echo "Live deployment evidence was rejected with status $STATE_RC; deployment was not accepted." >&2
-  collect_failure_diagnostics "live-evidence rejection"
-  exit "$STATE_RC"
+  --private-dir "$SYNTHRAN_PRIVATE_DIR" || ACCEPT_RC=$?
+if (( ACCEPT_RC != 0 )); then
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase verification --status failed || true
+  echo "Accepted-testbed validation failed with status $ACCEPT_RC; deployment was not published for reuse." >&2
+  mark_failed "accepted-testbed" "$ACCEPT_RC" "fresh selected workload/UE/user-plane acceptance failed"
+  collect_failure_diagnostics "accepted-testbed rejection"
+  exit "$ACCEPT_RC"
 fi
 
-echo "Live deployment evidence accepted."
-echo "Active deployment endpoint: $ACTIVE_DEPLOYMENT_ENDPOINT"
-echo "Testbed deployment completed and marked active."
+"$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+  --run-dir "$RUN_DIR" --phase verification
+
+echo "State: accepted-testbed."
+echo "Accepted deployment endpoint: $ACTIVE_DEPLOYMENT_ENDPOINT"
+echo "Experiments must still pass a fresh read-only experiment-eligibility probe before workload execution."

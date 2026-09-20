@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .deployment_state import validate_live_evidence
+from .acceptance import validate_live_evidence
 
 
 def _parser() -> argparse.ArgumentParser:

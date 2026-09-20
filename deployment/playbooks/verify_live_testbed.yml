@@ -1,0 +1,222 @@
+---
+- name: Recheck physical UE identity and source-bound user plane
+  hosts: physical_ues
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Probe the selected R2Lab UE without repair or reattachment
+      ansible.builtin.include_role:
+        name: synthran/r2lab_ue_verify
+      when: platform == 'r2lab'
+
+- name: Recheck software UE identity and source-bound user plane
+  hosts: ran_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install the staged read-only software UE probe
+      ansible.builtin.copy:
+        src: "{{ synthran_execution_root }}/scripts/probe_software_ues.py"
+        dest: /tmp/synthran-probe-software-ues.py
+        mode: '0755'
+      when: platform == 'rfsim'
+
+    - name: Stage the sealed deployment identity for the software UE probe
+      ansible.builtin.copy:
+        content: "{{ lookup('ansible.builtin.file', synthran_deployment_contract_file) }}\n"
+        dest: /tmp/synthran-accepted-deployment.json
+        mode: '0600'
+      when: platform == 'rfsim'
+
+    - name: Probe every selected software UE without changing testbed state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /tmp/synthran-probe-software-ues.py
+          - --expected
+          - /tmp/synthran-accepted-deployment.json
+          - --evidence
+          - /tmp/synthran-software-ue-acceptance-failure.json
+      register: synthran_live_software_probe
+      changed_when: false
+      failed_when: false
+      retries: 6
+      delay: 5
+      until: synthran_live_software_probe.rc == 0
+      when: platform == 'rfsim'
+
+    - name: Check for retained software UE acceptance failure evidence
+      ansible.builtin.stat:
+        path: /tmp/synthran-software-ue-acceptance-failure.json
+      register: synthran_live_software_failure_file
+      when:
+        - platform == 'rfsim'
+        - synthran_live_software_probe.rc != 0
+
+    - name: Retain structured software UE acceptance failure evidence
+      ansible.builtin.fetch:
+        src: /tmp/synthran-software-ue-acceptance-failure.json
+        dest: "{{ run_dir }}/software-ue-acceptance-failure.json"
+        flat: true
+      when:
+        - platform == 'rfsim'
+        - synthran_live_software_probe.rc != 0
+        - synthran_live_software_failure_file.stat.exists | default(false)
+
+    - name: Retain fallback software UE acceptance failure evidence
+      ansible.builtin.copy:
+        mode: '0644'
+        dest: "{{ run_dir }}/software-ue-acceptance-failure.json"
+        content: >-
+          {{ {
+               'schema_version': 1,
+               'stage': 'probe-process-failed',
+               'returncode': synthran_live_software_probe.rc,
+               'stdout': synthran_live_software_probe.stdout | default(''),
+               'stderr': synthran_live_software_probe.stderr | default('')
+             } | to_nice_json }}
+      delegate_to: localhost
+      become: false
+      when:
+        - platform == 'rfsim'
+        - synthran_live_software_probe.rc != 0
+        - not (synthran_live_software_failure_file.stat.exists | default(false))
+
+    - name: Require the complete read-only software UE acceptance probe
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_live_software_probe.rc == 0
+        fail_msg: >-
+          {{ synthran_live_software_probe.stderr
+             | default(synthran_live_software_probe.stdout, true)
+             | default('software UE acceptance probe failed', true) }}
+          Retained evidence:
+          {{ run_dir }}/software-ue-acceptance-failure.json
+      when: platform == 'rfsim'
+
+    - name: Decode fresh software UE bindings
+      ansible.builtin.set_fact:
+        synthran_live_software_bindings: "{{ synthran_live_software_probe.stdout | from_json }}"
+      when: platform == 'rfsim'
+
+- name: Recheck selected cluster runtime without mutation
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Load the sealed executable deployment identity
+      ansible.builtin.set_fact:
+        synthran_live_contract: >-
+          {{ lookup('ansible.builtin.file', synthran_deployment_contract_file) | from_json }}
+
+    - name: Collect fresh selected-namespace Kubernetes and Helm state
+      ansible.builtin.script:
+        cmd: >-
+          {{ synthran_execution_root }}/scripts/collect_cluster_snapshot.py
+          --namespace {{ synthran_live_contract.deployment.topology.namespace | quote }}
+        executable: /usr/bin/python3
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: synthran_live_cluster_snapshot
+      changed_when: false
+
+    - name: Retain fresh cluster runtime evidence
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        mode: '0644'
+        dest: >-
+          {{ synthran_live_cluster_file
+             | default(run_dir ~ '/acceptance-cluster.json') }}
+        content: >-
+          {{ synthran_live_cluster_snapshot.stdout | from_json | to_nice_json }}
+
+- name: Publish one fresh live-testbed evidence contract
+  hosts: localhost
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Load the sealed executable deployment identity
+      ansible.builtin.set_fact:
+        synthran_live_contract: >-
+          {{ lookup('ansible.builtin.file', synthran_deployment_contract_file) | from_json }}
+        synthran_live_bindings: []
+
+    - name: Require every selected physical UE to expose a fresh binding
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - hostvars[item.device] is defined
+          - hostvars[item.device].synthran_r2lab_binding is defined
+        fail_msg: >-
+          Selected physical UE {{ item.device }} has no fresh read-only binding.
+      loop: "{{ synthran_live_contract.deployment.ues }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: platform == 'r2lab'
+
+    - name: Collect fresh physical UE bindings in deployment order
+      ansible.builtin.set_fact:
+        synthran_live_bindings: >-
+          {{ synthran_live_bindings + [hostvars[item.device].synthran_r2lab_binding] }}
+      loop: "{{ synthran_live_contract.deployment.ues }}"
+      loop_control:
+        label: "{{ item.device }}"
+      when: platform == 'r2lab'
+
+    - name: Require complete fresh software UE bindings
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - hostvars[ran_node_name].synthran_live_software_bindings is defined
+          - >-
+            hostvars[ran_node_name].synthran_live_software_bindings | length
+            == synthran_live_contract.deployment.ues | length
+        fail_msg: >-
+          Selected software UEs do not expose a complete fresh binding set.
+      when: platform == 'rfsim'
+
+    - name: Collect fresh software UE bindings
+      ansible.builtin.set_fact:
+        synthran_live_bindings: "{{ hostvars[ran_node_name].synthran_live_software_bindings }}"
+      when: platform == 'rfsim'
+
+    - name: Read the fresh cluster runtime evidence
+      ansible.builtin.set_fact:
+        synthran_live_cluster_document: >-
+          {{ lookup(
+               'ansible.builtin.file',
+               synthran_live_cluster_file | default(run_dir ~ '/acceptance-cluster.json')
+             ) | from_json }}
+
+    - name: Require the live cluster to retain the sealed configuration identity
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - >-
+            synthran_live_cluster_document.cluster_attestation.configuration_hash
+            == synthran_live_contract.configuration_hash
+          - synthran_live_bindings | length == synthran_live_contract.deployment.ues | length
+        fail_msg: >-
+          Fresh live-testbed evidence does not match the sealed deployment identity.
+
+    - name: Retain fresh live-testbed evidence
+      ansible.builtin.copy:
+        mode: '0644'
+        dest: >-
+          {{ synthran_live_evidence_file
+             | default(run_dir ~ '/live-deployment-evidence.json') }}
+        content: >-
+          {{ {
+               'schema_version': 2,
+               'deployment_hash': synthran_live_contract.deployment_hash,
+               'configuration_hash': synthran_live_contract.configuration_hash,
+               'implementation_identity_sha256': synthran_live_contract.implementation_identity_sha256,
+               'cluster_identity_verified': true,
+               'bindings': synthran_live_bindings,
+               'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')
+             } | to_nice_json }}

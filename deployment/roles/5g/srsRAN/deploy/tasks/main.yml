@@ -1,22 +1,25 @@
 ---
-- name: Patch Helm charts
-  include_tasks: patch_charts.yml
+- name: Materialize the reviewed srsRAN lifecycle reference
+  ansible.builtin.include_tasks: materialize_reference.yml
+
+- name: Prepare the selected srsRAN UE pod through the pinned lifecycle
+  ansible.builtin.include_tasks: "{{ synthran_srsran_reference_deploy_srsues }}"
   when: rru == 'rfsim'
 
-- name: Prepare the srsRAN UE pod before starting RFSIM processes
-  include_tasks: deploy_srsues.yml
+- name: Verify the deployed RFSIM UE runtime contract
+  ansible.builtin.include_tasks: verify_rfsim_ue_runtime.yml
   when: rru == 'rfsim'
-
-- name: Harden the final srsRAN runtime before Helm deployment
-  ansible.builtin.include_tasks: "{{ role_path }}/../config/tasks/harden_runtime.yml"
 
 - name: Deploy srsRAN gNB
-  include_tasks: deploy_gnb.yml
+  ansible.builtin.include_tasks: deploy_gnb.yml
 
 - name: Verify live srsRAN log production
   ansible.builtin.include_tasks: verify_logging.yml
 
-- name: Start the RFSIM GNU Radio broker and UE processes
-  include_tasks: start_broker.yml
-  when: rru == 'rfsim'
+- name: Attest physical srsRAN RAN-local health
+  ansible.builtin.include_tasks: verify_ran_health.yml
+  when: rru in ['n300', 'n320']
 
+- name: Start the RFSIM GNU Radio broker and selected UE processes
+  ansible.builtin.include_tasks: start_broker.yml
+  when: rru == 'rfsim'

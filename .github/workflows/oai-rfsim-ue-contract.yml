@@ -1,0 +1,61 @@
+name: OAI RFSIM UE contract
+
+on:
+  pull_request:
+    branches:
+      - rework
+    paths:
+      - 'synthran/deployment_state.py'
+      - 'synthran/inventory.py'
+      - 'deployment/group_vars/all/network_profile_default.yaml'
+      - 'deployment/group_vars/all/ue_catalog.yaml'
+      - 'deployment/group_vars/all/all.yml'
+      - 'deployment/roles/5g/oai/**'
+      - 'deployment/scripts/probe_software_ues.py'
+      - 'deployment/playbooks/verify_live_testbed.yml'
+      - 'deployment/topology.yml'
+      - 'deployment/roles/synthran/r2lab_ue_verify/tasks/main.yml'
+      - 'tools/check_oai_rfsim_ue_contract.py'
+      - '.github/workflows/oai-rfsim-ue-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install contract dependencies
+        run: python -m pip install PyYAML ansible-core==2.19.13
+
+      - name: Compile OAI RFSIM acceptance code
+        run: |
+          python -m py_compile \
+            synthran/deployment_state.py \
+            synthran/inventory.py \
+            deployment/scripts/probe_software_ues.py \
+            tools/check_oai_rfsim_ue_contract.py
+
+      - name: Validate selected OAI RFSIM UE authority
+        env:
+          PYTHONPATH: .
+        run: python tools/check_oai_rfsim_ue_contract.py
+
+      - name: Syntax-check physical R2Lab UE verifier task loading
+        run: |
+          cat > /tmp/synthran-r2lab-ue-verifier-syntax.yml <<EOF
+          ---
+          - name: Parse the physical R2Lab UE verifier
+            hosts: localhost
+            gather_facts: false
+            tasks:
+              - name: Import the physical R2Lab UE verifier tasks
+                ansible.builtin.import_tasks: "$GITHUB_WORKSPACE/deployment/roles/synthran/r2lab_ue_verify/tasks/main.yml"
+          EOF
+          ansible-playbook -i localhost, --syntax-check /tmp/synthran-r2lab-ue-verifier-syntax.yml

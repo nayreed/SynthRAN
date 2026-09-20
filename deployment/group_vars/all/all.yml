@@ -15,7 +15,7 @@ helm_sha256:
   arm64: "0236e2ebea9577799375a236c5e0e98d0eded4b9a3260678e51bfbc9dcca97a1"
 yq_version: "v4.45.1"
 yq_bin_path: "/usr/local/bin/yq"
-# Legacy role download tasks are intentionally fail-closed. The network play
+# Legacy role download tasks are intentionally fail-closed. The bootstrap play
 # installs this binary from the checksum-pinned release before any 5G backend.
 yq_url: ""
 yq_sha256:
@@ -33,3 +33,65 @@ flannel_chart_version: "v0.28.9"
 # The srsRAN chart hardcodes a BusyBox log sidecar. SynthRAN rewrites that
 # reference to this immutable Docker Official Image index before Helm renders.
 synthran_log_sidecar_image: "busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
+
+# OAI RFSIM is intentionally decoupled from the physical N3xx image baseline.
+# The helper's 2026.w26 NR-UE contains OAI's later-fixed PRACH amplitude defect
+# (bad commit 611bbb...; fixed by 568ed... in integration 2026.w33).
+# Keep N300/N320 on the physically proven helper pin; override only software
+# RF simulation and retain the actual pulled imageID digest at runtime.
+synthran_oai_rfsim_runtime_release: "2026.w33"
+synthran_oai_rfsim_upstream_revision: "2b69bde6aeafe892cda1531a0f0cbba2e37792cd"
+synthran_oai_rfsim_prach_fix_revision: "568ed052348947dc5ece1d408887c50afe3c8e6a"
+synthran_oai_rfsim_gnb_repository: "docker.io/oaisoftwarealliance/oai-gnb"
+synthran_oai_rfsim_gnb_index_digest: "sha256:0dd2bd5507ccbbe08600a6df33a32f7861eaa4034c9d63750d5a3a8754686d16"
+synthran_oai_rfsim_ue_repository: "docker.io/oaisoftwarealliance/oai-nr-ue"
+synthran_oai_rfsim_ue_index_digest: "sha256:18b7a553088e98187de38e363ebe389ece45db6b54c0ce568c60f681762515c8"
+
+# #124 defines preserve|bootstrap|fresh in the resolved scenario. This policy
+# remains controller-owned and is never inferred from live host state.
+synthran_ran_boot_nodes:
+  - sopnode-f1
+  - sopnode-f2
+  - sopnode-f3
+
+# These token lists mirror the pinned POS boot profiles used by
+# synthran.reservation. The preflight checks the running kernel before any
+# R2Lab radio/UE mutation; contract CI guards this vocabulary.
+synthran_boot_common_tokens:
+  - biosdevname=0
+  - net.ifnames=0
+  - mitigations=off
+  - intel_iommu=on
+  - iommu=pt
+  - selinux=0
+  - enforcing=0
+  - nosoftlockup
+  - intel_pstate=disable
+  - idle=poll
+  - nosmt
+synthran_boot_ran_tokens:
+  - isolcpus=managed_irq,16-63
+  - nohz_full=16-63
+  - nohz=on
+  - rcu_nocbs=16-63
+  - kthread_cpus=0-4
+  - irqaffinity=0-4
+  - rcu_nocb_poll
+  - skew_tick=1
+  - tsc=nowatchdog
+  - nmi_watchdog=0
+  - softlockup_panic=0
+  - audit=0
+synthran_host_preparation: >-
+  {{
+    (
+      (lookup('file', scenario_file) | from_yaml).deployment.reservation
+      | default({})
+    ).host_preparation
+    | default('fresh')
+  }}
+
+# #51 pins the original sopnode/5g_ansible reference commit. The shared
+# materializer verifies this checkout before any delegated upstream task runs.
+synthran_reference_root: >-
+  {{ synthran_root }}/.synthran/reference/sopnode-5g-ansible/b73fccf87f55060484b3759e9cb347222253534b

@@ -16,13 +16,29 @@
     - ovs-vswitchd
   become: true
 
-- name: Define OVS bridges
+- name: Require the selected transport bridge contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_topology.transport is mapping
+      - synthran_topology.transport.bridges is mapping
+      - synthran_topology.transport.bridges.core is iterable
+      - synthran_topology.transport.bridges.ran is iterable
+    fail_msg: The selected topology does not define the authoritative OVS bridge contract.
+
+- name: Select authoritative OVS bridges for this host
   ansible.builtin.set_fact:
     ovs_bridges: >-
-      {{ ['n2br', 'n3br'] +
-         (['n4br'] if inventory_hostname in groups['core_node'] or core == 'free5gc' else []) }}
+      {{
+        ((synthran_topology.transport.bridges.core
+          if inventory_hostname in groups['core_node'] else [])
+         +
+         (synthran_topology.transport.bridges.ran
+          if inventory_hostname in groups['ran_node'] else []))
+        | unique | list
+      }}
 
-- name: Create OVS bridges
+- name: Create authoritative OVS bridges
   ansible.builtin.shell: |
     if ovs-vsctl br-exists {{ item }}; then
       echo existing
@@ -35,21 +51,6 @@
   changed_when: ovs_bridge_create.stdout | trim == 'created'
   become: true
 
-- name: Remove a legacy N4 bridge from the RAN host
-  ansible.builtin.shell: |
-    if ovs-vsctl br-exists n4br; then
-      ovs-vsctl del-br n4br
-      echo removed
-    else
-      echo absent
-    fi
-  register: legacy_ran_n4_cleanup
-  changed_when: legacy_ran_n4_cleanup.stdout | trim == 'removed'
-  become: true
-  when:
-    - inventory_hostname not in groups['core_node']
-    - core != 'free5gc'
-
 - name: Verify OVS daemons
   ansible.builtin.service_facts:
 
@@ -61,7 +62,7 @@
     fail_msg: "One or more Open vSwitch services are not running on {{ inventory_hostname }}"
     success_msg: Open vSwitch services are running
 
-- name: Verify OVS bridges
+- name: Verify authoritative OVS bridges
   ansible.builtin.command: "ovs-vsctl br-exists {{ item }}"
   loop: "{{ ovs_bridges }}"
   become: true

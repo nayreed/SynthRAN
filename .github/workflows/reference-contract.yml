@@ -1,0 +1,52 @@
+name: 5g-Ansible reference contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference-contract:
+    name: Pinned execution reference
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install contract parser dependency
+        run: python -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Materialize exact upstream execution reference
+        run: |
+          set -euo pipefail
+          reference_root="$(python -m synthran.reference_checkout)"
+          test -d "$reference_root/.git"
+          echo "SYNTHRAN_REFERENCE_ROOT=$reference_root" >>"$GITHUB_ENV"
+          git -C "$reference_root" rev-parse HEAD
+
+      - name: Verify original-upstream execution contract
+        run: >-
+          python3 tools/check_5g_ansible_contract.py
+          --reference "$SYNTHRAN_REFERENCE_ROOT"
+
+      - name: Verify SynthRAN resource authority boundary
+        run: >-
+          python3 tools/check_resource_authority_contract.py
+          --reference "$SYNTHRAN_REFERENCE_ROOT"
+
+      - name: Verify host and Kubernetes bootstrap ownership
+        run: >-
+          python3 tools/check_host_bootstrap_contract.py
+          --reference "$SYNTHRAN_REFERENCE_ROOT"

@@ -1,0 +1,108 @@
+---
+- name: Configure the R2Lab N320 RU parent interface
+  ansible.builtin.lineinfile:
+    path: "{{ repo_dest }}/rru/n320.env"
+    regexp: '^IF_NAME_GNB_RU='
+    line: 'IF_NAME_GNB_RU="{{ oai_r2lab_n320_ru_parent }}"'
+
+- name: Configure the R2Lab N320 RU with a static pod-side address
+  ansible.builtin.lineinfile:
+    path: "{{ repo_dest }}/rru/n320.env"
+    regexp: '^IP_GNB_RU='
+    line: 'IP_GNB_RU="{{ oai_r2lab_n320_ru_ip }}"'
+
+- name: Match the N320 RU MTU to the R2Lab parent interface
+  ansible.builtin.lineinfile:
+    path: "{{ repo_dest }}/rru/n320.env"
+    regexp: '^MTU_GNB_RU='
+    line: 'MTU_GNB_RU="{{ oai_r2lab_n320_ru_mtu }}"'
+
+- name: Configure the validated N320 MPM and RFNoC endpoint before Helm rendering
+  ansible.builtin.replace:
+    path: "{{ repo_dest }}/rru/n320.env"
+    regexp: 'mgmt_addr=[0-9.]+,addr=[0-9.]+'
+    replace: 'mgmt_addr={{ oai_r2lab_n320_sdr_ip }},addr={{ oai_r2lab_n320_sdr_ip }}'
+
+- name: Select the N320 RU interface values used by the configured OAI mode
+  ansible.builtin.set_fact:
+    oai_n320_nf_ifs_path: >-
+      {{ repo_dest }}/demo_charts/values/nf-ifs/{{
+        'oai-gnb.yaml'
+        if (oai_gnb_mode | default('monolithic')) == 'monolithic'
+        else 'oai-du-cucpup.yaml'
+        if (oai_gnb_mode | default('monolithic')) == 'cucpup'
+        else 'oai-du.yaml'
+      }}
+
+- name: Configure the staged R2Lab N320 RU values for the selected OAI mode
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 - "{{ oai_n320_nf_ifs_path }}" "{{ oai_r2lab_n320_ru_cni_type }}" "{{ oai_r2lab_n320_ru_cni_mode }}" <<'PY'
+    from pathlib import Path
+    import sys
+
+    path = Path(sys.argv[1])
+    cni_type = sys.argv[2]
+    cni_mode = sys.argv[3]
+    text = path.read_text()
+    marker = '- name: "ru"'
+    if marker not in text:
+        raise SystemExit(f"RU block not found in {path}")
+
+    prefix, ru = text.split(marker, 1)
+    old_type = '  type: macvlan'
+    old_mode = '  mode: "bridge"'
+    if old_type not in ru:
+        raise SystemExit(f"RU macvlan type not found in {path}")
+    if old_mode not in ru:
+        raise SystemExit(f"RU bridge mode not found in {path}")
+
+    ru = ru.replace(old_type, f'  type: {cni_type}', 1)
+    ru = ru.replace(old_mode, f'  mode: "{cni_mode}"', 1)
+    path.write_text(prefix + marker + ru)
+    PY
+  args:
+    executable: /bin/bash
+
+- name: Verify the staged R2Lab N320 source values
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 - \
+      "{{ repo_dest }}/rru/n320.env" \
+      "{{ oai_r2lab_n320_ru_parent }}" \
+      "{{ oai_r2lab_n320_ru_ip }}" \
+      "{{ oai_r2lab_n320_ru_mtu }}" \
+      "{{ oai_r2lab_n320_sdr_ip }}" \
+      "{{ oai_r2lab_n320_ru_cni_type }}" \
+      "{{ oai_r2lab_n320_ru_cni_mode }}" \
+      "{{ oai_n320_nf_ifs_path }}" <<'PY'
+    from pathlib import Path
+    import sys
+
+    env_path = Path(sys.argv[1])
+    ru_parent, ru_ip, ru_mtu, sdr_ip, cni_type, cni_mode = sys.argv[2:8]
+    values_path = Path(sys.argv[8])
+
+    env = env_path.read_text()
+    for expected in (
+        f'IF_NAME_GNB_RU="{ru_parent}"',
+        f'IP_GNB_RU="{ru_ip}"',
+        f'MTU_GNB_RU="{ru_mtu}"',
+        f'mgmt_addr={sdr_ip},addr={sdr_ip}',
+    ):
+        if expected not in env:
+            raise SystemExit(f"missing {expected!r} in {env_path}")
+
+    text = values_path.read_text()
+    marker = '- name: "ru"'
+    if marker not in text:
+        raise SystemExit(f"RU block not found in {values_path}")
+    ru = text.split(marker, 1)[1]
+    if f'  type: {cni_type}' not in ru:
+        raise SystemExit(f"RU CNI type is not {cni_type} in {values_path}")
+    if f'  mode: "{cni_mode}"' not in ru:
+        raise SystemExit(f"RU CNI mode is not {cni_mode} in {values_path}")
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false

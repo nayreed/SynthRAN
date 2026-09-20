@@ -3,8 +3,8 @@
   ansible.builtin.set_fact:
     bridge_enabled: "{{ bridge_enabled | default(false) | bool }}"
 
-# === CLEANUP PHASE ============================================================
-
+# Fresh provisioning only. bootstrap_nodes.yml prevents this role from running
+# when host_preparation=preserve.
 - name: Stop kubelet before reset
   ansible.builtin.systemd:
     name: kubelet
@@ -12,24 +12,22 @@
   become: true
   failed_when: false
 
-- name: Kill orphan static pod processes (apiserver, controller-manager, scheduler, etcd)
+- name: Kill orphan static pod processes
   ansible.builtin.shell: |
     for proc in kube-apiserver kube-controller-manager kube-scheduler etcd; do
-      pkill -9 -x "$proc" 2>/dev/null && echo "Killed $proc" || true
+      pkill -9 -x "$proc" 2>/dev/null || true
     done
   become: true
   changed_when: false
 
-- name: Wait for ports 6443 and 10259 to be released (max 30s)
+- name: Wait for control-plane ports to be released
   ansible.builtin.shell: |
     for port in 6443 10259; do
       for i in $(seq 1 15); do
         ss -tlnp | grep -q ":${port} " || break
-        echo "Port $port still in use ($i/15), waiting..."
         sleep 2
       done
       if ss -tlnp | grep -q ":${port} "; then
-        echo "ERROR: port $port still held after 30s"
         ss -tlnp | grep ":${port} "
         exit 1
       fi
@@ -51,7 +49,6 @@
   loop:
     - /etc/kubernetes
     - /var/lib/etcd
-    - /var/lib/kubelet
     - /etc/cni
     - /opt/cni
     - /var/lib/cni
@@ -60,86 +57,31 @@
   loop_control:
     label: "{{ item }}"
 
-- name: Remove all /var/lib/containerd entries from fstab after reset
-  ansible.builtin.lineinfile:
-    path: /etc/fstab
-    regexp: '.*/var/lib/containerd.*'
-    state: absent
-  become: true
-
-- name: Unmount all stacked mounts on /var/lib/containerd after reset
+- name: Clear generated kubelet state while preserving its mountpoint
   ansible.builtin.shell: |
-    for i in $(seq 1 10); do
-      findmnt /var/lib/containerd &>/dev/null || break
-      umount /var/lib/containerd 2>/dev/null || umount -l /var/lib/containerd 2>/dev/null || break
-      sleep 1
-    done
-    findmnt /var/lib/containerd && echo "STILL_MOUNTED" || echo "CLEAN"
-  register: unmount_after_reset
+    find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  become: true
   changed_when: false
-  become: true
 
-- name: Recreate /var/lib/containerd directory after cleanup
-  ansible.builtin.file:
-    path: /var/lib/containerd
-    state: directory
-    mode: '0755'
-  become: true
-
-- name: Detect existing mountpoint for storage device after reset
-  ansible.builtin.shell: |
-    findmnt -n -o TARGET /dev/{{ storage }} 2>/dev/null || echo "none"
-  register: storage_mount_after_reset
-  changed_when: false
-  become: true
-
-- name: "[bind] Remount via bind after reset (disk already mounted elsewhere)"
-  ansible.builtin.shell: |
-    mkdir -p "{{ storage_mount_after_reset.stdout }}/containerd"
-    mount --bind "{{ storage_mount_after_reset.stdout }}/containerd" /var/lib/containerd
-  become: true
-  when:
-    - storage_mount_after_reset.stdout != "none"
-    - storage_mount_after_reset.stdout != "/var/lib/containerd"
-
-- name: "[direct] Remount disk directly after reset"
-  ansible.builtin.shell: |
-    mount -t ext4 -o defaults,noatime /dev/{{ storage }} /var/lib/containerd
-  become: true
-  when: storage_mount_after_reset.stdout == "none"
-
-- name: Assert /var/lib/containerd is on a real FS before kubeadm init
+- name: Verify pre-k8s containerd storage binding before destructive cleanup
   ansible.builtin.shell: |
     fstype=$(findmnt -n -o FSTYPE /var/lib/containerd 2>/dev/null | head -1 || echo "NOT_MOUNTED")
-    echo "fstype=$fstype"
+    echo "$fstype"
     case "$fstype" in
       ext4|xfs|btrfs) exit 0 ;;
-      *) echo "ERROR: /var/lib/containerd is on '$fstype', expected ext4/xfs/btrfs"; exit 1 ;;
+      *) exit 1 ;;
     esac
-  become: true
+  register: cluster_containerd_fstype
   changed_when: false
-
-- name: Restart containerd
-  ansible.builtin.systemd:
-    name: containerd
-    state: restarted
   become: true
 
-- name: Wait for containerd to accept requests
-  ansible.builtin.command: ctr version
-  register: containerd_ready_before_wipe
-  changed_when: false
-  retries: 30
-  delay: 1
-  until: containerd_ready_before_wipe.rc == 0
-
-- name: Stop containerd before full data wipe
+- name: Stop containerd before clearing previous cluster data
   ansible.builtin.systemd:
     name: containerd
     state: stopped
   become: true
 
-- name: Wipe all containerd data (metadata, snapshots, blobs)
+- name: Remove stale containerd cluster data
   ansible.builtin.shell: |
     rm -rf /var/lib/containerd/io.containerd.content.v1.content
     rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt
@@ -151,20 +93,6 @@
     rm -rf /var/lib/containerd/tmpmounts
   become: true
 
-- name: Restart containerd after full wipe
-  ansible.builtin.systemd:
-    name: containerd
-    state: started
-  become: true
-
-- name: Wait for containerd to accept requests after the wipe
-  ansible.builtin.command: ctr version
-  register: containerd_ready_after_wipe
-  changed_when: false
-  retries: 30
-  delay: 1
-  until: containerd_ready_after_wipe.rc == 0
-
 - name: Create overlayfs snapshotter directory
   ansible.builtin.file:
     path: /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
@@ -172,18 +100,33 @@
     mode: '0755'
   become: true
 
-- name: Bind-mount overlayfs snapshotter dir as a separate mountpoint
+- name: Expose overlayfs capacity statistics to CRI
   ansible.builtin.shell: |
     findmnt /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs &>/dev/null || \
       mount --bind /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs \
                    /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
   become: true
+  changed_when: false
 
-# === KUBEADM INIT =============================================================
+- name: Restart containerd after clearing previous cluster data
+  ansible.builtin.systemd:
+    name: containerd
+    state: started
+  become: true
+
+- name: Wait for containerd to accept requests
+  ansible.builtin.command: ctr version
+  register: containerd_ready_after_wipe
+  changed_when: false
+  retries: 30
+  delay: 1
+  until: containerd_ready_after_wipe.rc == 0
+
 - name: Upload kubeadm config to master node
   ansible.builtin.template:
     src: kubeadm-config.yaml.j2
     dest: /root/kubeadm-config.yaml
+    mode: '0600'
   become: true
 
 - name: Initialize Kubernetes cluster
@@ -198,99 +141,35 @@
     state: absent
   become: true
 
-- name: Patch evictionHard into kubeadm-generated kubelet config
+- name: Configure kubelet storage eviction thresholds
   ansible.builtin.blockinfile:
     path: /var/lib/kubelet/config.yaml
     block: |
       evictionHard:
-        nodefs.available: "10%"
-        imagefs.available: "10%"
+        nodefs.available: "{{ '2%' if core_node_name == ran_node_name else '10%' }}"
+        imagefs.available: "{{ '2%' if core_node_name == ran_node_name else '10%' }}"
+      {% if core_node_name == ran_node_name %}
+      evictionMinimumReclaim:
+        nodefs.available: "500Mi"
+      {% endif %}
       imageGCHighThresholdPercent: 85
       imageGCLowThresholdPercent: 80
     marker: "# {mark} KUBELET STORAGE PATCH"
   become: true
 
-- name: Restart kubelet to apply eviction config
-  ansible.builtin.systemd:
-    name: kubelet
-    state: restarted
-    daemon_reload: yes
-  become: true
-
-# === KUBE-PROXY ===============================================================
-- name: Wait until at least one kube-proxy pod exists
-  ansible.builtin.shell: |
-    until kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get pod -l k8s-app=kube-proxy --no-headers 2>/dev/null | grep .; do
-      echo "Waiting for kube-proxy pod to appear..."
-      sleep 5
-    done
-  become: true
-
-- name: Restart kube-proxy pods to reload config.conf (if any exist)
-  ansible.builtin.shell: |
-    kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system delete pod -l k8s-app=kube-proxy --ignore-not-found
-  become: true
-
-- name: Wait until kube-proxy pods are Running
-  ansible.builtin.shell: |
-    kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system wait pod -l k8s-app=kube-proxy --for=condition=Ready --timeout=180s || true
-  become: true
-
-- name: Check for deprecated kubelet flags in /etc/default/kubelet
-  ansible.builtin.shell: |
-    if [ -f /etc/default/kubelet ]; then
-      if grep -Eq -- '--network-plugin|--cni-bin-dir|--cni-conf-dir' /etc/default/kubelet; then
-        echo "DEPRECATED_FOUND"
-      else
-        echo "CLEAN"
-      fi
-    else
-      echo "MISSING"
-    fi
-  register: kubelet_extra_check
-  changed_when: false
-  become: true
-
-- name: Backup existing /etc/default/kubelet if deprecated flags found
-  ansible.builtin.copy:
-    src: /etc/default/kubelet
-    dest: /etc/default/kubelet.bak_{{ ansible_date_time.epoch }}
-    remote_src: yes
-  when: kubelet_extra_check.stdout == "DEPRECATED_FOUND"
-  become: true
-
-- name: Sanitize /etc/default/kubelet if deprecated flags found or file missing
-  ansible.builtin.copy:
-    dest: /etc/default/kubelet
-    content: 'KUBELET_EXTRA_ARGS="--resolv-conf=/run/systemd/resolve/resolv.conf"'
-    mode: '0644'
-  when: kubelet_extra_check.stdout != "CLEAN"
-  become: true
-
-- name: Ensure kubelet systemd sees the change
-  ansible.builtin.systemd:
-    daemon_reload: yes
-  become: true
-
-- name: Restart kubelet if we changed the file
-  ansible.builtin.systemd:
-    name: kubelet
-    state: restarted
-  when: kubelet_extra_check.stdout != "CLEAN"
-  become: true
-
-- name: Ensure kubelet uses systemd-resolved DNS
+- name: Configure kubelet DNS resolution
   ansible.builtin.copy:
     dest: /etc/default/kubelet
     content: |
       KUBELET_EXTRA_ARGS=--resolv-conf=/run/systemd/resolve/resolv.conf
-    mode: "0644"
+    mode: '0644'
   become: true
 
-- name: Restart kubelet to apply DNS config
+- name: Restart kubelet after generated configuration is patched
   ansible.builtin.systemd:
     name: kubelet
     state: restarted
+    daemon_reload: true
   become: true
 
 - name: Enable cluster CIDR allocation in kube-controller-manager
@@ -306,20 +185,19 @@
   become: true
 
 - name: Create .kube directory in user's home
-  file:
+  ansible.builtin.file:
     path: "{{ ansible_env.HOME }}/.kube"
     state: directory
     mode: '0700'
 
 - name: Copy admin.conf to kube config
-  copy:
+  ansible.builtin.copy:
     src: /etc/kubernetes/admin.conf
     dest: "{{ ansible_env.HOME }}/.kube/config"
-    remote_src: yes
+    remote_src: true
     mode: '0600'
   become: true
 
-# === FLANNEL (CNI) ============================================================
 - name: Ensure CNI directories exist
   ansible.builtin.file:
     path: "{{ item }}"
@@ -340,7 +218,6 @@
     - /etc/cni/net.d/00-multus.conf.bak
     - /etc/cni/net.d/10-flannel.conf
     - /etc/cni/net.d/10-flannel.conf~
-  ignore_errors: yes
   become: true
 
 - name: Deploy Flannel CNI conflist
@@ -369,7 +246,7 @@
       }
   become: true
 
-- name: Extract the checksum-verified CNI plugin bundle staged by network.yml
+- name: Extract the checksum-verified CNI plugin bundle staged by bootstrap_nodes.yml
   ansible.builtin.unarchive:
     src: /tmp/cni-plugins.tgz
     dest: /opt/cni/bin
@@ -416,46 +293,51 @@
     - kubelet
   become: true
 
-- name: Wait until node is Ready
-  ansible.builtin.shell: |
-    kubectl wait node $(hostname) --for=condition=Ready --timeout=180s
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
+- name: Wait until the control-plane node is Ready
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig=/etc/kubernetes/admin.conf
+      - wait
+      - "node/{{ inventory_hostname }}"
+      - --for=condition=Ready
+      - --timeout=180s
   register: wait_ready
   retries: 3
   delay: 10
   until: wait_ready.rc == 0
+  changed_when: false
   become: true
 
 - name: Wait for CoreDNS pods to be Ready
-  ansible.builtin.shell: |
-    kubectl wait -n kube-system --for=condition=Ready pod -l k8s-app=kube-dns --timeout=300s
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  become: true
-
-- name: Test CoreDNS resolution using a non-interactive busybox pod
-  become: true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  ansible.builtin.shell: |
-    kubectl run dns-test --image=busybox:1.36 --restart=Never --command -- \
-      sh -c 'nslookup kubernetes.default.svc.cluster.local' || true
-    echo "Cleaning up test pods..."
-    kubectl delete pod dns-test --ignore-not-found
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig=/etc/kubernetes/admin.conf
+      - wait
+      - -n
+      - kube-system
+      - --for=condition=Ready
+      - pod
+      - -l
+      - k8s-app=kube-dns
+      - --timeout=300s
   changed_when: false
+  become: true
 
 - name: Generate join command
-  ansible.builtin.shell: kubeadm token create --print-join-command
+  ansible.builtin.command: kubeadm token create --print-join-command
   register: join_cmd
   delegate_to: "{{ groups['core_node'][0] }}"
   run_once: true
+  no_log: true
 
-- name: Save join command locally
+- name: Save join command in private run directory
   ansible.builtin.copy:
     content: "{{ join_cmd.stdout }}"
-    dest: .kubeadm_join_command.txt
-    mode: '0644'
+    dest: "{{ synthran_private_dir }}/kubeadm_join_command.txt"
+    mode: '0600'
   delegate_to: localhost
   become: false
   run_once: true
+  no_log: true

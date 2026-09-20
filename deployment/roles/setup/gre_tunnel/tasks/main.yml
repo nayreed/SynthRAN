@@ -1,77 +1,158 @@
 ---
-- name: Define the shared Open5GS and srsRAN access transport bridge
-  ansible.builtin.set_fact:
-    gre_bridges:
-      - name: n3br
-        local_ip_core: 10.10.3.254/24
-        local_ip_ran:  10.10.3.253/24
-        gre_key: 3
-  when: core == 'open5gs'
+- name: Require the selected transport contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_topology.transport is mapping
+      - synthran_topology.transport.bridges is mapping
+      - synthran_topology.transport.colocated is mapping
+      - synthran_topology.transport.split is mapping
+    fail_msg: The selected topology does not define an authoritative transport contract.
 
-- name: Define the OAI inter-host N3 bridge
+- name: Resolve transport mode and host role
   ansible.builtin.set_fact:
-    gre_bridges:
-      - name: n3br
-        local_ip_core: 192.168.3.254/24
-        local_ip_ran:  192.168.3.253/24
-        gre_key: 3
-  when: core == 'oai'
+    synthran_transport_mode: "{{ 'colocated' if core_node_name == ran_node_name else 'split' }}"
+    synthran_transport_host_role: >-
+      {{ 'core' if inventory_hostname in groups['core_node'] else 'ran' }}
 
-- name: Define GRE bridges configuration for free5gc core
+- name: Resolve this host's transport inputs
   ansible.builtin.set_fact:
-    gre_bridges:
-      - name: n3br
-        local_ip_core: 10.100.50.238/29
-        local_ip_ran:  10.100.50.237/29
-        gre_key: 3
-      - name: n4br
-        local_ip_core: 192.168.4.254/24
-        local_ip_ran:  192.168.4.253/24
-        gre_key: 4
-  when: core == 'free5gc'
+    synthran_transport_addresses: >-
+      {{ synthran_topology.transport[synthran_transport_mode].addresses | default({}) }}
+    synthran_transport_gre_bridges: >-
+      {{ synthran_topology.transport.split.gre | default([])
+         if synthran_transport_mode == 'split' else [] }}
+    synthran_transport_patches: >-
+      {{ synthran_topology.transport.split.patches | default([])
+         if synthran_transport_mode == 'split' else [] }}
 
-- name: Remove the legacy inter-host N4 GRE port
+- name: Configure authoritative host bridge addresses
   ansible.builtin.shell: |
-    if ovs-vsctl port-to-br gre-n4br >/dev/null 2>&1; then
-      ovs-vsctl --if-exists del-port n4br gre-n4br
+    set -eu
+    bridge={{ item.key | quote }}
+    target={{ ((item.value[synthran_transport_host_role] if item.value is mapping else item.value)) | quote }}
+    changed=false
+    current="$(ip -o -4 addr show dev "$bridge" scope global 2>/dev/null | awk '{print $4}' || true)"
+    for address in $current; do
+      if [ "$address" != "$target" ]; then
+        ip addr del "$address" dev "$bridge"
+        changed=true
+      fi
+    done
+    if ! ip -o -4 addr show dev "$bridge" scope global 2>/dev/null | awk '{print $4}' | grep -Fxq "$target"; then
+      ip addr add "$target" dev "$bridge"
+      changed=true
+    fi
+    ip link set dev "$bridge" up
+    if $changed; then echo changed; else echo retained; fi
+  args:
+    executable: /bin/bash
+  loop: "{{ synthran_transport_addresses | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: synthran_transport_address_result
+  changed_when: synthran_transport_address_result.stdout | trim == 'changed'
+  become: true
+
+- name: Reconcile SynthRAN-managed GRE ports with the selected contract
+  ansible.builtin.shell: |
+    set -eu
+    bridge={{ item | quote }}
+    port="gre-${bridge}"
+    if ! ovs-vsctl br-exists "$bridge" >/dev/null 2>&1; then
+      echo absent
+    elif {{ (item in synthran_transport_gre_bridges) | ternary('true', 'false') }}; then
+      echo required
+    elif ovs-vsctl port-to-br "$port" >/dev/null 2>&1; then
+      ovs-vsctl --if-exists del-port "$bridge" "$port"
       echo removed
     else
       echo absent
     fi
-  register: legacy_n4_gre_cleanup
-  changed_when: legacy_n4_gre_cleanup.stdout | trim == 'removed'
-  when: core != 'free5gc'
+  args:
+    executable: /bin/bash
+  loop: [n2br, n3br, n4br]
+  register: synthran_transport_gre_reconcile
+  changed_when: synthran_transport_gre_reconcile.stdout | trim == 'removed'
+  become: true
 
-- name: Check for the unsupported Open5GS N2 GRE port
-  ansible.builtin.command:
-    argv:
-      - ovs-vsctl
-      - port-to-br
-      - gre-n2br
-  register: legacy_n2_gre_check
-  changed_when: false
-  failed_when: false
-  when: core == 'open5gs'
-
-- name: Remove the unsupported Open5GS N2 GRE port
-  ansible.builtin.command:
-    argv:
-      - ovs-vsctl
-      - --if-exists
-      - del-port
-      - n2br
-      - gre-n2br
-  when:
-    - core == 'open5gs'
-    - legacy_n2_gre_check.rc == 0
-
-- name: Configure the required inter-host 5G transport bridges
+- name: Configure required inter-host GRE links
   ansible.builtin.include_tasks: gre_loop.yml
-  loop: "{{ gre_bridges }}"
+  loop: "{{ synthran_transport_gre_bridges }}"
   loop_control:
-    loop_var: item
-    label: "{{ item.name }}"
+    loop_var: synthran_gre_bridge
+    label: "{{ synthran_gre_bridge }}"
+  when: synthran_transport_mode == 'split'
 
-#- name: Pause to debug
-#  ansible.builtin.pause:
-#    prompt: "Type Enter to resume after inspection"
+- name: Remove managed patch ports when the selected contract does not require them
+  ansible.builtin.shell: |
+    set -eu
+    changed=false
+    if [ {{ synthran_transport_patches | length }} -eq 0 ]; then
+      for spec in 'n3br patch-n3-n4' 'n4br patch-n4-n3'; do
+        set -- $spec
+        bridge=$1
+        port=$2
+        if ovs-vsctl br-exists "$bridge" >/dev/null 2>&1 && \
+           ovs-vsctl port-to-br "$port" >/dev/null 2>&1; then
+          ovs-vsctl --if-exists del-port "$bridge" "$port"
+          changed=true
+        fi
+      done
+    fi
+    if $changed; then echo changed; else echo retained; fi
+  args:
+    executable: /bin/bash
+  register: synthran_patch_reconcile
+  changed_when: synthran_patch_reconcile.stdout | trim == 'changed'
+  become: true
+
+- name: Converge required local OVS patch links
+  ansible.builtin.shell: |
+    set -eu
+    a={{ item.a | quote }}
+    b={{ item.b | quote }}
+    a_port={{ item.a_port | quote }}
+    b_port={{ item.b_port | quote }}
+    a_bridge="$(ovs-vsctl port-to-br "$a_port" 2>/dev/null || true)"
+    b_bridge="$(ovs-vsctl port-to-br "$b_port" 2>/dev/null || true)"
+    a_type="$(ovs-vsctl --if-exists get interface "$a_port" type 2>/dev/null | tr -d '"' || true)"
+    b_type="$(ovs-vsctl --if-exists get interface "$b_port" type 2>/dev/null | tr -d '"' || true)"
+    a_peer="$(ovs-vsctl --if-exists get interface "$a_port" options:peer 2>/dev/null | tr -d '"' || true)"
+    b_peer="$(ovs-vsctl --if-exists get interface "$b_port" options:peer 2>/dev/null | tr -d '"' || true)"
+    if [ "$a_bridge" = "$a" ] && [ "$b_bridge" = "$b" ] && \
+       [ "$a_type" = "patch" ] && [ "$b_type" = "patch" ] && \
+       [ "$a_peer" = "$b_port" ] && [ "$b_peer" = "$a_port" ]; then
+      echo retained
+      exit 0
+    fi
+    ovs-vsctl --may-exist add-port "$a" "$a_port"
+    ovs-vsctl --may-exist add-port "$b" "$b_port"
+    ovs-vsctl set interface "$a_port" type=patch options:peer="$b_port"
+    ovs-vsctl set interface "$b_port" type=patch options:peer="$a_port"
+    echo changed
+  args:
+    executable: /bin/bash
+  loop: "{{ synthran_transport_patches }}"
+  loop_control:
+    label: "{{ item.a }}<->{{ item.b }}"
+  when: synthran_transport_mode == 'split'
+  register: synthran_patch_converge
+  changed_when: synthran_patch_converge.stdout | trim == 'changed'
+  become: true
+
+- name: Verify authoritative transport bridges exist
+  ansible.builtin.command:
+    argv:
+      - ovs-vsctl
+      - br-exists
+      - "{{ item }}"
+  loop: >-
+    {{ ((synthran_topology.transport.bridges.core
+         if inventory_hostname in groups['core_node'] else [])
+        +
+        (synthran_topology.transport.bridges.ran
+         if inventory_hostname in groups['ran_node'] else []))
+       | unique | list }}
+  changed_when: false
+  become: true

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 
 import yaml
 
+from ..acceptance import validate_live_evidence
+from ..deployment_identity import validate_current_cluster_runtime
 from ..deployment_state import bindings_match_deployment
 from .metrics import measurements
 
@@ -41,49 +43,60 @@ def _configured_devices(expected: str | Path, scenario: str | Path | None) -> li
 
 
 def _deployment_evidence(expected: str | Path) -> dict:
+    """Verify the accepted deployment and the eligibility snapshot used for this run."""
+
     run = Path(expected).parent.parent
     identity_path = run / "deployment-fingerprint.json"
-    evidence_path = run / "live-deployment-evidence.json"
+    evidence_path = run / "experiment-eligibility-evidence.json"
+    cluster_path = run / "experiment-eligibility-cluster.json"
+    decision_path = run / "experiment-eligible.json"
+    required = (identity_path, evidence_path, cluster_path, decision_path)
+    missing = [path.name for path in required if not path.is_file()]
+    if missing:
+        return {
+            "verified": False,
+            "reason": "experiment eligibility evidence is incomplete: " + ", ".join(missing),
+        }
+
     try:
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        validate_live_evidence(identity_path, evidence_path, max_age_seconds=None)
+        validate_current_cluster_runtime(identity, cluster_path)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
         return {
             "verified": False,
-            "reason": "deployment identity evidence is missing or unreadable",
+            "reason": f"experiment eligibility evidence is invalid: {exc}",
         }
-    matches = identity.get("deployment_hash") == evidence.get("deployment_hash")
-    cluster_verified = evidence.get("cluster_identity_verified") is True
+
     deployment = identity.get("deployment", {})
     bindings = evidence.get("bindings", [])
-    platform = deployment.get("platform")
-    binding_fields = ("device", "index", "imsi", "slice", "dnn")
-    if platform == "rfsim":
-        binding_verified = (
-            [tuple(item.get(field) for field in binding_fields) for item in bindings]
-            == [
-                tuple(item.get(field) for field in binding_fields)
-                for item in deployment.get("ues", [])
-            ]
-        )
-    elif platform == "r2lab":
-        binding_verified = bindings_match_deployment(deployment, bindings)
-    else:
-        binding_verified = False
-    status_valid = identity.get("status") in {"active", "reused"}
-    verified = matches and cluster_verified and binding_verified and status_valid
+    binding_verified = isinstance(bindings, list) and bindings_match_deployment(
+        deployment, bindings
+    )
+    decision_verified = (
+        decision.get("status") == "experiment-eligible"
+        and decision.get("experiment_eligible") is True
+        and decision.get("deployment_hash") == identity.get("deployment_hash")
+        and decision.get("eligibility_observed_at") == evidence.get("observed_at")
+    )
+    status_valid = identity.get("status") == "accepted-testbed"
+    verified = binding_verified and decision_verified and status_valid
     return {
         "verified": verified,
         "status": identity.get("status"),
+        "eligibility_status": decision.get("status"),
         "deployment_hash": identity.get("deployment_hash"),
         "scenario_hash": identity.get("scenario_hash"),
-        "cluster_identity_verified": cluster_verified,
+        "cluster_identity_verified": evidence.get("cluster_identity_verified") is True,
         "binding_verified": binding_verified,
         "bindings": bindings,
+        "eligibility_observed_at": evidence.get("observed_at"),
         "reason": (
             None
             if verified
-            else "live evidence does not completely match the deployment identity"
+            else "experiment eligibility evidence does not completely match the accepted deployment"
         ),
     }
 

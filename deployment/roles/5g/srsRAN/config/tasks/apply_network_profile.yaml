@@ -86,7 +86,7 @@
       - (synthran_srsran_remote_control.stdout | from_json).bind_addr == '127.0.0.1'
     fail_msg: Refusing to deploy srsRAN with an enabled or broadly bound remote-control listener.
 
-- name: Ensure values file has node constraints
+- name: Ensure RFSIM values have local node constraints
   ansible.builtin.blockinfile:
     path: "{{ values_file }}"
     marker: "# {mark} ANSIBLE MANAGED NODE SELECTOR"
@@ -95,3 +95,4 @@
       nodeSelector:
         kubernetes.io/hostname: "{{ ran_node_name }}"
       nodeName: {{ ran_node_name }}
+  when: rru == 'rfsim'

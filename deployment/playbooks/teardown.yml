@@ -1,0 +1,57 @@
+---
+- name: Stop only the selected R2Lab radio and UE resources
+  hosts: faraday
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run the shared selected-resource cleanup lifecycle
+      ansible.builtin.include_role:
+        name: r2lab/cleanup
+        apply:
+          tags:
+            - resources
+      vars:
+        synthran_cleanup_phase: teardown
+      when: platform == 'r2lab'
+      tags:
+        - resources
+
+- name: Delete only the explicitly selected deployment namespace
+  hosts: core_node
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve the selected namespace from the accepted deployment contract
+      ansible.builtin.set_fact:
+        synthran_selected_namespace: >-
+          {{ synthran_deployment_contract.deployment.topology.namespace | default('') }}
+      when: synthran_delete_namespace | default(false) | bool
+      tags:
+        - namespace
+
+    - name: Require a non-system selected namespace before deletion
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_selected_namespace | string | length > 0
+          - synthran_selected_namespace not in ['default', 'kube-system', 'kube-public', 'kube-node-lease']
+        fail_msg: >-
+          Explicit namespace teardown requires one non-system namespace from the
+          accepted deployment contract; arbitrary namespace input is not allowed.
+      when: synthran_delete_namespace | default(false) | bool
+      tags:
+        - namespace
+
+    - name: Delete the exact selected deployment namespace
+      ansible.builtin.command:
+        argv:
+          - "{{ kubectl_bin | default('/usr/bin/kubectl') }}"
+          - delete
+          - namespace
+          - "{{ synthran_selected_namespace }}"
+          - --ignore-not-found=true
+      register: synthran_namespace_delete
+      changed_when: "'deleted' in (synthran_namespace_delete.stdout | default('') | lower)"
+      when: synthran_delete_namespace | default(false) | bool
+      tags:
+        - namespace

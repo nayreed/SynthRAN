@@ -1,18 +1,4 @@
 ---
-- name: Force Taint node {{ target_node }} with NoSchedule
-  ansible.builtin.command: >
-    kubectl taint node {{ target_node }} test-eviction=true:NoSchedule --overwrite
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: taint_out
-  # Avec --overwrite, il n'y a pas besoin de failed_when basé sur stderr
-  failed_when: taint_out.rc != 0
-  # Indique que la tâche a changé si kubectl retourne 'tainted' ou 'modified'
-  changed_when: "'tainted' in taint_out.stdout or 'modified' in taint_out.stdout"
-
-- name: Clean up core pods from node {{ target_node }}
-  ansible.builtin.command: >
-    kubectl delete pods -n open5gs --field-selector spec.nodeName={{ target_node }} --ignore-not-found=true
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  when: taint_out.changed
+- name: Delegate worker taint lifecycle to pinned 5g-Ansible
+  ansible.builtin.include_tasks:
+    file: "{{ synthran_reference_root }}/roles/setup/k8s/add_taint/tasks/main.yml"

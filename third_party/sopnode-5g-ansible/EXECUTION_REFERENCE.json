@@ -1,0 +1,117 @@
+{
+  "schema": "synthran/5g-ansible-execution-reference/v2",
+  "repository": "https://github.com/sopnode/5g_ansible",
+  "commit": "b73fccf87f55060484b3759e9cb347222253534b",
+  "upstream_branch": "main",
+  "purpose": "Pinned execution/comparison reference for the SynthRAN rework. This is separate from historical derivation provenance in SOURCE.json.",
+  "execution_model": "selective-delegation",
+  "upstream_entrypoints": {
+    "deployment": "playbooks/deploy.yml",
+    "r2lab_preparation": "playbooks/deploy_r2lab.yml",
+    "physical_ue_connect": "playbooks/test-ue-connect.yml"
+  },
+  "required_capabilities": {
+    "cores": ["open5gs", "oai", "free5gc"],
+    "rans": ["oai", "srsRAN", "ueransim"],
+    "platforms": ["r2lab", "rfsim"],
+    "profiles": ["default", "scenario1"],
+    "r2lab_probe_ues": {
+      "qhats": ["qhat01"],
+      "qfits": ["qfit07"]
+    }
+  },
+  "required_paths": [
+    "playbooks/deploy.yml",
+    "playbooks/deploy_r2lab.yml",
+    "playbooks/test-ue-connect.yml",
+    "roles/pos/tasks/main.yml",
+    "roles/setup/containerd/tasks/main.yml",
+    "roles/setup/storage/tasks/main.yml",
+    "roles/setup/k8s/add_taint/tasks/main.yml",
+    "roles/setup/k8s/remove_cp_taint/tasks/main.yml",
+    "roles/setup/k8s/remove_taint/tasks/main.yml",
+    "roles/5g/oai/core/tasks/main.yml",
+    "roles/5g/srsRAN/deploy/tasks/deploy_with_check.yml",
+    "roles/5g/srsRAN/deploy/tasks/deploy_srsues.yml",
+    "roles/r2lab/ue/setup/tasks/main.yml",
+    "roles/r2lab/ue/connect/tasks/main.yml",
+    "roles/r2lab/ue/stop/tasks/main.yml"
+  ],
+  "mapping": [
+    {"synthran": "deployment.core", "reference": "core", "status": "direct"},
+    {"synthran": "deployment.ran", "reference": "ran", "status": "adapt", "rule": "srsran -> srsRAN; oai/ueransim unchanged"},
+    {"synthran": "deployment.platform", "reference": "platform", "status": "direct"},
+    {"synthran": "deployment.ru", "reference": "rru", "status": "direct for physical R2Lab; rfsim remains locally derived"},
+    {"synthran": "deployment.nodes.core", "reference": "core_node inventory group/core_node_name", "status": "direct"},
+    {"synthran": "deployment.nodes.ran", "reference": "ran_node inventory group/ran_node_name", "status": "direct"},
+    {"synthran": "deployment.ues", "reference": "qhats/qfits inventory groups plus fiveg profile UEs", "status": "adapt", "rule": "resource selection, subscriber identity and attachment are separate concerns"},
+    {"synthran": "deployment.network_profile", "reference": "fiveg_profile and role include_vars", "status": "conditional", "rule": "effective SynthRAN profile adapters must be validated per backend"},
+    {"synthran": "deployment.host_vars", "reference": "inventory host vars", "status": "adapt", "rule": "SynthRAN renders the selected inventory rather than relying on a fork-only normalizer"},
+    {"synthran": "deployment.r2lab_username", "reference": "R2Lab inventory/jump-host context", "status": "adapt"},
+    {"synthran": "deployment.r2lab_ssh.identity_file / R2LAB_IDENTITY_FILE", "reference": null, "status": "synthran-owned"},
+    {"synthran": "accepted active deployment", "reference": "successful delegated provisioning", "status": "not-equivalent"}
+  ],
+  "delegation_policy": {
+    "mode": "explicit-reviewed-task-files-only",
+    "full_upstream_playbooks_allowed": false,
+    "reason": "Pure upstream deploy_r2lab.yml owns cleanup/RRU/UE preparation and deploy.yml invokes POS for every SOP node. The upstream POS role unconditionally frees/allocates resources before its no_boot-guarded image/reset work, so invoking those full playbooks would violate SynthRAN's authoritative reservation/POS boundary.",
+    "allowed_reference_task_files": [
+      "roles/setup/containerd/tasks/main.yml",
+      "roles/setup/storage/tasks/main.yml",
+      "roles/setup/k8s/add_taint/tasks/main.yml",
+      "roles/setup/k8s/remove_cp_taint/tasks/main.yml",
+      "roles/setup/k8s/remove_taint/tasks/main.yml",
+      "roles/5g/oai/core/tasks/main.yml",
+      "roles/5g/srsRAN/deploy/tasks/deploy_with_check.yml",
+      "roles/5g/srsRAN/deploy/tasks/deploy_srsues.yml"
+    ]
+  },
+  "external_resource_authority": {
+    "owner": "synthran",
+    "reason": "Issue #52 establishes SynthRAN as the sole SLICES/POS/R2Lab acquisition and POS-preparation authority. Pure upstream has no complete suppression surface for its POS allocation steps, so full upstream resource/deploy playbooks are not callable after SynthRAN resource preparation.",
+    "forbidden_full_upstream_entrypoints": [
+      "playbooks/deploy_r2lab.yml",
+      "playbooks/deploy.yml",
+      "playbooks/run_pos.yml"
+    ]
+  },
+  "ownership": {
+    "reference_candidate": [
+      "explicitly reviewed downstream host/Kubernetes/core/RAN task files after SynthRAN resource preparation",
+      "selected-resource teardown only where a dependent issue proves the exact boundary"
+    ],
+    "synthran": [
+      "scenario source resolution",
+      "translation and fail-closed validation before delegation",
+      "SLICES project/experiment provider context",
+      "exact selected-node POS calendar authority",
+      "POS allocation, image, boot-parameter, reset and post-reset readiness",
+      "R2Lab lease acquisition/extension/require-existing verification and evidence",
+      "SSH identity-file handling",
+      "scientific deployment identity and evidence",
+      "physical UE acceptance beyond upstream provisioning",
+      "experiment lifecycle"
+    ]
+  },
+  "resolved_decisions": [
+    {
+      "id": "reference-authority",
+      "issue": 51,
+      "decision": "The execution/comparison authority is the original sopnode/5g_ansible repository at an immutable upstream commit. Fork-only machine-interface behavior is not part of the reference contract."
+    },
+    {
+      "id": "reservation-policy",
+      "issue": 52,
+      "decision": "SynthRAN is the sole resource-acquisition and POS-preparation authority; pure upstream full deploy/R2Lab playbooks are not invoked across that boundary."
+    }
+  ],
+  "known_gaps": [
+    {"id": "no-upstream-machine-interface", "issue": 51, "severity": "resolved-by-contract", "detail": "Pure sopnode/5g_ansible does not provide the fork-added bin/fiveg or tools/fiveg_machine.py API. SynthRAN validates the upstream source/task contract directly instead."},
+    {"id": "upstream-pos-reacquisition", "issue": 52, "severity": "blocking-for-full-playbook-delegation", "detail": "Pure upstream roles/pos/tasks/main.yml frees and allocates unconditionally; no_boot suppresses later image/reset work only. Full upstream deploy.yml therefore cannot run after SynthRAN resource preparation."},
+    {"id": "effective-profile", "issue": 61, "severity": "adapter-required", "detail": "Pure upstream roles load repository-named fiveg_profile files; SynthRAN effective profile adapters remain backend-specific and must be validated from rendered configuration."},
+    {"id": "physical-ue-attachment", "issue": 56, "severity": "adapter-required", "detail": "Pure upstream test-ue-connect.yml is separate from deployment and ignores individual connection errors; SynthRAN requires explicit selected-UE lifecycle ownership and fail-closed evidence."},
+    {"id": "n320-oai-adaptation", "issue": 55, "severity": "adapter-required", "detail": "SynthRAN N320-specific OAI behavior is reviewed separately from the generic upstream lifecycle."},
+    {"id": "srsran-upstream-lifecycle", "issue": 60, "severity": "physical-validation-required", "detail": "Pure upstream deploy_with_check.yml differs from the former fork-derived pin. SynthRAN's post-deploy RF/PHY health attestation remains authoritative for acceptance; fresh physical validation is required."},
+    {"id": "ready-vs-accepted", "issue": 57, "severity": "blocking", "detail": "Completion of delegated upstream provisioning is not equivalent to SynthRAN experiment eligibility; fresh acceptance evidence remains required."}
+  ]
+}

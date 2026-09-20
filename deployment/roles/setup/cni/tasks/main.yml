@@ -3,34 +3,14 @@
   ansible.builtin.set_fact:
     ansible_python_interpreter: /opt/ansible-venv/bin/python
 
-- name: Ensure Open vSwitch is installed
-  apt:
-    name: openvswitch-switch
-    state: present
-    update_cache: yes
-  become: true
-  when: bridge_enabled
-
-- name: Create OVS bridges for ovs-cni
-  command: "ovs-vsctl --may-exist add-br {{ item }}"
-  loop:
-    - n2br
-    - n3br
-    - n4br
-  become: true
-  when: bridge_enabled
-
-- name: Render NetworkAddonsConfig manifest locally (bridge enabled)
+# Host bridge lifecycle belongs to setup/ovs and the selected topology contract.
+# CNAO exposes OVS-CNI independently of inter-host GRE placement: colocated
+# Open5GS uses pinned OVS NADs, and OAI+UERANSIM retains an OVS compatibility
+# attachment even though neither case needs a GRE tunnel.
+- name: Render the shared NetworkAddonsConfig manifest
   ansible.builtin.template:
     src: network-addons-config.yaml.j2
     dest: /tmp/network-addons-config.yaml
-  when: bridge_enabled
-
-- name: Render NetworkAddonsConfig manifest locally (bridge disabled)
-  ansible.builtin.template:
-    src: network-addons-config-full-oai.yaml.j2
-    dest: /tmp/network-addons-config.yaml
-  when: not bridge_enabled
 
 - name: Apply Cluster-Network-Addons Operator manifests
   ansible.builtin.shell: |
@@ -117,4 +97,3 @@
 - name: Retain the Kubernetes-enabled Ansible Python runtime
   ansible.builtin.set_fact:
     ansible_python_interpreter: /opt/ansible-venv/bin/python
-

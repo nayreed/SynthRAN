@@ -1,0 +1,143 @@
+---
+- name: Resolve the selected OAI RFSIM chart slot
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_release: >-
+      {{ 'oai-nr-ue'
+         if (synthran_rfsim_ue.index | int) == 1
+         else 'oai-nr-ue' ~ (synthran_rfsim_ue.index | string) }}
+    synthran_oai_rfsim_expected_sd: >-
+      {{ 16777215
+         if (synthran_rfsim_ue.sd | string | upper) == 'EMPTY'
+         else '0x' ~ (synthran_rfsim_ue.sd | string) }}
+
+- name: Require the selected OAI RFSIM chart to exist
+  ansible.builtin.stat:
+    path: >-
+      {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  register: synthran_oai_rfsim_values
+
+- name: Refuse a missing selected OAI RFSIM chart slot
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_values.stat.exists
+      - synthran_oai_rfsim_values.stat.isreg
+      - synthran_rfsim_ue.tunnel.pod_name_prefix == synthran_oai_rfsim_release ~ '-'
+    fail_msg: >-
+      Selected UE {{ synthran_rfsim_ue.device }} does not map to the expected
+      pinned OAI RFSIM chart slot {{ synthran_oai_rfsim_release }}.
+
+- name: Apply the sealed IMSI DNN and SST to the selected OAI RFSIM chart
+  ansible.builtin.command:
+    argv:
+      - "{{ yq_bin_path }}"
+      - eval
+      - -i
+      - >-
+        .nfimage.repository = strenv(SYNTHRAN_RFSIM_UE_REPOSITORY) |
+        .nfimage.version = strenv(SYNTHRAN_RFSIM_UE_VERSION) |
+        .config.fullImsi = strenv(SYNTHRAN_UE_IMSI) |
+        .config.dnn = strenv(SYNTHRAN_UE_DNN) |
+        .config.sst = strenv(SYNTHRAN_UE_SST)
+      - >-
+        {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  environment:
+    SYNTHRAN_RFSIM_UE_REPOSITORY: "{{ synthran_oai_rfsim_ue_repository }}"
+    SYNTHRAN_RFSIM_UE_VERSION: "{{ synthran_oai_rfsim_runtime_release }}@{{ synthran_oai_rfsim_ue_index_digest }}"
+    SYNTHRAN_UE_IMSI: "{{ synthran_rfsim_ue.imsi }}"
+    SYNTHRAN_UE_DNN: "{{ synthran_rfsim_ue.dnn }}"
+    SYNTHRAN_UE_SST: "{{ synthran_rfsim_ue.sst | string }}"
+  changed_when: true
+
+- name: Apply empty SD semantics to the selected OAI RFSIM chart
+  ansible.builtin.command:
+    argv:
+      - "{{ yq_bin_path }}"
+      - eval
+      - -i
+      - '.config.sd = 16777215'
+      - >-
+        {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  changed_when: true
+  when: (synthran_rfsim_ue.sd | string | upper) == 'EMPTY'
+
+- name: Apply explicit SD semantics to the selected OAI RFSIM chart
+  ansible.builtin.command:
+    argv:
+      - "{{ yq_bin_path }}"
+      - eval
+      - -i
+      - '.config.sd = strenv(SYNTHRAN_UE_SD)'
+      - >-
+        {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  environment:
+    SYNTHRAN_UE_SD: "0x{{ synthran_rfsim_ue.sd }}"
+  changed_when: true
+  when: (synthran_rfsim_ue.sd | string | upper) != 'EMPTY'
+
+- name: Read back the selected OAI RFSIM chart configuration
+  ansible.builtin.command:
+    argv:
+      - "{{ yq_bin_path }}"
+      - -o=json
+      - '.config'
+      - >-
+        {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  register: synthran_oai_rfsim_config
+  changed_when: false
+
+- name: Decode the selected OAI RFSIM chart configuration
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_rendered: "{{ synthran_oai_rfsim_config.stdout | from_json }}"
+
+- name: Read back the selected OAI RFSIM UE image contract
+  ansible.builtin.command:
+    argv:
+      - "{{ yq_bin_path }}"
+      - -o=json
+      - '.nfimage'
+      - >-
+        {{ charts_base }}/oai-5g-ran/{{ synthran_oai_rfsim_release }}/values.yaml
+  register: synthran_oai_rfsim_image_raw
+  changed_when: false
+
+- name: Decode the selected OAI RFSIM UE image contract
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_image: "{{ synthran_oai_rfsim_image_raw.stdout | from_json }}"
+
+- name: Require the rendered OAI RFSIM UE identity to match the sealed contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_rendered.fullImsi | string == synthran_rfsim_ue.imsi | string
+      - synthran_oai_rfsim_rendered.dnn | string == synthran_rfsim_ue.dnn | string
+      - synthran_oai_rfsim_rendered.sst | string == synthran_rfsim_ue.sst | string
+      - synthran_oai_rfsim_rendered.sd | string == synthran_oai_rfsim_expected_sd | string
+      - synthran_oai_rfsim_image.repository == synthran_oai_rfsim_ue_repository
+      - synthran_oai_rfsim_image.version | string == synthran_oai_rfsim_runtime_release ~ '@' ~ synthran_oai_rfsim_ue_index_digest
+    fail_msg: >-
+      OAI RFSIM chart {{ synthran_oai_rfsim_release }} does not match the
+      sealed deployment identity for {{ synthran_rfsim_ue.device }}; refusing
+      to launch a positional helper configuration.
+
+- name: Record the selected OAI RFSIM chart identity
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_chart_contracts: >-
+      {{ synthran_oai_rfsim_chart_contracts + [
+           {
+             'device': synthran_rfsim_ue.device,
+             'index': synthran_rfsim_ue.index,
+             'release': synthran_oai_rfsim_release,
+             'slice': synthran_rfsim_ue.slice,
+             'imsi': synthran_rfsim_ue.imsi,
+             'dnn': synthran_rfsim_ue.dnn,
+             'sst': synthran_rfsim_ue.sst | string,
+             'sd': synthran_rfsim_ue.sd | string,
+             'rendered_sd': synthran_oai_rfsim_rendered.sd | string,
+             'image_repository': synthran_oai_rfsim_image.repository,
+             'image_version': synthran_oai_rfsim_image.version | string,
+             'image_index_digest': synthran_oai_rfsim_ue_index_digest,
+             'address_cidr': synthran_rfsim_ue.address_cidr,
+             'user_plane_target': synthran_rfsim_ue.user_plane_target
+           }
+         ] }}

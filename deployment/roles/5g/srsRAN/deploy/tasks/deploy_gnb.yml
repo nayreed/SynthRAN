@@ -13,7 +13,7 @@
     fail_msg: "srsRAN requires the checksum-pinned Helm v{{ helm_version }} runtime"
 
 - name: Load common variables
-  include_vars:
+  ansible.builtin.include_vars:
     file: "../../common/defaults/main.yml"
 
 - name: Check srsran-gnb release
@@ -26,35 +26,30 @@
   ansible.builtin.command: helm uninstall srsran-gnb -n {{ ran_ns }} --no-hooks
   when: gnb_release_exists.rc == 0
 
-- name: Deploy srsRAN gNB on an N3xx radio
+- name: Deploy physical srsRAN through the pinned lifecycle owner
   when: rru in ['n300', 'n320']
   block:
-
-    - name: Set initial retry facts
+    - name: Initialize the reference-owned physical retry contract
       ansible.builtin.set_fact:
         gnb_startup_success: false
         max_attempts: 2
 
-    - name: Deploy and Monitor srsRAN gNB
-      block:
-        - name: "Attempt gNB deployment (Attempt {{ item }})"
-          include_tasks: deploy_with_check.yml
-          loop: "{{ range(1, max_attempts + 1) | list }}"
-          when: not gnb_startup_success
+    - name: Run the exact pinned physical startup task
+      ansible.builtin.include_tasks: "{{ synthran_srsran_reference_deploy_with_check }}"
+      loop: "{{ range(1, max_attempts + 1) | list }}"
+      when: not gnb_startup_success
 
-      rescue:
-        - name: Final failure message
-          ansible.builtin.fail:
-            msg: "gNB failed to start properly on both IP addresses."
-          when: not gnb_startup_success
+    - name: Require reference-owned physical startup success
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - gnb_startup_success | bool
+        fail_msg: >-
+          Physical srsRAN gNB did not remain radio-ready after the pinned
+          5g-Ansible lifecycle exhausted its supported attempts.
 
-    - name: Confirm success
-      ansible.builtin.debug:
-        msg: "srsRAN gNB is running successfully!"
-      when: gnb_startup_success
-
-- name: Deploy srsRAN gNB through the generic Helm path
-  when: rru not in ['n300', 'n320']
+- name: Deploy RFSIM srsRAN gNB through the generic Helm path
+  when: rru == 'rfsim'
   kubernetes.core.helm:
     name: srsran-gnb
     chart_ref: "{{ [repo_dest_abs, 'charts', 'srsran-gnb'] | path_join }}"
@@ -62,6 +57,6 @@
     values_files:
       - "{{ values_file }}"
     state: present
-    wait: False
-    atomic: True
+    wait: false
+    atomic: true
     timeout: 180s

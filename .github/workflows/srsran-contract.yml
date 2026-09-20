@@ -1,0 +1,278 @@
+name: srsRAN contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  srsran-contract:
+    name: Issue 60 srsRAN ownership and health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Check out pinned 5g-Ansible reference
+        uses: actions/checkout@v7
+        with:
+          repository: sopnode/5g_ansible
+          ref: b73fccf87f55060484b3759e9cb347222253534b
+          path: reference
+
+      - name: Check out pinned srsRAN chart source
+        uses: actions/checkout@v7
+        with:
+          repository: turletti/srsran-helm
+          ref: 8dfb9890d127734cdcd6eee9df8c5d09b1a8076a
+          path: chart
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deployment validation runtime
+        run: python -m pip install --disable-pip-version-check -e '.[deployment]'
+
+      - name: Install pinned Ansible collections
+        run: ansible-galaxy collection install -r deployment/collections/requirements.yml
+
+      - name: Verify Helm is available
+        run: helm version --short
+
+      - name: Check Sub 07 checker syntax
+        run: >-
+          python -m compileall -q
+          tools/check_srsran_contract.py
+          tools/check_ran_transition_contract.py
+          tools/check_srsran_runtime_contract.py
+          tools/check_srsran_rfsim_render.py
+          synthran/image_digest.py
+
+      - name: Parse touched Ansible YAML
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          paths = [
+              Path("deployment/roles/5g/ran_transition/defaults/main.yml"),
+              Path("deployment/roles/5g/ran_transition/tasks/main.yml"),
+              Path("deployment/roles/5g/srsRAN/config/tasks/main.yml"),
+              Path("deployment/roles/5g/srsRAN/config/tasks/apply_network_profile.yaml"),
+              Path("deployment/roles/5g/srsRAN/config/tasks/harden_runtime.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/main.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/deploy_gnb.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/materialize_reference.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/verify_rfsim_ue_runtime.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/verify_logging.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/verify_ran_health.yml"),
+              Path("deployment/roles/5g/srsRAN/deploy/tasks/start_broker.yml"),
+          ]
+          for path in paths:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+          print(f"parsed {len(paths)} srsRAN task files")
+          PY
+
+      - name: Validate pinned reference lifecycle assumptions
+        run: >-
+          python tools/check_srsran_contract.py
+          --reference reference
+          --section reference
+
+      - name: Validate pinned downstream chart assumptions and fixtures
+        run: >-
+          python tools/check_srsran_contract.py
+          --chart chart
+          --section chart
+
+      - name: Validate local Sub 07 ownership boundary
+        run: python tools/check_srsran_contract.py --section local
+
+      - name: Exercise shared OAI/srsRAN transition ownership
+        run: python tools/check_ran_transition_contract.py
+
+      - name: Validate final runtime ownership boundary
+        run: python tools/check_srsran_runtime_contract.py
+
+      - name: Validate public OCI resolver normalization
+        run: |
+          python - <<'PY'
+          from synthran.image_digest import _normalize_public_repository
+
+          assert _normalize_public_repository("busybox") == (
+              "busybox", "registry-1.docker.io", "library/busybox"
+          )
+          assert _normalize_public_repository("r2labuser/srsran-gnb-uhd") == (
+              "r2labuser/srsran-gnb-uhd",
+              "registry-1.docker.io",
+              "r2labuser/srsran-gnb-uhd",
+          )
+          assert _normalize_public_repository("ghcr.io/ziyad-mabrouk/srsue") == (
+              "ghcr.io/ziyad-mabrouk/srsue",
+              "ghcr.io",
+              "ziyad-mabrouk/srsue",
+          )
+          for invalid in (
+              "quay.io/example/image",
+              "localhost:5000/example/image",
+              "https://ghcr.io/example/image",
+          ):
+              try:
+                  _normalize_public_repository(invalid)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f"unsupported registry accepted: {invalid}")
+          print("public OCI resolver normalization OK")
+          PY
+
+      - name: Resolve pinned srsRAN images to immutable digests
+        run: |
+          set -euo pipefail
+          mapfile -t ue_coordinates < <(python - <<'PY'
+          import yaml
+          values = yaml.safe_load(open("chart/charts/srsue/values.yaml", encoding="utf-8"))
+          print(values["image"]["repository"])
+          print(values["image"]["tag"])
+          PY
+          )
+          ue_image="$(python -m synthran.image_digest \
+            --repository "${ue_coordinates[0]}" \
+            --tag "${ue_coordinates[1]}")"
+          if [[ ! "$ue_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "Unexpected srsUE digest reference: $ue_image" >&2
+            exit 1
+          fi
+          echo "SYNTHRAN_CI_SRSUE_IMAGE=$ue_image" >>"$GITHUB_ENV"
+          echo "resolved pinned-chart srsUE image: ${ue_image%@sha256:*}@sha256:<verified>"
+
+          mapfile -t gnb_coordinates < <(python - <<'PY'
+          import yaml
+          values = yaml.safe_load(open(
+              "chart/charts/srsran-gnb/values-n320-n78-20MHz.yaml",
+              encoding="utf-8",
+          ))
+          print(values["image"]["repository"])
+          print(values["image"]["tag"])
+          PY
+          )
+          gnb_image="$(python -m synthran.image_digest \
+            --repository "${gnb_coordinates[0]}" \
+            --tag "${gnb_coordinates[1]}")"
+          if [[ ! "$gnb_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "Unexpected N320 gNB digest reference: $gnb_image" >&2
+            exit 1
+          fi
+          echo "resolved pinned-chart N320 image: ${gnb_image%@sha256:*}@sha256:<verified>"
+
+      - name: Render one and multiple selected RFSIM UEs
+        run: >-
+          python tools/check_srsran_rfsim_render.py
+          --chart chart
+          --ue-image "$SYNTHRAN_CI_SRSUE_IMAGE"
+
+      - name: Exercise an already-hardened N320 render
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/srsran-chart-render"
+          cp -a chart "$fixture"
+          values="$(python tools/check_srsran_contract.py \
+            --chart "$fixture" \
+            --prepare-render-fixture)"
+          helm template synthran-srsran-gnb \
+            "$fixture/charts/srsran-gnb" \
+            --namespace oai \
+            -f "$values" >"$RUNNER_TEMP/srsran-rendered.yaml"
+          grep -F 'r2labuser/srsran-gnb-uhd@sha256:' "$RUNNER_TEMP/srsran-rendered.yaml"
+          grep -F 'busybox@sha256:' "$RUNNER_TEMP/srsran-rendered.yaml"
+          grep -F 'filename: /var/log/gnb.log' "$RUNNER_TEMP/srsran-rendered.yaml"
+          if grep -F 'filename: /tmp/gnb.log' "$RUNNER_TEMP/srsran-rendered.yaml"; then
+            echo 'Rendered N320 chart retained obsolete /tmp/gnb.log' >&2
+            exit 1
+          fi
+          grep -F 'name: "oai-5g-basic-n3"' "$RUNNER_TEMP/srsran-rendered.yaml" || true
+
+      - name: Materialize the authoritative execution-reference cache
+        run: python -m synthran.reference_checkout
+
+      - name: Syntax-check the active network playbook
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+        run: |
+          fixture="$RUNNER_TEMP/srsran-ansible"
+          mkdir -p "$fixture/private" "$fixture/result"
+          cat >"$fixture/inventory.yml" <<'YAML'
+          all:
+            children:
+              core_node:
+                hosts:
+                  core-ci:
+                    ansible_connection: local
+                    ansible_python_interpreter: /usr/bin/python3
+              ran_node:
+                hosts:
+                  ran-ci:
+                    ansible_connection: local
+                    ansible_python_interpreter: /usr/bin/python3
+              broker_node:
+                hosts:
+                  core-ci: {}
+              sopnodes:
+                children:
+                  core_node: {}
+                  ran_node: {}
+              k8s_workers:
+                children:
+                  ran_node: {}
+          YAML
+          cat >"$fixture/vars.yml" <<YAML
+          synthran_root: $GITHUB_WORKSPACE
+          synthran_private_dir: $fixture/private
+          run_dir: $fixture/result
+          core: oai
+          ran: srsRAN
+          platform: r2lab
+          rru: n320
+          core_node_name: core-ci
+          ran_node_name: ran-ci
+          broker_node_name: core-ci
+          bridge_enabled: true
+          network_profile: default
+          network_profile_file: $GITHUB_WORKSPACE/deployment/group_vars/all/network_profile_default.yaml
+          synthran_ue_map: []
+          ue_count: 0
+          synthran_topology:
+            contract_version: 1
+            n3network_name: oai-5g-basic-n3
+            namespace: oai
+            network:
+              n2:
+                amf_ip: 192.168.3.201
+                amf_port: 38412
+                gnb_bind_ip: 192.168.3.203
+              n3:
+                gnb_ip: 192.168.3.203
+                ue_ips: [192.168.3.210]
+            transport:
+              workload_interfaces:
+                ran:
+                  n2: n3br
+                  n3: n3br
+          YAML
+          ansible-playbook \
+            -i "$fixture/inventory.yml" \
+            -e @deployment/group_vars/all/all.yml \
+            -e @"$fixture/vars.yml" \
+            deployment/playbooks/network.yml \
+            --syntax-check

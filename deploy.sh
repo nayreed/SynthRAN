@@ -8,6 +8,7 @@ NO_INPUT=false
 NO_RESERVATION=false
 DRY_RUN=false
 VERBOSE=false
+UE_CATALOG_FILE=deployment/group_vars/all/ue_catalog.yaml
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -156,9 +157,20 @@ discover_network_profiles() {
   done
 }
 
+network_profile_path() {
+  if [[ "$1" == "${DEFAULT_NETWORK_PROFILE:-}" && -n "${BASE_NETWORK_PROFILE_FILE:-}" ]]; then
+    printf '%s\n' "$BASE_NETWORK_PROFILE_FILE"
+  else
+    printf 'deployment/group_vars/all/network_profile_%s.yaml\n' "$1"
+  fi
+}
+
 choose_network_profile() {
   local default_profile="$1" profile_choice default_choice=1 index
   mapfile -t AVAILABLE_NETWORK_PROFILES < <(discover_network_profiles)
+  if [[ -n "${BASE_NETWORK_PROFILE_FILE:-}" && ! " ${AVAILABLE_NETWORK_PROFILES[*]} " == *" $default_profile "* ]]; then
+    AVAILABLE_NETWORK_PROFILES+=("$default_profile")
+  fi
   [[ ${#AVAILABLE_NETWORK_PROFILES[@]} -gt 0 ]] || {
     echo "No network profiles found under deployment/group_vars/all/network_profile_*.yaml" >&2
     exit 1
@@ -188,11 +200,11 @@ choose_network_profile() {
 }
 
 catalog_ues() {
-  "$SYNTHRAN_PYTHON" - "$1" <<'PY'
+  "$SYNTHRAN_PYTHON" - "$1" "$UE_CATALOG_FILE" <<'PY'
 import sys, yaml
 from pathlib import Path
 platform = sys.argv[1]
-catalog = Path('deployment/group_vars/all/ue_catalog.yaml')
+catalog = Path(sys.argv[2])
 data = yaml.safe_load(catalog.read_text()) or {}
 for name, ue in (data.get('ues') or {}).items():
     if str(ue.get('platform', '')).lower() != platform:
@@ -246,11 +258,11 @@ print_ue_matrix() {
 }
 
 expand_ue_selection() {
-  "$SYNTHRAN_PYTHON" - "$1" "$2" <<'PY'
+  "$SYNTHRAN_PYTHON" - "$1" "$2" "$UE_CATALOG_FILE" <<'PY'
 import sys, yaml
 from pathlib import Path
 platform, value = sys.argv[1], sys.argv[2].strip().lower()
-data = yaml.safe_load(Path('deployment/group_vars/all/ue_catalog.yaml').read_text()) or {}
+data = yaml.safe_load(Path(sys.argv[3]).read_text()) or {}
 names = [
     name for name, ue in (data.get('ues') or {}).items()
     if str(ue.get('platform', '')).lower() == platform
@@ -278,10 +290,10 @@ PY
 }
 
 network_profile_slices() {
-  "$SYNTHRAN_PYTHON" - "$1" <<'PY'
+  "$SYNTHRAN_PYTHON" - "$(network_profile_path "$1")" <<'PY'
 import sys, yaml
 from pathlib import Path
-path = Path('deployment/group_vars/all') / f'network_profile_{sys.argv[1]}.yaml'
+path = Path(sys.argv[1])
 data = yaml.safe_load(path.read_text()) or {}
 for item in data.get('slices') or []:
     qos = item.get('qos') or {}
@@ -315,11 +327,11 @@ PY
 }
 
 describe_ue_slice_assignments() {
-  "$SYNTHRAN_PYTHON" - "$1" "$2" <<'PY'
+  "$SYNTHRAN_PYTHON" - "$(network_profile_path "$1")" "$2" <<'PY'
 import sys, yaml
 from pathlib import Path
-profile_name, spec = sys.argv[1:]
-profile = yaml.safe_load((Path('deployment/group_vars/all') / f'network_profile_{profile_name}.yaml').read_text()) or {}
+profile_path, spec = sys.argv[1:]
+profile = yaml.safe_load(Path(profile_path).read_text()) or {}
 by_name = {s['name']: s for s in profile.get('slices') or []}
 for pair in filter(None, spec.split(',')):
     ue, slice_name = pair.split('=', 1)
@@ -331,6 +343,11 @@ PY
 if ! $NO_INPUT && { ! $CONFIG_EXPLICIT || $INTERACTIVE; }; then
   [[ -t 0 ]] || { echo "Interactive input requires a terminal; use --config or --no-input" >&2; exit 2; }
   BASE_CONFIG="$CONFIG"
+  if [[ -n "$BASE_CONFIG" ]]; then
+    "$SYNTHRAN_PYTHON" -m synthran.deployment_state resolve \
+      --source "$BASE_CONFIG" --output "$PRIVATE_RUN_DIR/interactive-base.yml"
+    BASE_CONFIG="$PRIVATE_RUN_DIR/interactive-base.yml"
+  fi
 
   DEFAULT_CORE=open5gs
   DEFAULT_RAN=srsran
@@ -342,6 +359,8 @@ if ! $NO_INPUT && { ! $CONFIG_EXPLICIT || $INTERACTIVE; }; then
   DEFAULT_NETWORK_PROFILE=default
   DEFAULT_UES=uesim01,uesim02
   DEFAULT_RESERVE=true
+  DEFAULT_RESERVATION_MODE=create
+  DEFAULT_HOST_PREPARATION=fresh
   DEFAULT_DURATION=120
   DEFAULT_POS_IMAGE=ubuntu-jammy
   DEFAULT_R2LAB_USERNAME=${R2LAB_USERNAME:-}
@@ -355,12 +374,16 @@ from pathlib import Path
 data = yaml.safe_load(Path(sys.argv[1]).read_text()) or {}
 d = data.get('deployment') or {}
 n = d.get('nodes', {}); r = d.get('reservation', {}); rr = d.get('r2lab_reservation', {})
+enabled = bool(r.get('enabled', True))
+mode = r.get('mode', 'create' if enabled else 'disabled')
+preparation = r.get('host_preparation', 'fresh' if mode != 'disabled' else 'preserve')
 values = [
     d.get('core','open5gs'), d.get('ran','srsran'), d.get('platform','rfsim'), d.get('ru','rfsim'),
     n.get('core','sopnode-f2'), n.get('ran','sopnode-f3'), n.get('broker',n.get('core','sopnode-f2')),
-    d.get('network_profile','default'), ','.join(d.get('ues',[])), str(r.get('enabled',True)).lower(),
+    d.get('network_profile','default'), ','.join(d.get('ues',[])), str(enabled).lower(), mode, preparation,
     str(r.get('duration_minutes',120)), r.get('image','ubuntu-jammy'), d.get('r2lab_username',''),
-    str(rr.get('enabled',True)).lower(), str(rr.get('duration_minutes',120))
+    str(rr.get('enabled',True)).lower(), str(rr.get('duration_minutes',120)),
+    d.get('network_profile_file',''), d.get('ue_catalog_file','deployment/group_vars/all/ue_catalog.yaml')
 ]
 print('\n'.join(str(value) for value in values))
 PY
@@ -375,11 +398,15 @@ PY
     DEFAULT_NETWORK_PROFILE=${SCENARIO_DEFAULTS[7]}
     DEFAULT_UES=${SCENARIO_DEFAULTS[8]}
     DEFAULT_RESERVE=${SCENARIO_DEFAULTS[9]}
-    DEFAULT_DURATION=${SCENARIO_DEFAULTS[10]}
-    DEFAULT_POS_IMAGE=${SCENARIO_DEFAULTS[11]}
-    DEFAULT_R2LAB_USERNAME=${SCENARIO_DEFAULTS[12]}
-    DEFAULT_R2LAB_RESERVE=${SCENARIO_DEFAULTS[13]}
-    DEFAULT_R2LAB_DURATION=${SCENARIO_DEFAULTS[14]}
+    DEFAULT_RESERVATION_MODE=${SCENARIO_DEFAULTS[10]}
+    DEFAULT_HOST_PREPARATION=${SCENARIO_DEFAULTS[11]}
+    DEFAULT_DURATION=${SCENARIO_DEFAULTS[12]}
+    DEFAULT_POS_IMAGE=${SCENARIO_DEFAULTS[13]}
+    DEFAULT_R2LAB_USERNAME=${SCENARIO_DEFAULTS[14]}
+    DEFAULT_R2LAB_RESERVE=${SCENARIO_DEFAULTS[15]}
+    DEFAULT_R2LAB_DURATION=${SCENARIO_DEFAULTS[16]}
+    BASE_NETWORK_PROFILE_FILE=${SCENARIO_DEFAULTS[17]}
+    UE_CATALOG_FILE=${SCENARIO_DEFAULTS[18]}
   fi
 
   echo
@@ -574,18 +601,52 @@ BANNER
   SELECTED_RESERVE=$DEFAULT_RESERVE
   [[ "${RESERVE_CHOICE:-}" =~ ^[Yy]$ ]] && SELECTED_RESERVE=true
   [[ "${RESERVE_CHOICE:-}" =~ ^[Nn]$ ]] && SELECTED_RESERVE=false
+
+  SELECTED_DURATION=$DEFAULT_DURATION
+  SELECTED_POS_IMAGE=$DEFAULT_POS_IMAGE
+  SELECTED_HOST_PREPARATION=preserve
   if $SELECTED_RESERVE; then
+    if [[ "$DEFAULT_RESERVATION_MODE" == require-existing ]]; then
+      SELECTED_RESERVATION_MODE=require-existing
+    else
+      SELECTED_RESERVATION_MODE=create
+    fi
     read -r -p "Reservation duration in minutes [$DEFAULT_DURATION]: " SELECTED_DURATION
     SELECTED_DURATION=${SELECTED_DURATION:-$DEFAULT_DURATION}
     [[ "$SELECTED_DURATION" =~ ^[1-9][0-9]*$ ]] || { echo "Duration must be a positive integer" >&2; exit 2; }
-    read -r -p "POS image [$DEFAULT_POS_IMAGE]: " SELECTED_POS_IMAGE
-    SELECTED_POS_IMAGE=${SELECTED_POS_IMAGE:-$DEFAULT_POS_IMAGE}
+
+    case "$DEFAULT_HOST_PREPARATION" in
+      preserve) DEFAULT_PREP_CHOICE=1 ;;
+      bootstrap) DEFAULT_PREP_CHOICE=2 ;;
+      fresh) DEFAULT_PREP_CHOICE=3 ;;
+      *) DEFAULT_PREP_CHOICE=3 ;;
+    esac
+    echo
+    echo "How should SynthRAN prepare the selected SOP nodes?"
+    echo "1) Reuse verified current node state"
+    echo "   No host repair or reboot. Deployment stops if required prerequisites are missing."
+    echo "2) Bootstrap/reconcile current node state"
+    echo "   Keep the current OS/allocation and repair safe prerequisites in place; a bounded reboot may be used, but no reimage."
+    echo "3) Fresh reset/reimage"
+    echo "   Use the known-clean POS image/reset path and rebuild host/Kubernetes prerequisites."
+    read -r -p "Enter choice [1-3] [$DEFAULT_PREP_CHOICE]: " PREP_CHOICE
+    case "${PREP_CHOICE:-$DEFAULT_PREP_CHOICE}" in
+      1) SELECTED_HOST_PREPARATION=preserve ;;
+      2) SELECTED_HOST_PREPARATION=bootstrap ;;
+      3) SELECTED_HOST_PREPARATION=fresh ;;
+      *) echo "Invalid SOP preparation choice" >&2; exit 2 ;;
+    esac
+
+    if [[ "$SELECTED_HOST_PREPARATION" == fresh ]]; then
+      read -r -p "POS image [$DEFAULT_POS_IMAGE]: " SELECTED_POS_IMAGE
+      SELECTED_POS_IMAGE=${SELECTED_POS_IMAGE:-$DEFAULT_POS_IMAGE}
+    fi
+  else
+    SELECTED_RESERVATION_MODE=disabled
   fi
-  SELECTED_DURATION=${SELECTED_DURATION:-$DEFAULT_DURATION}
-  SELECTED_POS_IMAGE=${SELECTED_POS_IMAGE:-$DEFAULT_POS_IMAGE}
 
   CONFIG="$RUN_DIR/interactive-scenario.yml"
-  "$SYNTHRAN_PYTHON" - "$BASE_CONFIG" "$CONFIG" "$SELECTED_CORE" "$SELECTED_RAN" "$SELECTED_PLATFORM" "$SELECTED_RU" "$SELECTED_CORE_NODE" "$SELECTED_RAN_NODE" "$SELECTED_BROKER_NODE" "$SELECTED_NETWORK_PROFILE" "$SELECTED_UES" "$SELECTED_UE_SLICE_SPEC" "$SELECTED_R2LAB_USERNAME" "$SELECTED_RESERVE" "$SELECTED_DURATION" "$SELECTED_POS_IMAGE" "$SELECTED_R2LAB_RESERVE" "$SELECTED_R2LAB_DURATION" <<'PY'
+  "$SYNTHRAN_PYTHON" - "$BASE_CONFIG" "$CONFIG" "$SELECTED_CORE" "$SELECTED_RAN" "$SELECTED_PLATFORM" "$SELECTED_RU" "$SELECTED_CORE_NODE" "$SELECTED_RAN_NODE" "$SELECTED_BROKER_NODE" "$SELECTED_NETWORK_PROFILE" "$SELECTED_UES" "$SELECTED_UE_SLICE_SPEC" "$SELECTED_R2LAB_USERNAME" "$SELECTED_RESERVE" "$SELECTED_RESERVATION_MODE" "$SELECTED_HOST_PREPARATION" "$SELECTED_DURATION" "$SELECTED_POS_IMAGE" "$SELECTED_R2LAB_RESERVE" "$SELECTED_R2LAB_DURATION" <<'PY'
 import copy
 import sys
 from pathlib import Path
@@ -593,8 +654,8 @@ import yaml
 
 (
     source, output, core, ran, platform, ru, core_node, ran_node, broker_node,
-    network_profile, ue_csv, ue_slice_spec, r2lab_username, reserve, duration,
-    pos_image, r2_reserve, r2_duration,
+    network_profile, ue_csv, ue_slice_spec, r2lab_username, reserve,
+    reservation_mode, host_preparation, duration, pos_image, r2_reserve, r2_duration,
 ) = sys.argv[1:]
 source_data = {}
 if source:
@@ -613,6 +674,8 @@ if set(ue_slices) != set(ues):
     raise SystemExit('Interactive UE slice assignments do not match selected UEs')
 
 host_vars = dep.get('host_vars', {})
+if network_profile != dep.get('network_profile'):
+    dep.pop('network_profile_file', None)
 dep.update({
     'core': core,
     'ran': ran,
@@ -624,9 +687,15 @@ dep.update({
     'ue_slices': ue_slices,
 })
 dep['host_vars'] = host_vars
-dep['reservation'] = {'enabled': reserve == 'true', 'duration_minutes': int(duration), 'image': pos_image}
+dep['reservation'] = {
+    'enabled': reserve == 'true',
+    'mode': reservation_mode,
+    'host_preparation': host_preparation,
+    'duration_minutes': int(duration),
+    'image': pos_image,
+}
 dep['r2lab_reservation'] = {'enabled': r2_reserve == 'true', 'duration_minutes': int(r2_duration)}
-for legacy in ('profile', 'profile_file', 'ue_profiles', 'network_profile_file', 'ue_catalog_file', 'r2lab_experiment_nodes'):
+for legacy in ('profile', 'profile_file', 'ue_profiles', 'r2lab_experiment_nodes'):
     dep.pop(legacy, None)
 if r2lab_username:
     dep['r2lab_username'] = r2lab_username
@@ -644,7 +713,21 @@ PY
   echo "  Network profile: $SELECTED_NETWORK_PROFILE"
   echo "  UE slices:"
   describe_ue_slice_assignments "$SELECTED_NETWORK_PROFILE" "$SELECTED_UE_SLICE_SPEC"
-  echo "  POS:             $SELECTED_RESERVE, ${SELECTED_DURATION}m, image $SELECTED_POS_IMAGE"
+  if $SELECTED_RESERVE; then
+    case "$SELECTED_HOST_PREPARATION" in
+      preserve)
+        echo "  POS:             true, ${SELECTED_DURATION}m, preserve (verify/reuse only; no repair)"
+        ;;
+      bootstrap)
+        echo "  POS:             true, ${SELECTED_DURATION}m, bootstrap (retain OS/allocation; bounded reconcile/reboot)"
+        ;;
+      fresh)
+        echo "  POS:             true, ${SELECTED_DURATION}m, fresh reset/reimage, image $SELECTED_POS_IMAGE"
+        ;;
+    esac
+  else
+    echo "  POS:             false"
+  fi
   [[ "$SELECTED_PLATFORM" == r2lab ]] && echo "  R2Lab:           $SELECTED_R2LAB_RESERVE, ${SELECTED_R2LAB_DURATION}m"
   read -r -p "Continue? [Y/n]: " CONFIRM_DEPLOY
   [[ ! "${CONFIRM_DEPLOY:-y}" =~ ^[Nn]$ ]] || exit 0
@@ -653,25 +736,10 @@ fi
 SOURCE_CONFIG="$CONFIG"
 [[ -n "$SOURCE_CONFIG" && -f "$SOURCE_CONFIG" ]] || { echo "No testbed scenario was produced" >&2; exit 2; }
 
-TESTBED_SOURCE_CONFIG="$PRIVATE_RUN_DIR/testbed-source.yml"
-"$SYNTHRAN_PYTHON" - "$SOURCE_CONFIG" "$TESTBED_SOURCE_CONFIG" <<'PY'
-import copy
-import sys
-from pathlib import Path
-import yaml
-
-source, output = map(Path, sys.argv[1:3])
-data = yaml.safe_load(source.read_text()) or {}
-deployment = data.get('deployment')
-if not isinstance(deployment, dict):
-    raise SystemExit('scenario requires mapping: deployment')
-Path(output).write_text(yaml.safe_dump({'deployment': copy.deepcopy(deployment)}, sort_keys=False))
-PY
-
 PUBLIC_CONFIG="$RUN_DIR/resolved-scenario.yml"
 CONFIG="$PRIVATE_RUN_DIR/resolved-scenario.yml"
 "$SYNTHRAN_PYTHON" -m synthran.deployment_state resolve \
-  --source "$TESTBED_SOURCE_CONFIG" --output "$CONFIG"
+  --source "$SOURCE_CONFIG" --output "$CONFIG"
 
 write_public_scenario() {
   "$SYNTHRAN_PYTHON" - "$CONFIG" "$PUBLIC_CONFIG" <<'PY'
@@ -754,6 +822,8 @@ PY
 
   R2LAB_END=$(TZ=Europe/Paris date -d "@$R2LAB_END_EPOCH" +'%Y-%m-%dT%H:%M')
   echo "Resolving provider-backed R2Lab coverage for $R2LAB_START to $R2LAB_END"
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing start \
+    --run-dir "$RUN_DIR" --phase reservation --scope r2lab
   if ! printf '%s\n' "${R2LAB_PASSWORD:-}" | \
     "$SYNTHRAN_PYTHON" deployment/scripts/reserve_r2lab.py \
       --host "$R2LAB_HOST" \
@@ -765,9 +835,13 @@ PY
       --end "$R2LAB_END" \
       --output "$RUN_DIR/r2lab-lease.json" \
       --log "$RUN_DIR/r2lab-reservation.log"; then
+    "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+      --run-dir "$RUN_DIR" --phase reservation --scope r2lab --status failed || true
     echo "R2Lab reservation/coverage verification failed; the separate SOP allocation was left intact" >&2
     exit 1
   fi
+  "$SYNTHRAN_PYTHON" -m synthran.phase_timing finish \
+    --run-dir "$RUN_DIR" --phase reservation --scope r2lab
 fi
 
 deployment_section "Preparing Ansible dependencies"

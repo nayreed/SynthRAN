@@ -1,0 +1,170 @@
+---
+# RFSIM-only chart adapter for selected multi-UE GNU Radio execution.
+# Configuration owns all chart mutations; deployment consumes the prepared chart.
+
+- name: Create charts/srsue/files directory
+  ansible.builtin.file:
+    path: "{{ repo_dest_abs }}/charts/srsue/files"
+    state: directory
+    mode: '0755'
+
+- name: Write multi_ue_scenario.py
+  ansible.builtin.copy:
+    dest: "{{ repo_dest_abs }}/charts/srsue/files/multi_ue_scenario.py"
+    mode: '0755'
+    content: |
+      #!/usr/bin/env python3
+      """GNU Radio ZMQ broker - srsRAN project gNB + srsRAN 4G UEs."""
+      from gnuradio import gr, zeromq, blocks
+      import argparse, os, signal, sys
+
+      GNB_IP = os.environ.get("GNB_IP", "{{ srsran_network.n3.gnb_ip }}")
+      UE_IP = os.environ.get("UE_IPS", "{{ srsran_network.n3.ue_ips[0] }}").split(",")[0]
+      SAMP_RATE = 23.04e6
+
+      class MultiUEBroker(gr.top_block):
+          def __init__(self, nof_ues):
+              gr.top_block.__init__(self, "MultiUE ZMQ Broker")
+              gnb_src_dl = zeromq.req_source(
+                  gr.sizeof_gr_complex, 1, f"tcp://{GNB_IP}:2000", 100, False, -1
+              )
+              throttle_dl = blocks.throttle(gr.sizeof_gr_complex, SAMP_RATE)
+              self.connect(gnb_src_dl, throttle_dl)
+              for i in range(nof_ues):
+                  passthrough = blocks.multiply_const_cc(1.0)
+                  sink = zeromq.rep_sink(
+                      gr.sizeof_gr_complex,
+                      1,
+                      f"tcp://{UE_IP}:{2100 + i * 100}",
+                      100,
+                      False,
+                      -1,
+                  )
+                  self.connect(throttle_dl, passthrough, sink)
+
+              adder = blocks.add_vcc(1)
+              for i in range(nof_ues):
+                  ue_src = zeromq.req_source(
+                      gr.sizeof_gr_complex,
+                      1,
+                      f"tcp://{UE_IP}:{2101 + i * 100}",
+                      100,
+                      False,
+                      -1,
+                  )
+                  self.connect(ue_src, (adder, i))
+              gnb_ul_sink = zeromq.rep_sink(
+                  gr.sizeof_gr_complex, 1, f"tcp://{UE_IP}:2001", 100, False, -1
+              )
+              self.connect(adder, gnb_ul_sink)
+
+      if __name__ == "__main__":
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--nof-ues", type=int, required=True)
+          args = parser.parse_args()
+          if args.nof_ues < 1:
+              raise SystemExit("--nof-ues must be positive")
+          tb = MultiUEBroker(args.nof_ues)
+          tb.start()
+          print("GNU Radio broker ready", flush=True)
+
+          def _stop(*_):
+              tb.stop()
+              tb.wait()
+              sys.exit(0)
+
+          signal.signal(signal.SIGTERM, _stop)
+          signal.signal(signal.SIGINT, _stop)
+          try:
+              tb.wait()
+          except KeyboardInterrupt:
+              _stop()
+
+- name: Write start_gnu.sh
+  ansible.builtin.copy:
+    dest: "{{ repo_dest_abs }}/charts/srsue/files/start_gnu.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      UE_COUNT=${1:?UE count is required}
+      LOG=/var/log/gnu_multi_ue.log
+      mkdir -p /var/log
+      : > "$LOG"
+      echo "[$(date -u +%FT%TZ)] Starting GNU Radio broker for ${UE_COUNT} UE(s)..." >> "$LOG"
+      exec python3 /srsran/config/multi_ue_scenario.py --nof-ues "$UE_COUNT" >> "$LOG" 2>&1
+
+- name: Write selected-UE srsue ConfigMap template
+  ansible.builtin.copy:
+    dest: "{{ repo_dest_abs }}/charts/srsue/templates/configmap.yaml"
+    mode: '0644'
+    content: "{{ lookup('template', 'srsue_configmap.yaml.j2') }}"
+
+- name: Write immutable-image srsue Deployment template
+  ansible.builtin.copy:
+    dest: "{{ repo_dest_abs }}/charts/srsue/templates/deployment.yaml"
+    mode: '0644'
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: {{ '{{' }} include "srsran-ue.fullname" . {{ '}}' }}-{{ '{{' }} .Release.Name {{ '}}' }}
+        labels:
+          {{ '{{-' }} include "srsran-ue.labels" . | nindent 4 {{ '}}' }}
+      spec:
+        selector:
+          matchLabels:
+            {{ '{{-' }} include "srsran-ue.selectorLabels" . | nindent 6 {{ '}}' }}
+        replicas: 1
+        template:
+          metadata:
+            labels:
+              {{ '{{-' }} include "srsran-ue.selectorLabels" . | nindent 8 {{ '}}' }}
+            annotations:
+              k8s.v1.cni.cncf.io/networks: "[{ \"name\": \"{{ '{{' }} .Values.n3networkName {{ '}}' }}\", \"interface\": \"n3\", \"ips\": [ \"{{ '{{' }} .Values.ueIp {{ '}}' }}/24\" ] }]"
+          spec:
+            containers:
+              - name: ue
+                image: "{{ '{{' }} .Values.image.repository {{ '}}' }}"
+                imagePullPolicy: {{ '{{' }} .Values.image.pullPolicy {{ '}}' }}
+                securityContext:
+                  privileged: true
+                command: ["/bin/bash", "-c", "--"]
+                args:
+                  - |
+                    mkdir -p /dev/net
+                    if [ ! -c /dev/net/tun ]; then mknod /dev/net/tun c 10 200; fi
+                    ip route del default dev n3 || true
+                    sleep infinity
+                env:
+                  - name: PATH
+                    value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/srsran/config"
+                  - name: GNB_IP
+                    value: "{{ srsran_network.n3.gnb_ip }}"
+                  - name: UE_IPS
+                    value: "{{ srsran_network.n3.ue_ips[0] }}"
+                  - name: UE_COUNT
+                    value: "{{ ue_count | string }}"
+                volumeMounts:
+                  - name: ue-config
+                    mountPath: /srsran/config
+            dnsPolicy: ClusterFirst
+            restartPolicy: Always
+            {{ '{{-' }} if .Values.nodeName {{ '}}' }}
+            nodeName: {{ '{{' }} .Values.nodeName | quote {{ '}}' }}
+            {{ '{{-' }} end {{ '}}' }}
+            {{ '{{-' }} if .Values.nodeSelector {{ '}}' }}
+            nodeSelector:
+              {{ '{{-' }} toYaml .Values.nodeSelector | nindent 12 {{ '}}' }}
+            {{ '{{-' }} end {{ '}}' }}
+            volumes:
+              - name: ue-config
+                configMap:
+                  name: {{ '{{' }} include "srsran-ue.fullname" . {{ '}}' }}-{{ '{{' }} .Release.Name {{ '}}' }}-ue-config
+                  defaultMode: 0755
+
+- name: Set RFSIM gNB log level to info
+  ansible.builtin.replace:
+    path: "{{ repo_dest_abs }}/charts/srsran-gnb/values-rfsim.yaml"
+    regexp: 'all_level:\s*warning'
+    replace: 'all_level: info'

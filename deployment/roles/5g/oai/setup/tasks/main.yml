@@ -92,6 +92,12 @@
     fail_msg: >-
       OAI charts checkout does not match pinned revision {{ tag_oai_cn5g_fed }}.
 
+- name: Report the immutable OAI source revisions used by this run
+  ansible.builtin.debug:
+    msg: >-
+      OAI sources: helper={{ oai_helper_revision.stdout | trim }},
+      charts={{ oai_charts_revision.stdout | trim }}
+
 - name: Install OAI helper scripts from the immutable checkout
   ansible.builtin.copy:
     src: "{{ item.src }}"
@@ -112,10 +118,10 @@
     multus_ran_if: "{{ hostvars[groups['ran_node'][0]].nic_interface }}"
   when: not bridge_enabled
 
-- name: Retrieve bridge interfaces for multus on the core and ran nodes
+- name: Retrieve topology-selected bridge interfaces for multus
   ansible.builtin.set_fact:
-    multus_core_if: n3br
-    multus_ran_if: n3br
+    multus_core_if: "{{ synthran_topology.transport.workload_interfaces.core.n3 }}"
+    multus_ran_if: "{{ synthran_topology.transport.workload_interfaces.ran.n3 }}"
   when: bridge_enabled or (core == 'oai' and ran == 'ueransim')
 
 - name: Update NS variable in prepare-demo-oai.sh
@@ -236,6 +242,13 @@
     insertafter: EOF
   when: redcap is defined
 
+- name: Apply the validated R2Lab N320 transport contract before chart rendering
+  ansible.builtin.include_tasks: r2lab_n320.yml
+  when:
+    - platform == 'r2lab'
+    - ran == 'oai'
+    - rru == 'n320'
+
 - name: Require staged OAI helper and charts inputs before configuration
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -298,3 +311,9 @@
     fail_msg: >-
       OAI configuration did not produce a complete runnable deployment tree.
       Inspect /tmp/output-prepare-demo-oai.txt on {{ inventory_hostname }}.
+
+- name: Make selected OAI RFSIM UE charts follow the sealed deployment contract
+  ansible.builtin.include_tasks: rfsim_ue_contract.yml
+  when:
+    - platform == 'rfsim'
+    - ran | lower == 'oai'

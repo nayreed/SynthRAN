@@ -1,0 +1,79 @@
+---
+- name: Load the pinned 5g-Ansible execution reference for OAI core lifecycle
+  ansible.builtin.set_fact:
+    synthran_oai_core_reference: >-
+      {{ lookup(
+           'ansible.builtin.file',
+           synthran_execution_reference_file
+         ) | from_json }}
+  when: synthran_oai_core_reference is not defined
+
+- name: Require an immutable OAI core lifecycle reference
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_core_reference.repository == 'https://github.com/sopnode/5g_ansible'
+      - synthran_oai_core_reference.commit is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      Sub 08 requires the reviewed original sopnode/5g_ansible execution
+      reference rather than an implicit, floating, or fork-owned lifecycle source.
+
+- name: Materialize the authoritative pinned execution reference
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - synthran.reference_checkout
+  register: synthran_oai_core_reference_checkout
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Resolve the verified OAI core execution-reference root
+  ansible.builtin.set_fact:
+    synthran_oai_core_reference_root: "{{ synthran_oai_core_reference_checkout.stdout | trim }}"
+
+- name: Read back the materialized OAI core lifecycle revision
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - "{{ synthran_oai_core_reference_root }}"
+      - rev-parse
+      - HEAD
+  register: synthran_oai_core_reference_head
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Require the exact reviewed OAI core lifecycle revision
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_core_reference_root | length > 0
+      - (synthran_oai_core_reference_head.stdout | trim) == synthran_oai_core_reference.commit
+    fail_msg: >-
+      The authoritative 5g-Ansible cache does not match the reviewed Sub 08
+      execution reference.
+
+- name: Resolve the reference-owned OAI core lifecycle task file
+  ansible.builtin.set_fact:
+    synthran_oai_core_reference_tasks: >-
+      {{ synthran_oai_core_reference_root }}/roles/5g/oai/core/tasks/main.yml
+
+- name: Verify the reference-owned OAI core lifecycle task file exists
+  ansible.builtin.stat:
+    path: "{{ synthran_oai_core_reference_tasks }}"
+  register: synthran_oai_core_reference_task
+  delegate_to: localhost
+  become: false
+
+- name: Refuse an incomplete OAI core lifecycle checkout
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_core_reference_task.stat.exists
+      - synthran_oai_core_reference_task.stat.isreg
+    fail_msg: >-
+      The pinned 5g-Ansible checkout does not contain the reviewed OAI core
+      lifecycle task file required by Sub 08.

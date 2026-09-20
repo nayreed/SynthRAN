@@ -33,7 +33,7 @@ jobs:
           bash -n experiment.sh
 
       - name: Compile Python sources
-        run: python -m compileall -q synthran Experiments
+        run: python -m compileall -q synthran Experiments tools/check_acceptance_contract.py
 
       - name: Validate project metadata
         run: |
@@ -258,99 +258,8 @@ jobs:
               print("archive lifecycle contracts OK")
           PY
 
-      - name: Validate read-only accepted-testbed attachment
-        run: |
-          python - <<'PY'
-          import json
-          import tempfile
-          from pathlib import Path
-
-          from synthran.deployment_state import content_hash
-          from synthran.testbed_attachment import AttachmentError, attach_active_deployment
-
-          with tempfile.TemporaryDirectory() as tmp:
-              root = Path(tmp)
-              private = root / "private"
-              result = root / "deployment-result"
-              private.mkdir()
-              result.mkdir()
-              (private / "inventory.yml").write_text("all: {}\n")
-              (private / "deployment-vars.yml").write_text("{}\n")
-
-              deployment = {
-                  "core": "oai",
-                  "ran": "srsran",
-                  "platform": "rfsim",
-                  "radio_unit": "rfsim",
-                  "network_profile": "ci",
-                  "bridge_enabled": True,
-                  "nodes": {"core": "f2", "ran": "f3", "broker": "f2"},
-                  "slices": [
-                      {"name": "default", "sst": "1", "sd": "000001", "dnn": "internet"}
-                  ],
-                  "ues": [
-                      {
-                          "device": "uesim01",
-                          "index": 1,
-                          "imsi": "001010000000001",
-                          "slice": "default",
-                          "sst": "1",
-                          "sd": "000001",
-                          "dnn": "internet",
-                          "tunnel": {"namespace": "oai", "interface": "tun_srsue1"},
-                      }
-                  ],
-              }
-              deployment_hash = content_hash(deployment)
-              identity = root / "active.json"
-              evidence = root / "evidence.json"
-              endpoint = root / "endpoint.json"
-              identity.write_text(json.dumps({
-                  "schema_version": 2,
-                  "status": "active",
-                  "deployment_hash": deployment_hash,
-                  "deployment": deployment,
-                  "attested_at": "2026-09-13T00:00:00+00:00",
-              }))
-              evidence.write_text(json.dumps({
-                  "deployment_hash": deployment_hash,
-                  "cluster_identity_verified": True,
-              }))
-              endpoint.write_text(json.dumps({
-                  "schema_version": 1,
-                  "status": "active",
-                  "deployment_hash": deployment_hash,
-                  "run_id": "ci-deployment",
-                  "identity_file": str(identity),
-                  "evidence_file": str(evidence),
-                  "private_execution_dir": str(private),
-                  "result_dir": str(result),
-                  "published_at": "2026-09-13T00:00:00+00:00",
-              }))
-
-              attached = attach_active_deployment({
-                  "core": "oai",
-                  "ran": ["srsran", "oai"],
-                  "platform": "rfsim",
-                  "radio_unit": "rfsim",
-                  "nodes": {"core": "f2", "ran": "f3"},
-                  "ue_devices": ["uesim01"],
-                  "exact_ue_devices": True,
-                  "ues": [{"device": "uesim01", "dnn": "internet", "interface": "tun_srsue1"}],
-                  "slices": [{"name": "default", "dnn": "internet"}],
-              }, endpoint_path=endpoint)
-              assert attached["status"] == "attached", attached
-              assert attached["mode"] == "read_only", attached
-              assert attached["deployment_hash"] == deployment_hash, attached
-
-              try:
-                  attach_active_deployment({"ran": "oai"}, endpoint_path=endpoint)
-              except AttachmentError:
-                  pass
-              else:
-                  raise AssertionError("incompatible accepted deployment was not rejected")
-              print("accepted-testbed attachment contract OK")
-          PY
+      - name: Validate accepted-testbed and experiment-eligibility contracts
+        run: python tools/check_acceptance_contract.py
 
       - name: Parse versioned YAML and citation metadata
         run: |

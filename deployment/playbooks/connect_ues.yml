@@ -1,5 +1,5 @@
 ---
-- name: Connect R2Lab UEs with the upstream 5g_ansible role
+- name: Attach selected R2Lab UEs from the deployment contract
   hosts: faraday
   gather_facts: false
   any_errors_fatal: true
@@ -24,7 +24,7 @@
         fail_msg: The secured nested SSH wrapper is missing on Faraday; refusing unverified UE connection.
       when: platform == 'r2lab'
 
-    - name: Connect UEs on R2Lab to 5G network
+    - name: Attach each selected R2Lab UE through the upstream lifecycle owner
       ansible.builtin.include_role:
         name: r2lab/ue/connect
         apply:
@@ -32,20 +32,16 @@
             PATH: "{{ synthran_nested_ssh_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             SYNTHRAN_SSH_KNOWN_HOSTS: "{{ synthran_nested_ssh_dir }}/known_hosts"
       vars:
-        ue_item: "{{ item }}"
-        # The upstream role deliberately treats modem bring-up as best effort.
-        # SynthRAN's read-only verification role below is the acceptance gate.
-        ignore_task_errors: true
-        # Upstream embeds phone_ssh in a task name inside a conditionally skipped
-        # phone block. Seed it so non-phone UEs do not emit undefined-template
-        # warnings before that block's set_fact would run.
-        phone_ssh: ""
-      loop: "{{ (groups['qhats'] | default([])) + (groups['qfits'] | default([])) }}"
+        synthran_r2lab_ue: "{{ item }}"
+        ue_item: "{{ item.device }}"
+      loop: "{{ synthran_ue_map }}"
       loop_control:
-        label: "{{ item }}"
+        label: >-
+          {{ item.device }} -> {{ item.slice }} / {{ item.dnn }} /
+          {{ item.tunnel.mode }}
       when: platform == 'r2lab'
 
-    - name: Retain nested R2Lab SSH host keys with the run
+    - name: Retain nested R2Lab SSH host keys with the deployment run
       ansible.builtin.fetch:
         src: "{{ synthran_nested_ssh_dir }}/known_hosts"
         dest: "{{ run_dir }}/r2lab-nested-known-hosts"
@@ -56,73 +52,4 @@
       ansible.builtin.file:
         path: "{{ synthran_nested_ssh_dir }}"
         state: absent
-      when: platform == 'r2lab'
-
-- name: Verify R2Lab modem sessions without changing upstream modem state
-  hosts: physical_ues
-  gather_facts: false
-  become: true
-  any_errors_fatal: true
-  tasks:
-    - name: Prove the live R2Lab UE session against the deployment contract
-      ansible.builtin.include_role:
-        name: synthran/r2lab_ue_verify
-      when: platform == 'r2lab'
-
-- name: Retain structured live R2Lab UE bindings
-  hosts: localhost
-  gather_facts: false
-  any_errors_fatal: true
-  tasks:
-    - name: Initialize live R2Lab UE binding evidence
-      ansible.builtin.set_fact:
-        synthran_r2lab_bindings: []
-      when: platform == 'r2lab'
-
-    - name: Require every deployment-contract UE to expose a proved R2Lab binding
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - hostvars[item.device] is defined
-          - hostvars[item.device].synthran_r2lab_binding is defined
-        fail_msg: >-
-          R2Lab UE {{ item.device }} has no proved live binding for the deployment
-          contract. Required UEs cannot be accepted from desired configuration
-          alone.
-      loop: "{{ synthran_deployment_contract.deployment.ues }}"
-      loop_control:
-        label: "{{ item.device }}"
-      when: platform == 'r2lab'
-
-    - name: Collect proved R2Lab UE bindings in deployment-contract order
-      ansible.builtin.set_fact:
-        synthran_r2lab_bindings: >-
-          {{ synthran_r2lab_bindings + [hostvars[item.device].synthran_r2lab_binding] }}
-      loop: "{{ synthran_deployment_contract.deployment.ues }}"
-      loop_control:
-        label: "{{ item.device }}"
-      when: platform == 'r2lab'
-
-    - name: Read the existing cluster attestation
-      ansible.builtin.set_fact:
-        synthran_cluster_evidence: "{{ lookup('file', run_dir ~ '/live-deployment-evidence.json') | from_json }}"
-      when: platform == 'r2lab'
-
-    - name: Require a matching cluster attestation before adding R2Lab UE evidence
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - synthran_cluster_evidence.cluster_identity_verified is sameas true
-          - synthran_cluster_evidence.deployment_hash == synthran_deployment_contract.deployment_hash
-        fail_msg: Live R2Lab UE observations cannot replace a missing or mismatched cluster attestation.
-      when: platform == 'r2lab'
-
-    - name: Retain live R2Lab UE bindings with the run
-      ansible.builtin.copy:
-        content: >-
-          {{ synthran_cluster_evidence
-             | combine({'bindings': synthran_r2lab_bindings,
-                        'observed_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')})
-             | to_nice_json }}
-        dest: "{{ run_dir }}/live-deployment-evidence.json"
       when: platform == 'r2lab'

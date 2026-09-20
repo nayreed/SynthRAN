@@ -1,0 +1,95 @@
+name: Reservation authority contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reservation-authority:
+    name: Explicit resource ownership
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install SynthRAN
+        run: python -m pip install --disable-pip-version-check -e .
+
+      - name: Compile reservation sources
+        run: >-
+          python -m py_compile
+          synthran/reservation.py
+          synthran/phase_timing.py
+          synthran/pos_images.py
+          synthran/r2lab.py
+          synthran/inventory.py
+          synthran/scenario.py
+          deployment/scripts/reserve_sop.py
+          deployment/scripts/reserve_r2lab.py
+          tools/check_reservation_authority.py
+          tools/check_pos_calendar_reuse_regression.py
+          tools/check_pos_image_resolution.py
+          tools/check_pos_preparation_regression.py
+          tools/check_reservation_wizard_contract.py
+          tools/check_reservation_output_contract.py
+          tools/check_phase_timing_contract.py
+          tools/check_issue124_regressions.py
+          tools/validate_issue124_physical.py
+          tools/check_issue124_physical_validator.py
+          tools/check_r2lab_handoff_contract.py
+          tools/check_reservation_failure_evidence.py
+          tools/check_reservation_cli_fakes.py
+          tools/check_resource_authority_contract.py
+
+      - name: Syntax-check interactive deployment entrypoint
+        run: bash -n deploy.sh
+
+      - name: Validate reservation authority without hardware
+        run: python tools/check_reservation_authority.py
+
+      - name: Validate active POS calendar reuse regression
+        run: python tools/check_pos_calendar_reuse_regression.py
+
+      - name: Validate POS image alias resolution
+        run: python tools/check_pos_image_resolution.py
+
+      - name: Validate multi-node POS preparation ordering
+        run: python tools/check_pos_preparation_regression.py
+
+      - name: Validate simple reservation wizard over explicit internal policy
+        run: python tools/check_reservation_wizard_contract.py
+
+      - name: Validate operator-facing reservation output
+        run: python tools/check_reservation_output_contract.py
+
+      - name: Validate deployment phase timing evidence
+        run: python tools/check_phase_timing_contract.py
+
+      - name: Validate issue 124 host-preparation regression matrix
+        run: python tools/check_issue124_regressions.py
+
+      - name: Validate issue 124 physical artifact gate without hardware
+        run: python tools/check_issue124_physical_validator.py
+
+      - name: Validate R2Lab Ansible handoff and cleanup scope
+        run: python tools/check_r2lab_handoff_contract.py
+
+      - name: Validate failure evidence preservation
+        run: python tools/check_reservation_failure_evidence.py
+
+      - name: Validate real CLI wiring through temporary fake commands
+        run: python tools/check_reservation_cli_fakes.py

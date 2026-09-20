@@ -1,0 +1,62 @@
+---
+- name: Select the R2Lab N320 chart used by this OAI mode
+  ansible.builtin.set_fact:
+    oai_n320_release_name: "{{ 'oai-du' if (oai_gnb_mode | default('monolithic')) in ['cudu', 'cucpup'] else 'oai-gnb' }}"
+    oai_n320_chart_path: "{{ charts_base }}/oai-5g-ran/{{ 'oai-du' if (oai_gnb_mode | default('monolithic')) in ['cudu', 'cucpup'] else 'oai-gnb' }}"
+
+- name: Install the Helm-owned R2Lab N320 ipvlan NAD renderer
+  ansible.builtin.copy:
+    src: r2lab_n320_ipvlan_nad.yaml
+    dest: "{{ oai_n320_chart_path }}/templates/synthran-r2lab-n320-ipvlan-nad.yaml"
+    mode: '0644'
+
+- name: Verify Helm renders exactly one validated N320 ipvlan RU attachment
+  ansible.builtin.shell: |
+    set -euo pipefail
+    rendered="$(mktemp)"
+    trap 'rm -f "$rendered"' EXIT
+
+    helm template \
+      "{{ oai_n320_release_name }}" \
+      "{{ oai_n320_chart_path }}" \
+      --namespace "{{ core }}" > "$rendered"
+
+    nad_name="{{ oai_n320_release_name }}-ru"
+    count="$({{ yq_bin_path }} ea -r \
+      'select(.kind == "NetworkAttachmentDefinition" and .metadata.name == "'"$nad_name"'") | .metadata.name' \
+      "$rendered" | sed '/^null$/d;/^$/d' | wc -l)"
+    test "$count" -eq 1
+
+    config="$({{ yq_bin_path }} ea -r \
+      'select(.kind == "NetworkAttachmentDefinition" and .metadata.name == "'"$nad_name"'") | .spec.config' \
+      "$rendered")"
+
+    python3 - \
+      "$config" \
+      "{{ oai_r2lab_n320_ru_cni_type }}" \
+      "{{ oai_r2lab_n320_ru_parent }}" \
+      "{{ oai_r2lab_n320_ru_cni_mode }}" \
+      "{{ oai_r2lab_n320_ru_ip }}/{{ oai_r2lab_n320_ru_prefix }}" <<'PY'
+    import json
+    import sys
+
+    cfg = json.loads(sys.argv[1])
+    plugin = cfg['plugins'][0]
+    expected = {
+        'type': sys.argv[2],
+        'master': sys.argv[3],
+        'mode': sys.argv[4],
+        'address': sys.argv[5],
+    }
+    actual = {
+        'type': plugin.get('type'),
+        'master': plugin.get('master'),
+        'mode': plugin.get('mode'),
+        'address': plugin.get('ipam', {}).get('addresses', [{}])[0].get('address'),
+    }
+    if actual != expected:
+        raise SystemExit(f'N320 RU NAD mismatch: expected={expected!r} actual={actual!r}')
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false

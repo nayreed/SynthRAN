@@ -1,0 +1,462 @@
+---
+- name: Classify bootstrap cluster state before physical testbed mutation
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve existing Kubernetes identity and readiness
+      ansible.builtin.set_fact:
+        synthran_bootstrap_cluster_identity_present: >-
+          {{
+            (synthran_preflight_admin_conf.stat.exists | default(false) | bool)
+            or (synthran_preflight_etcd_state.stat.exists | default(false) | bool)
+            or (hostvars[groups['core_node'][0]].synthran_preflight_kubelet_identity.stat.exists | default(false) | bool)
+            or (hostvars[groups['ran_node'][0]].synthran_preflight_kubelet_identity.stat.exists | default(false) | bool)
+          }}
+        synthran_bootstrap_cluster_ready: >-
+          {{
+            (synthran_preflight_readyz.rc | int == 0)
+            and (synthran_preflight_ran_node.rc | int == 0)
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Classify existing Kubernetes cluster action
+      ansible.builtin.set_fact:
+        synthran_bootstrap_cluster_action: >-
+          {{
+            'requires-fresh'
+            if (synthran_bootstrap_cluster_identity_present | bool
+                and not (synthran_bootstrap_cluster_ready | bool))
+            else 'reuse'
+            if (synthran_bootstrap_cluster_identity_present | bool)
+            else 'rebuild'
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Retain bootstrap cluster classification
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-bootstrap-classification-cluster.json"
+        mode: '0644'
+        content: >-
+          {{ {
+               'schema': 'synthran/bootstrap-classification-cluster/v1',
+               'host_preparation': synthran_host_preparation,
+               'cluster_identity_present': synthran_bootstrap_cluster_identity_present | bool,
+               'cluster_ready': synthran_bootstrap_cluster_ready | bool,
+               'cluster_action': synthran_bootstrap_cluster_action,
+               'readyz_rc': synthran_preflight_readyz.rc | int,
+               'ran_node_rc': synthran_preflight_ran_node.rc | int,
+               'nad_rc': synthran_preflight_nad.rc | int
+             } | to_nice_json }}\n
+      delegate_to: localhost
+      become: false
+      when: synthran_host_preparation == 'bootstrap'
+
+- name: Classify bootstrap host repairability before physical testbed mutation
+  hosts: sopnodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve shared bootstrap cluster action
+      ansible.builtin.set_fact:
+        synthran_bootstrap_cluster_action: >-
+          {{ hostvars[groups['core_node'][0]].synthran_bootstrap_cluster_action }}
+        synthran_bootstrap_live_boot: >-
+          {{ 'boot=live' in synthran_preflight_cmdline.stdout.split() }}
+        synthran_bootstrap_ovs_bridges_healthy: >-
+          {{
+            (synthran_preflight_ovs_bridges.results | default([])
+             | selectattr('rc', 'ne', 0) | list | length) == 0
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Resolve bootstrap prerequisite health
+      ansible.builtin.set_fact:
+        synthran_bootstrap_host_prereqs_healthy: >-
+          {{
+            (ansible_distribution == 'Ubuntu')
+            and (ansible_distribution_release == 'jammy')
+            and (synthran_preflight_containerd.rc | int == 0)
+            and (synthran_preflight_kubelet.rc | int == 0)
+            and (synthran_preflight_dhcp_binary.stat.exists | default(false) | bool)
+            and (synthran_preflight_dhcp_binary.stat.executable | default(false) | bool)
+            and (synthran_preflight_dhcp_service.rc | int == 0)
+            and (synthran_preflight_ovsdb.rc | int == 0)
+            and (synthran_preflight_ovsvswitchd.rc | int == 0)
+            and (synthran_bootstrap_ovs_bridges_healthy | bool)
+            and (synthran_preflight_ip_forward.rc | int == 0)
+            and (synthran_preflight_ip_forward.stdout | trim == '1')
+            and (synthran_preflight_bridge_ipv4.rc | int == 0)
+            and (synthran_preflight_bridge_ipv4.stdout | trim == '1')
+            and (synthran_preflight_bridge_ipv6.rc | int == 0)
+            and (synthran_preflight_bridge_ipv6.stdout | trim == '1')
+            and (synthran_preflight_swap.rc | int == 0)
+            and (synthran_preflight_swap.stdout | trim | length == 0)
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Build bootstrap classification reasons
+      ansible.builtin.set_fact:
+        synthran_bootstrap_classification_reasons: >-
+          {{
+            ([] if ansible_distribution == 'Ubuntu' else ['unsupported-os'])
+            + ([] if ansible_distribution_release == 'jammy' else ['unsupported-ubuntu-release'])
+            + ([] if synthran_bootstrap_cluster_action != 'requires-fresh' else ['existing-cluster-unhealthy'])
+            + ([] if synthran_preflight_missing_boot_tokens | length == 0 else ['boot-profile-drift'])
+            + ([]
+               if (synthran_preflight_missing_boot_tokens | length == 0
+                   or synthran_bootstrap_live_boot | bool)
+               else ['boot-drift-on-non-live-host'])
+            + ([] if synthran_preflight_containerd.rc | int == 0 else ['containerd-missing-or-inactive'])
+            + ([] if synthran_preflight_kubelet.rc | int == 0 else ['kubelet-missing-or-inactive'])
+            + ([] if (synthran_preflight_dhcp_binary.stat.exists | default(false) | bool) else ['cni-dhcp-binary-missing'])
+            + ([] if synthran_preflight_dhcp_service.rc | int == 0 else ['cni-dhcp-service-inactive'])
+            + ([] if synthran_preflight_ovsdb.rc | int == 0 else ['ovsdb-server-inactive'])
+            + ([] if synthran_preflight_ovsvswitchd.rc | int == 0 else ['ovs-vswitchd-inactive'])
+            + ([] if synthran_bootstrap_ovs_bridges_healthy | bool else ['ovs-bridge-missing'])
+            + ([] if (synthran_preflight_ip_forward.stdout | trim == '1') else ['ip-forwarding-mismatch'])
+            + ([] if (synthran_preflight_bridge_ipv4.stdout | trim == '1') else ['bridge-ipv4-sysctl-mismatch'])
+            + ([] if (synthran_preflight_bridge_ipv6.stdout | trim == '1') else ['bridge-ipv6-sysctl-mismatch'])
+            + ([] if (synthran_preflight_swap.stdout | trim | length == 0) else ['swap-active'])
+            + ([] if hostvars[groups['core_node'][0]].synthran_preflight_nad.rc | int == 0 else ['nad-api-missing'])
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Classify bootstrap host state
+      ansible.builtin.set_fact:
+        synthran_bootstrap_classification: >-
+          {{
+            'requires-fresh'
+            if (
+              ansible_distribution != 'Ubuntu'
+              or ansible_distribution_release != 'jammy'
+              or synthran_bootstrap_cluster_action == 'requires-fresh'
+              or (
+                synthran_preflight_missing_boot_tokens | length > 0
+                and not (synthran_bootstrap_live_boot | bool)
+              )
+            )
+            else 'reboot-required'
+            if (synthran_preflight_missing_boot_tokens | length > 0)
+            else 'repairable-in-place'
+            if (
+              synthran_bootstrap_cluster_action == 'rebuild'
+              or not (synthran_bootstrap_host_prereqs_healthy | bool)
+              or hostvars[groups['core_node'][0]].synthran_preflight_nad.rc | int != 0
+            )
+            else 'healthy'
+          }}
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Retain per-host bootstrap classification before mutation
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-bootstrap-classification-{{ inventory_hostname }}.json"
+        mode: '0644'
+        content: >-
+          {{ {
+               'schema': 'synthran/bootstrap-classification-host/v1',
+               'host': inventory_hostname,
+               'host_preparation': synthran_host_preparation,
+               'classification': synthran_bootstrap_classification,
+               'cluster_action': synthran_bootstrap_cluster_action,
+               'reasons': synthran_bootstrap_classification_reasons,
+               'boot_profile': synthran_preflight_boot_profile,
+               'live_boot': synthran_bootstrap_live_boot | bool,
+               'missing_boot_tokens': synthran_preflight_missing_boot_tokens,
+               'recommended_action':
+                 ('fresh' if synthran_bootstrap_classification == 'requires-fresh'
+                  else 'reboot-and-reconcile' if synthran_bootstrap_classification == 'reboot-required'
+                  else 'reconcile' if synthran_bootstrap_classification == 'repairable-in-place'
+                  else 'reuse')
+             } | to_nice_json }}\n
+      delegate_to: localhost
+      become: false
+      when: synthran_host_preparation == 'bootstrap'
+
+    - name: Block bootstrap state that requires a fresh image
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_bootstrap_classification != 'requires-fresh'
+        fail_msg: >-
+          Bootstrap cannot safely reconcile {{ inventory_hostname }} in place.
+          Classification={{ synthran_bootstrap_classification }};
+          reasons={{ synthran_bootstrap_classification_reasons | join(', ') }}.
+          Re-run with host_preparation=fresh. No image staging or allocation
+          reclaim was attempted by bootstrap.
+      when: synthran_host_preparation == 'bootstrap'
+
+- name: Apply minimum bootstrap boot-profile correction
+  hosts: sopnodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: 1
+  tasks:
+    - name: Load retained POS authority for bootstrap boot mutation
+      ansible.builtin.set_fact:
+        synthran_bootstrap_authority: >-
+          {{ lookup('file', run_dir ~ '/reservation-authority.json') | from_json }}
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Require explicit POS authority before bootstrap boot mutation
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_bootstrap_authority.status == 'ready'
+          - synthran_bootstrap_authority.policies.host_preparation == 'bootstrap'
+          - synthran_bootstrap_authority.pos_calendar.status != 'disabled'
+          - inventory_hostname in synthran_bootstrap_authority.selected_resources
+        fail_msg: >-
+          Bootstrap boot reconciliation lacks retained POS calendar authority for
+          {{ inventory_hostname }}; refusing boot-parameter or reboot mutation.
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Start bootstrap boot-parameter mutation timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - boot_parameter_mutation
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Apply required POS boot parameters without image staging
+      ansible.builtin.command:
+        argv:
+          - pos
+          - nodes
+          - bootparameter
+          - "{{ inventory_hostname }}"
+          - --raw
+          - "{{ synthran_preflight_required_boot_tokens | join(' ') }}"
+      delegate_to: localhost
+      become: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Finish bootstrap boot-parameter mutation timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - boot_parameter_mutation
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Remove retained host key before authorized reboot
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -f
+          - "{{ synthran_private_dir }}/ssh-known-hosts"
+          - -R
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Remove retained address key before authorized reboot
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -f
+          - "{{ synthran_private_dir }}/ssh-known-hosts"
+          - -R
+          - "{{ ansible_host | default(inventory_hostname) }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Start bootstrap reboot timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - bootstrap_reboot
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Reboot current OS to activate corrected boot parameters
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        connect_timeout: 10
+        post_reboot_delay: 5
+        msg: SynthRAN bootstrap is activating the authorized SOP boot profile
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Finish bootstrap reboot timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - bootstrap_reboot
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Read boot parameters after bootstrap reboot
+      ansible.builtin.command: cat /proc/cmdline
+      register: synthran_bootstrap_post_reboot_cmdline
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Require corrected boot profile after bootstrap reboot
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item in synthran_bootstrap_post_reboot_cmdline.stdout.split()
+        fail_msg: >-
+          {{ inventory_hostname }} did not activate required boot parameter
+          {{ item }} after the minimum bootstrap reboot. Re-run with
+          host_preparation=fresh; bootstrap will not escalate automatically.
+      loop: "{{ synthran_preflight_required_boot_tokens }}"
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Retain bootstrap boot-reconciliation evidence
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-bootstrap-boot-{{ inventory_hostname }}.json"
+        mode: '0644'
+        content: >-
+          {{ {
+               'schema': 'synthran/bootstrap-boot-reconcile/v1',
+               'host': inventory_hostname,
+               'boot_profile': synthran_preflight_boot_profile,
+               'previous_missing_tokens': synthran_preflight_missing_boot_tokens,
+               'post_reboot_command_line': synthran_bootstrap_post_reboot_cmdline.stdout | trim,
+               'image_staged': false,
+               'allocation_reclaimed': false,
+               'pos_reset_used': false,
+               'reboot_used': true
+             } | to_nice_json }}\n
+      delegate_to: localhost
+      become: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+- name: Revalidate reused Kubernetes after bootstrap reboot
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve whether a reused cluster experienced a bootstrap reboot
+      ansible.builtin.set_fact:
+        synthran_bootstrap_reused_cluster_rebooted: >-
+          {{
+            synthran_host_preparation == 'bootstrap'
+            and synthran_bootstrap_cluster_action == 'reuse'
+            and (
+              hostvars[groups['core_node'][0]].synthran_bootstrap_classification == 'reboot-required'
+              or hostvars[groups['ran_node'][0]].synthran_bootstrap_classification == 'reboot-required'
+            )
+          }}
+
+    - name: Wait for reused Kubernetes control plane after bootstrap reboot
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - --raw=/readyz
+      register: synthran_bootstrap_reused_readyz
+      changed_when: false
+      retries: 36
+      delay: 5
+      until: synthran_bootstrap_reused_readyz.rc == 0
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+
+    - name: Wait for reused RAN node after bootstrap reboot
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - "node/{{ ran_node_name }}"
+          - --for=condition=Ready
+          - --timeout=180s
+      register: synthran_bootstrap_reused_ran_ready
+      changed_when: false
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+
+    - name: Retain reused-cluster recovery evidence before R2Lab mutation
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-bootstrap-cluster-recovery.json"
+        mode: '0644'
+        content: >-
+          {{ {
+               'schema': 'synthran/bootstrap-cluster-recovery/v1',
+               'cluster_action': synthran_bootstrap_cluster_action,
+               'control_plane_ready': synthran_bootstrap_reused_readyz.rc | int == 0,
+               'ran_node_ready': synthran_bootstrap_reused_ran_ready.rc | int == 0,
+               'r2lab_mutation_started': false
+             } | to_nice_json }}\n
+      delegate_to: localhost
+      become: false
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+

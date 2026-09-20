@@ -1,0 +1,33 @@
+---
+# Shared physical-RAN identities used only to remove the non-selected stack.
+# Same-stack restart/redeploy remains owned by each backend-specific lifecycle.
+synthran_ran_transition_timeout: "120s"
+
+synthran_ran_transition_catalog:
+  oai:
+    - release: oai-gnb
+      deployment: oai-gnb
+      pod_selector: app.kubernetes.io/instance=oai-gnb
+      ru_nad: oai-gnb-ru
+    - release: oai-du
+      deployment: oai-du
+      pod_selector: app.kubernetes.io/instance=oai-du
+      ru_nad: oai-du-ru
+    - release: oai-cu
+      deployment: oai-cu
+      pod_selector: app.kubernetes.io/instance=oai-cu
+      ru_nad: ""
+    - release: oai-cu-up
+      deployment: oai-cu-up
+      pod_selector: app.kubernetes.io/instance=oai-cu-up
+      ru_nad: ""
+    - release: oai-cu-cp
+      deployment: oai-cu-cp
+      pod_selector: app.kubernetes.io/instance=oai-cu-cp
+      ru_nad: ""
+
+  srsran:
+    - release: srsran-gnb
+      deployment: srsran-gnb
+      pod_selector: app=srsran,component=gnb
+      ru_nad: ru-network

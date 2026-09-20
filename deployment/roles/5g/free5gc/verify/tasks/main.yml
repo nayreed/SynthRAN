@@ -1,229 +1,291 @@
 ---
-# ============================================================
-# free5gc profile verification
-# Called at the end of the deploy role via include_role
-# Requires: fiveg (profile vars), core_ns
-# ============================================================
-
-# -- Fetch all configmaps --
-- name: Fetch AMF configmap
+- name: Fetch Free5GC profile-bearing ConfigMaps
   kubernetes.core.k8s_info:
     api_version: v1
     kind: ConfigMap
-    name: free5gc-free5gc-amf-configmap
+    name: "{{ item.name }}"
     namespace: "{{ core_ns }}"
-  register: amf_cm
+  loop:
+    - {key: amf, name: free5gc-free5gc-amf-configmap}
+    - {key: smf, name: free5gc-free5gc-smf-configmap}
+    - {key: nssf, name: free5gc-free5gc-nssf-configmap}
+    - {key: iupf1, name: free5gc-free5gc-upf-iupf1-configmap}
+    - {key: psaupf1, name: free5gc-free5gc-upf-psaupf1-configmap}
+    - {key: psaupf2, name: free5gc-free5gc-upf-psaupf2-configmap}
+  loop_control:
+    label: "{{ item.key }}"
+  register: free5gc_profile_configmaps
 
-- name: Fetch SMF configmap
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: ConfigMap
-    name: free5gc-free5gc-smf-configmap
-    namespace: "{{ core_ns }}"
-  register: smf_cm
-
-- name: Fetch NSSF configmap
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: ConfigMap
-    name: free5gc-free5gc-nssf-configmap
-    namespace: "{{ core_ns }}"
-  register: nssf_cm
-
-- name: Fetch iupf1 configmap
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: ConfigMap
-    name: free5gc-free5gc-upf-iupf1-configmap
-    namespace: "{{ core_ns }}"
-  register: iupf1_cm
-
-- name: Fetch psaupf1 configmap
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: ConfigMap
-    name: free5gc-free5gc-upf-psaupf1-configmap
-    namespace: "{{ core_ns }}"
-  register: psaupf1_cm
-
-- name: Fetch psaupf2 configmap
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: ConfigMap
-    name: free5gc-free5gc-upf-psaupf2-configmap
-    namespace: "{{ core_ns }}"
-  register: psaupf2_cm
-
-# ============================================================
-# AMF
-# ============================================================
-- name: "Verify AMF PLMN (mcc={{ fiveg.plmn.mcc }} mnc={{ fiveg.plmn.mnc }} tac={{ fiveg.plmn.tac }})"
-  assert:
+- name: Require every Free5GC profile-bearing ConfigMap
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "fiveg.plmn.mcc in amf_cm.resources[0].data['amfcfg.yaml']"
-      - "fiveg.plmn.mnc in amf_cm.resources[0].data['amfcfg.yaml']"
-      - "(fiveg.plmn.tac | string) in amf_cm.resources[0].data['amfcfg.yaml']"
-    fail_msg: "AMF configmap PLMN mismatch (expected mcc={{ fiveg.plmn.mcc }} mnc={{ fiveg.plmn.mnc }} tac={{ fiveg.plmn.tac }})"
+      - item.resources | length == 1
+    fail_msg: >-
+      Free5GC profile verification requires ConfigMap {{ item.item.name }} in
+      namespace {{ core_ns }}.
+  loop: "{{ free5gc_profile_configmaps.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
 
-- name: "Verify AMF slice {{ item.name }} (sst={{ item.sst }} sd={{ item.sd }} dnn={{ item.dnn }})"
-  assert:
+- name: Index Free5GC profile-bearing ConfigMaps
+  ansible.builtin.set_fact:
+    free5gc_profile_cm: >-
+      {{ (free5gc_profile_cm | default({})) |
+         combine({item.item.key: item.resources[0]}) }}
+  loop: "{{ free5gc_profile_configmaps.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Parse live Free5GC profile-bearing configuration
+  ansible.builtin.set_fact:
+    free5gc_live_amf_cfg: "{{ free5gc_profile_cm.amf.data['amfcfg.yaml'] | from_yaml }}"
+    free5gc_live_smf_cfg: "{{ free5gc_profile_cm.smf.data['smfcfg.yaml'] | from_yaml }}"
+    free5gc_live_nssf_cfg: "{{ free5gc_profile_cm.nssf.data['nssfcfg.yaml'] | from_yaml }}"
+    free5gc_live_iupf1_cfg: "{{ free5gc_profile_cm.iupf1.data['upfcfg.yaml'] | from_yaml }}"
+    free5gc_live_psaupf1_cfg: "{{ free5gc_profile_cm.psaupf1.data['upfcfg.yaml'] | from_yaml }}"
+    free5gc_live_psaupf2_cfg: "{{ free5gc_profile_cm.psaupf2.data['upfcfg.yaml'] | from_yaml }}"
+
+- name: Require the exact Free5GC AMF profile schema and PLMN
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "(item.sst | string) in amf_cm.resources[0].data['amfcfg.yaml']"
-      - "item.dnn in amf_cm.resources[0].data['amfcfg.yaml']"
+      - free5gc_live_amf_cfg.configuration.servedGuamiList | length == 1
+      - free5gc_live_amf_cfg.configuration.servedGuamiList[0].plmnId.mcc == fiveg.plmn.mcc
+      - free5gc_live_amf_cfg.configuration.servedGuamiList[0].plmnId.mnc == fiveg.plmn.mnc
+      - free5gc_live_amf_cfg.configuration.supportTaiList | length == 1
+      - free5gc_live_amf_cfg.configuration.supportTaiList[0].plmnId.mcc == fiveg.plmn.mcc
+      - free5gc_live_amf_cfg.configuration.supportTaiList[0].plmnId.mnc == fiveg.plmn.mnc
+      - free5gc_live_amf_cfg.configuration.supportTaiList[0].tac | int == fiveg.plmn.tac | int
+      - free5gc_live_amf_cfg.configuration.plmnSupportList | length == 1
+      - free5gc_live_amf_cfg.configuration.plmnSupportList[0].plmnId.mcc == fiveg.plmn.mcc
+      - free5gc_live_amf_cfg.configuration.plmnSupportList[0].plmnId.mnc == fiveg.plmn.mnc
+      - free5gc_live_amf_cfg.configuration.supportDnnList == fiveg.slices | map(attribute='dnn') | list
+      - free5gc_live_amf_cfg.configuration.security.integrityOrder == ['NIA2', 'NIA1', 'NIA0']
+      - free5gc_live_amf_cfg.configuration.security.cipheringOrder == ['NEA0', 'NEA1', 'NEA2']
+      - free5gc_live_amf_cfg.configuration.networkName.full == 'free5GC'
+      - free5gc_live_amf_cfg.configuration.t3512Value | int == 540
+      - "'s_nssai' not in free5gc_live_amf_cfg.configuration"
+      - "'network_name' not in free5gc_live_amf_cfg.configuration"
+      - "'amf_name' not in free5gc_live_amf_cfg.configuration"
+      - "'t3512' not in free5gc_live_amf_cfg.configuration"
+    fail_msg: >-
+      Live Free5GC AMF configuration does not match the selected effective
+      PLMN or the reviewed v4.2 AMF schema.
+
+- name: Build live Free5GC AMF S-NSSAI identities
+  ansible.builtin.set_fact:
+    free5gc_live_amf_snssai: >-
+      {{ (free5gc_live_amf_snssai | default([])) +
+         [((item.sst | int | string) ~ ':' ~ (item.sd | string | lower))] }}
+  loop: "{{ free5gc_live_amf_cfg.configuration.plmnSupportList[0].snssaiList }}"
+  loop_control:
+    label: "{{ item.sst }}:{{ item.sd }}"
+
+- name: Require every effective slice and DNN in live Free5GC AMF
+  ansible.builtin.assert:
+    quiet: true
+    that:
       - >-
-        item.sd == 'EMPTY' or
-        ('%06x' | format(item.sd | int(base=16))) in amf_cm.resources[0].data['amfcfg.yaml']
-    fail_msg: "AMF configmap missing parameters for slice {{ item.name }}"
+        ((item.sst | int | string) ~ ':' ~
+         ('ffffff' if item.sd == 'EMPTY' else ('%06x' | format(item.sd | int(base=16)))))
+        in free5gc_live_amf_snssai
+      - item.dnn in free5gc_live_amf_cfg.configuration.supportDnnList
+    fail_msg: "Live Free5GC AMF is missing an effective slice or DNN."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-# ============================================================
-# SMF
-# ============================================================
-- name: "Verify SMF PLMN (mcc={{ fiveg.plmn.mcc }} mnc={{ fiveg.plmn.mnc }})"
-  assert:
+- name: Require exact Free5GC SMF PLMN
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "fiveg.plmn.mcc in smf_cm.resources[0].data['smfcfg.yaml']"
-      - "fiveg.plmn.mnc in smf_cm.resources[0].data['smfcfg.yaml']"
-    fail_msg: "SMF configmap PLMN mismatch"
+      - free5gc_live_smf_cfg.configuration.plmnList | length == 1
+      - free5gc_live_smf_cfg.configuration.plmnList[0].mcc == fiveg.plmn.mcc
+      - free5gc_live_smf_cfg.configuration.plmnList[0].mnc == fiveg.plmn.mnc
+    fail_msg: "Live Free5GC SMF does not match the selected effective PLMN."
 
-- name: "Verify SMF slice {{ item.name }} (sst={{ item.sst }} sd={{ item.sd }} dnn={{ item.dnn }} prefix={{ item.ip_prefix }})"
-  assert:
+- name: Build live Free5GC SMF S-NSSAI identities
+  ansible.builtin.set_fact:
+    free5gc_live_smf_snssai: >-
+      {{ (free5gc_live_smf_snssai | default([])) +
+         [((item.sNssai.sst | int | string) ~ ':' ~
+           (item.sNssai.sd | string | lower))] }}
+  loop: "{{ free5gc_live_smf_cfg.configuration.snssaiInfos }}"
+  loop_control:
+    label: "{{ item.sNssai.sst }}:{{ item.sNssai.sd }}"
+
+- name: Build live Free5GC SMF DNN inventory
+  ansible.builtin.set_fact:
+    free5gc_live_smf_dnns: >-
+      {{ (free5gc_live_smf_dnns | default([])) +
+         (item.dnnInfos | map(attribute='dnn') | list) }}
+  loop: "{{ free5gc_live_smf_cfg.configuration.snssaiInfos }}"
+  loop_control:
+    label: "{{ item.sNssai.sst }}:{{ item.sNssai.sd }}"
+
+- name: Require every effective slice and DNN in live Free5GC SMF
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "(item.sst | string) in smf_cm.resources[0].data['smfcfg.yaml']"
-      - "item.dnn in smf_cm.resources[0].data['smfcfg.yaml']"
-      - "item.ip_prefix in smf_cm.resources[0].data['smfcfg.yaml']"
       - >-
-        item.sd == 'EMPTY' or
-        ('%06x' | format(item.sd | int(base=16))) in smf_cm.resources[0].data['smfcfg.yaml']
-    fail_msg: "SMF configmap missing parameters for slice {{ item.name }}"
+        ((item.sst | int | string) ~ ':' ~
+         ('ffffff' if item.sd == 'EMPTY' else ('%06x' | format(item.sd | int(base=16)))))
+        in free5gc_live_smf_snssai
+      - item.dnn in free5gc_live_smf_dnns
+    fail_msg: "Live Free5GC SMF is missing an effective slice or DNN."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-# ============================================================
-# NSSF
-# ============================================================
-- name: "Verify NSSF PLMN (mcc={{ fiveg.plmn.mcc }} mnc={{ fiveg.plmn.mnc }})"
-  assert:
+- name: Require exact Free5GC NSSF PLMN
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "fiveg.plmn.mcc in nssf_cm.resources[0].data['nssfcfg.yaml']"
-      - "fiveg.plmn.mnc in nssf_cm.resources[0].data['nssfcfg.yaml']"
-    fail_msg: "NSSF configmap PLMN mismatch"
+      - free5gc_live_nssf_cfg.configuration.supportedPlmnList | length == 1
+      - free5gc_live_nssf_cfg.configuration.supportedPlmnList[0].mcc == fiveg.plmn.mcc
+      - free5gc_live_nssf_cfg.configuration.supportedPlmnList[0].mnc == fiveg.plmn.mnc
+      - free5gc_live_nssf_cfg.configuration.supportedNssaiInPlmnList | length == 1
+      - free5gc_live_nssf_cfg.configuration.supportedNssaiInPlmnList[0].plmnId.mcc == fiveg.plmn.mcc
+      - free5gc_live_nssf_cfg.configuration.supportedNssaiInPlmnList[0].plmnId.mnc == fiveg.plmn.mnc
+      - free5gc_live_nssf_cfg.configuration.taList | length == 1
+      - free5gc_live_nssf_cfg.configuration.taList[0].tai.plmnId.mcc == fiveg.plmn.mcc
+      - free5gc_live_nssf_cfg.configuration.taList[0].tai.plmnId.mnc == fiveg.plmn.mnc
+      - free5gc_live_nssf_cfg.configuration.taList[0].tai.tac | int == fiveg.plmn.tac | int
+    fail_msg: "Live Free5GC NSSF does not match the selected effective PLMN/TAC."
 
-- name: "Verify NSSF slice {{ item.name }} (sst={{ item.sst }} sd={{ item.sd }})"
-  assert:
+- name: Build live Free5GC NSSF S-NSSAI identities
+  ansible.builtin.set_fact:
+    free5gc_live_nssf_snssai: >-
+      {{ (free5gc_live_nssf_snssai | default([])) +
+         [((item.sst | int | string) ~ ':' ~ (item.sd | string | lower))] }}
+  loop: "{{ free5gc_live_nssf_cfg.configuration.supportedNssaiInPlmnList[0].supportedSnssaiList }}"
+  loop_control:
+    label: "{{ item.sst }}:{{ item.sd }}"
+
+- name: Require every effective slice in live Free5GC NSSF
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "(item.sst | string) in nssf_cm.resources[0].data['nssfcfg.yaml']"
       - >-
-        item.sd == 'EMPTY' or
-        ('%06x' | format(item.sd | int(base=16))) in nssf_cm.resources[0].data['nssfcfg.yaml']
-    fail_msg: "NSSF configmap missing parameters for slice {{ item.name }}"
+        ((item.sst | int | string) ~ ':' ~
+         ('ffffff' if item.sd == 'EMPTY' else ('%06x' | format(item.sd | int(base=16)))))
+        in free5gc_live_nssf_snssai
+    fail_msg: "Live Free5GC NSSF is missing an effective slice."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-# ============================================================
-# UPFs
-# ============================================================
-- name: "Verify iupf1 slice {{ item.name }} (dnn={{ item.dnn }} prefix={{ item.ip_prefix }})"
-  assert:
+- name: Require every effective DNN and UE pool in live Free5GC iUPF1
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "item.dnn in iupf1_cm.resources[0].data['upfcfg.yaml']"
-      - "item.ip_prefix in iupf1_cm.resources[0].data['upfcfg.yaml']"
-    fail_msg: "iupf1 configmap missing dnn/cidr for slice {{ item.name }}"
+      - "{'dnn': item.dnn, 'cidr': item.ip_prefix ~ '.0/24'} in free5gc_live_iupf1_cfg.dnnList"
+    fail_msg: "Live Free5GC iUPF1 is missing an effective DNN or UE pool."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-- name: "Verify psaupf1 slice {{ item.name }} (dnn={{ item.dnn }} prefix={{ item.ip_prefix }})"
-  assert:
+- name: Require every effective DNN and UE pool in live Free5GC PSA-UPF1
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "item.dnn in psaupf1_cm.resources[0].data['upfcfg.yaml']"
-      - "item.ip_prefix in psaupf1_cm.resources[0].data['upfcfg.yaml']"
-    fail_msg: "psaupf1 configmap missing dnn/cidr for slice {{ item.name }}"
+      - "{'dnn': item.dnn, 'cidr': item.ip_prefix ~ '.0/25'} in free5gc_live_psaupf1_cfg.dnnList"
+    fail_msg: "Live Free5GC PSA-UPF1 is missing an effective DNN or UE pool."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-- name: "Verify psaupf2 slice {{ item.name }} (dnn={{ item.dnn }} prefix={{ item.ip_prefix }})"
-  assert:
+- name: Require every effective DNN and UE pool in live Free5GC PSA-UPF2
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "item.dnn in psaupf2_cm.resources[0].data['upfcfg.yaml']"
-      - "item.ip_prefix in psaupf2_cm.resources[0].data['upfcfg.yaml']"
-    fail_msg: "psaupf2 configmap missing dnn/cidr for slice {{ item.name }}"
+      - "{'dnn': item.dnn, 'cidr': item.ip_prefix ~ '.128/25'} in free5gc_live_psaupf2_cfg.dnnList"
+    fail_msg: "Live Free5GC PSA-UPF2 is missing an effective DNN or UE pool."
   loop: "{{ fiveg.slices }}"
+  loop_control:
+    label: "{{ item.name }}"
 
-# ============================================================
-# Pod status
-# ============================================================
-- name: Fetch all pods in free5gc namespace
+- name: Fetch all Free5GC namespace pods
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Pod
     namespace: "{{ core_ns }}"
   register: free5gc_pods
 
-- name: "Verify pod {{ item.metadata.name }} is Running and Ready"
-  assert:
+- name: Require Free5GC to have running workloads
+  ansible.builtin.assert:
+    quiet: true
     that:
-      - "item.status.phase == 'Running'"
+      - free5gc_pods.resources | length > 0
+    fail_msg: "Free5GC namespace contains no pods after Helm deployment."
+
+- name: Require every Free5GC pod to be Running and Ready
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.status.phase == 'Running'
+      - item.status.containerStatuses is defined
+      - item.status.containerStatuses | length > 0
       - >-
         item.status.containerStatuses |
         selectattr('ready', 'equalto', true) | list | length ==
         item.status.containerStatuses | length
-    fail_msg: "Pod {{ item.metadata.name }} is not Running/Ready (phase={{ item.status.phase }})"
+    fail_msg: "A Free5GC pod is not Running and Ready."
   loop: "{{ free5gc_pods.resources }}"
   loop_control:
     label: "{{ item.metadata.name }}"
 
-# ============================================================
-# MongoDB subscribers
-# ============================================================
-- name: Find add_subscribers.py path in dbpython pod
-  shell: |
-    kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      find / -name "add_subscribers.py" 2>/dev/null | head -1
-  register: subscribers_script_path
-  failed_when: false
+- name: Require the pinned Free5GC subscriber utility path
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - exec
+      - -n
+      - "{{ core_ns }}"
+      - deployment/free5gc-free5gc-dbpython-dbpython
+      - --
+      - test
+      - -f
+      - /free5gc/add_subscribers.py
   changed_when: false
 
-- name: Check MongoDB subscriber count
-  shell: |
+- name: Require every selected subscriber identity in Free5GC MongoDB
+  ansible.builtin.shell: |
+    set -euo pipefail
     kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      python3 {{ subscribers_script_path.stdout | trim }} -a list 2>/dev/null | \
-      tail -10
-  register: mongo_list_output
-  failed_when: false
+      python3 /free5gc/add_subscribers.py -a list | \
+      grep -Fq "imsi-{{ fiveg.plmn.mcc }}{{ fiveg.plmn.mnc }}{{ item.value.imsi_suffix }}"
+  args:
+    executable: /bin/bash
+  loop: "{{ fiveg.ues | dict2items }}"
+  loop_control:
+    label: selected-subscriber
   changed_when: false
-  when: subscribers_script_path.stdout | trim | length > 0
+  no_log: true
 
-- name: Parse MongoDB subscriber count
-  shell: |
-    kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
-      python3 {{ subscribers_script_path.stdout | trim }} -a list 2>/dev/null | \
-      grep "^subscriptionData.authenticationData.authenticationSubscription:" | \
-      tail -1 | awk -F': ' '{print $2}'
-  register: mongo_ue_count
-  failed_when: false
+- name: Read the Free5GC authentication-subscriber count without exposing records
+  ansible.builtin.shell: |
+    set -euo pipefail
+    count="$(
+      kubectl exec -n {{ core_ns }} deployment/free5gc-free5gc-dbpython-dbpython -- \
+        python3 /free5gc/add_subscribers.py -a list | \
+        awk -F': ' '$1 == "subscriptionData.authenticationData.authenticationSubscription" {print $2}' | \
+        tail -1
+    )"
+    test -n "$count"
+    printf '%s\n' "$count"
+  args:
+    executable: /bin/bash
+  register: free5gc_subscriber_count
   changed_when: false
-  when: subscribers_script_path.stdout | trim | length > 0
+  no_log: true
 
-- name: Report the Free5GC subscriber inventory
-  debug:
-    msg: "MongoDB list output: {{ mongo_list_output.stdout | default('N/A') }}"
-  when: subscribers_script_path.stdout | trim | length > 0
-
-- name: "Verify MongoDB subscriber count (expected={{ fiveg.ues | length }})"
-  assert:
-    that: "mongo_ue_count.stdout | trim | int == fiveg.ues | length"
+- name: Require exact Free5GC subscriber cardinality
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - free5gc_subscriber_count.stdout | trim | int == fiveg.ues | length
     fail_msg: >-
-      MongoDB has '{{ mongo_ue_count.stdout | trim }}' subscribers
-      but profile defines {{ fiveg.ues | length }} UEs
-  when:
-    - subscribers_script_path.stdout | trim | length > 0
-    - mongo_ue_count.stdout | trim | length > 0
-
-- name: Warn if MongoDB subscriber check could not run
-  debug:
-    msg: >-
-      WARNING: Could not verify MongoDB subscribers —
-      {% if subscribers_script_path.stdout | trim | length == 0 %}
-      add_subscribers.py not found in dbpython pod
-      {% else %}
-      script returned empty output
-      {% endif %}
-  when: >-
-    subscribers_script_path.stdout | trim | length == 0 or
-    mongo_ue_count.stdout | trim | length == 0
+      Free5GC subscriber cardinality does not match the selected effective
+      profile (expected {{ fiveg.ues | length }}).

@@ -1,15 +1,4 @@
 ---
-- name: Remove taint from node {{ target_node }}
-  ansible.builtin.command: >
-    kubectl taint node {{ target_node }} test-eviction=true:NoSchedule-
-  environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: taint_out
-  failed_when: >
-    taint_out.rc != 0 and
-    'not found' not in taint_out.stderr
-  changed_when: >
-    'untainted' in taint_out.stdout
-
-
-
+- name: Delegate worker untaint lifecycle to pinned 5g-Ansible
+  ansible.builtin.include_tasks:
+    file: "{{ synthran_reference_root }}/roles/setup/k8s/remove_taint/tasks/main.yml"

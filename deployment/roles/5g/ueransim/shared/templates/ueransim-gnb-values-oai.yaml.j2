@@ -13,11 +13,13 @@ global:
 gnb:
   enabled: true
 
+  # OAI/UERANSIM carries logical N2 and N3 over the same topology-selected
+  # compatibility attachment.
   n2if:
-    ipAddress: {{ net.gnb_n3_ip }}
+    ipAddress: {{ net.gnb_ip }}
 
   n3if:
-    ipAddress: {{ net.gnb_n3_ip }}
+    ipAddress: {{ net.gnb_ip }}
 
   amf:
     n2if:
@@ -40,19 +42,12 @@ gnb:
 {% endfor %}
     ignoreStreamIds: true
 
-    # USEFUL for GTP-U BIND
     linkIp: 0.0.0.0
-    ngapIp: {{ net.gnb_n3_ip }}
-
-    # Must match Multus N3 interface
-    gtpIp: {{ net.gnb_n3_ip }}
+    ngapIp: {{ net.gnb_ip }}
+    gtpIp: {{ net.gnb_ip }}
 
 ue:
   enabled: false
-
-# ============================================================
-# IMPORTANT : MUST MATCH gnb-deployment.yaml
-# ============================================================
 
 nodeSelector:
   kubernetes.io/hostname: "{{ ran_node_name }}"

@@ -1,310 +1,183 @@
 ---
-# ue_item stands for the UE name, defined in the inventory.
-# mode (mbim|qmi) comes from the inventory host vars; defaults to mbim.
-#
-# Every connectable UE (Quectel or phone) MUST be declared in fiveg.ues, so a
-# single resolved-network-profile presence gate covers both. Phones (hosts in
-# the [phones] group) are handled by a dedicated sub-branch: the SSH target IS
-# the Mac the handset is tethered to (ansible_host=macphoneN), and "connecting"
-# the UE just means turning airplane mode OFF over adb. APN/RAT are not set here.
+- name: Require one supported selected UE attachment contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ue_item == synthran_r2lab_ue.device
+      - synthran_r2lab_ue.tunnel.host == ue_item
+      - synthran_r2lab_ue.tunnel.interface == 'wwan0'
+      - synthran_r2lab_ue.tunnel.mode in ['mbim', 'qmi']
+      - >-
+        synthran_r2lab_ue.tunnel.mode != 'mbim' or
+        (synthran_r2lab_ue.tunnel.mbim_session | int) == 0
+      - >-
+        (hostvars[ue_item].mode | default(synthran_r2lab_ue.tunnel.mode)) ==
+        synthran_r2lab_ue.tunnel.mode
+    fail_msg: >-
+      The R2Lab attachment phase must consume exactly one selected deployment
+      contract entry on the supported wwan0 MBIM/QMI transport.
 
-- name: START_UE_CONNECT
-  ansible.builtin.meta: noop
+- name: Resolve selected UE attachment identity
+  ansible.builtin.set_fact:
+    ue_mode: "{{ synthran_r2lab_ue.tunnel.mode }}"
+    ue_interface: "{{ synthran_r2lab_ue.tunnel.interface }}"
+    current_dnn: "{{ synthran_r2lab_ue.dnn }}"
+    current_ue_slice: "{{ synthran_r2lab_ue.slice }}"
+    current_slice_sst: "{{ synthran_r2lab_ue.sst | string }}"
+    current_slice_sd: "{{ synthran_r2lab_ue.sd | string | upper }}"
+    upf_ip: >-
+      {{ synthran_r2lab_ue.address_cidr |
+         regex_replace('\.0/[0-9]+$', '.1') }}
 
-- name: Load resolved network profile variables
-  ansible.builtin.include_vars:
-    file: "{{ network_profile_file }}"
-    name: fiveg
+# Pure upstream attaches MBIM with the plain DNN. Physical qhat03 acceptance in
+# SynthRAN proved that RM500Q qhat-init exposes a real SST=1/SD context as
+# <dnn>_EMBB<sd>, and selecting the plain DNN makes the UE request SD FFFFFF.
+# Keep this narrow physical adapter while retaining the upstream helper lifecycle.
+- name: Require a supported slice-qualified MBIM context convention
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        ue_mode != 'mbim' or
+        current_slice_sd in ['EMPTY', 'FFFFFF'] or
+        (current_slice_sst | int) == 1
+    fail_msg: >-
+      R2Lab MBIM slice selection is only proven for the RM500Q SST=1 context
+      convention. Refusing to drop non-empty SD {{ current_slice_sd }} from
+      SST {{ current_slice_sst }} for {{ ue_item }}.
 
-- name: Resolve UE connection mode
-  set_fact:
-    ue_mode: "{{ hostvars[ue_item].mode | default('mbim') }}"
+- name: Resolve the modem access string for the selected slice
+  ansible.builtin.set_fact:
+    mbim_access_string: >-
+      {{ current_dnn ~ '_EMBB' ~ current_slice_sd
+         if ue_mode == 'mbim'
+            and current_slice_sd not in ['EMPTY', 'FFFFFF']
+            and (current_slice_sst | int) == 1
+         else current_dnn }}
 
-- name: Detect whether this UE is a phone
-  set_fact:
-    is_phone: "{{ ue_item in (groups['phones'] | default([])) }}"
+- name: Report selected UE attachment identity
+  ansible.builtin.debug:
+    msg: >-
+      UE {{ ue_item }} -> {{ current_ue_slice }} SST={{ current_slice_sst }}
+      SD={{ current_slice_sd }} DNN={{ current_dnn }} mode={{ ue_mode }}
+      MBIM-access={{ mbim_access_string }} interface={{ ue_interface }} UPF={{ upf_ip }}
 
-- name: "Skip {{ ue_item }} (not in resolved network profile)"
-  debug:
-    msg: "UE {{ ue_item }} is not in fiveg.ues - skipping connect."
-  when: fiveg.ues[ue_item] is not defined
+- name: Check selected UE user-plane reachability before mutating attachment
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    'ping -I {{ ue_interface }} -c 1 -W 3 {{ upf_ip }} >/dev/null 2>&1 && echo up || echo down'
+  args:
+    executable: /bin/bash
+  register: synthran_wwan_precheck
+  changed_when: false
+  failed_when: false
 
-- name: "Connect UE {{ ue_item }}"
-  when: fiveg.ues[ue_item] is defined
-  block:
-    # --- Shared profile resolution (used by both branches) ---------------
-    - name: Extract UE slice
-      set_fact:
-        current_ue_slice: "{{ fiveg.ues[ue_item].slice }}"
+- name: Record whether the selected UE is already reachable on its modem interface
+  ansible.builtin.set_fact:
+    wwan0_up: "{{ (synthran_wwan_precheck.stdout | default('down') | trim) == 'up' }}"
 
-    - name: Resolve selected slice definition
-      set_fact:
-        current_slice_config: "{{ fiveg.slices | selectattr('name', 'equalto', current_ue_slice) | first }}"
+- name: Attach the selected MBIM context with the installed R2Lab helpers
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    'stop.sh; start.sh -F {{ mbim_access_string }}'
+  args:
+    executable: /bin/bash
+  register: synthran_mbim_attach
+  changed_when: true
+  failed_when: false
+  when:
+    - ue_mode == 'mbim'
+    - not wwan0_up
 
-    - name: Extract DNN and normalize the selected slice SD
-      set_fact:
-        current_dnn: "{{ current_slice_config.dnn }}"
-        current_slice_sd: "{{ current_slice_config.sd | string | upper }}"
+- name: Read MBIM diagnostics when the helper fails
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    'qhat-check'
+  args:
+    executable: /bin/bash
+  register: synthran_mbim_attach_check
+  changed_when: false
+  failed_when: false
+  when:
+    - ue_mode == 'mbim'
+    - not wwan0_up
+    - (synthran_mbim_attach.rc | default(0)) != 0
 
-    - name: Require a supported slice-qualified MBIM context convention
-      assert:
-        quiet: true
-        that:
-          - ue_mode != 'mbim' or current_slice_sd in ['EMPTY', 'FFFFFF'] or (current_slice_config.sst | int) == 1
-        fail_msg: >-
-          R2Lab MBIM slice selection is only defined for the observed Quectel
-          SST=1 context convention. Refusing to drop non-empty SD {{ current_slice_sd }}
-          from SST {{ current_slice_config.sst }} for {{ ue_item }}.
+- name: Retain selected MBIM attachment helper evidence
+  ansible.builtin.copy:
+    content: |
+      phase=attach
+      device={{ ue_item }}
+      imsi={{ synthran_r2lab_ue.imsi }}
+      slice={{ current_ue_slice }}
+      sst={{ current_slice_sst }}
+      sd={{ current_slice_sd }}
+      dnn={{ current_dnn }}
+      mbim_access_string={{ mbim_access_string }}
+      interface={{ ue_interface }}
+      mode={{ ue_mode }}
+      mbim_session={{ synthran_r2lab_ue.tunnel.mbim_session | default('') }}
+      precheck_command=ping -I {{ ue_interface }} -c 1 -W 3 {{ upf_ip }}
+      precheck_result={{ synthran_wwan_precheck.stdout | default('') | trim }}
+      helper_command=stop.sh; start.sh -F {{ mbim_access_string }}
+      helper_rc={{ synthran_mbim_attach.rc | default('not-run') }}
+      helper_stdout={{ synthran_mbim_attach.stdout | default('') }}
+      helper_stderr={{ synthran_mbim_attach.stderr | default('') }}
+      qhat_check_rc={{ synthran_mbim_attach_check.rc | default('not-run') }}
+      qhat_check_stdout={{ synthran_mbim_attach_check.stdout | default('') }}
+      qhat_check_stderr={{ synthran_mbim_attach_check.stderr | default('') }}
+    dest: "{{ run_dir }}/r2lab-ue-{{ ue_item }}-attach.log"
+  delegate_to: localhost
+  become: false
+  when: ue_mode == 'mbim'
 
-    - name: Resolve the modem access string for the selected slice
-      set_fact:
-        mbim_access_string: >-
-          {{ current_dnn ~ '_EMBB' ~ current_slice_sd
-             if ue_mode == 'mbim'
-                and current_slice_sd not in ['EMPTY', 'FFFFFF']
-                and (current_slice_config.sst | int) == 1
-             else current_dnn }}
+- name: Require the selected MBIM helper to complete
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - wwan0_up or (synthran_mbim_attach.rc | default(1)) == 0
+    fail_msg: >-
+      MBIM attachment failed for {{ ue_item }} on DNN {{ current_dnn }} using
+      access context {{ mbim_access_string }}. See r2lab-ue-{{ ue_item }}-attach.log.
+      No retry or alternate-session recovery is performed by the lifecycle authority.
+  when: ue_mode == 'mbim'
 
-    - name: "Get UPF IP for this UE"
-      set_fact:
-        upf_ip: "{{ current_slice_config.ip_prefix }}.1"
+# Run the QMI invariant check even when the interface is already reachable. A
+# stale quectel-CM serving another DNN must never be accepted merely because a
+# previous session can still ping the selected endpoint. qmi.yml mutates only
+# when wwan0_up is false.
+- name: Validate or attach the selected QMI DNN with the upstream-style procedure
+  ansible.builtin.include_tasks: qmi.yml
+  when: ue_mode == 'qmi'
 
-    - name: "Debug: Show mode and UPF IP for current UE"
-      debug:
-        msg: >-
-          UE {{ ue_item }} -> phone={{ is_phone }} mode={{ ue_mode }}
-          DNN={{ current_dnn }} MBIM-access={{ mbim_access_string }} UPF={{ upf_ip }}
+- name: Wait for the selected UE IPv4 session on its modem interface
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    "ip -4 -o addr show dev {{ ue_interface }} scope global"
+  args:
+    executable: /bin/bash
+  register: synthran_ue_ip
+  changed_when: false
+  retries: "{{ 60 if ue_mode == 'qmi' else 5 }}"
+  delay: 2
+  until: (synthran_ue_ip.stdout | default('') | trim | length) > 0
 
-    # =====================================================================
-    # PHONE bring-up (adb over the tethering Mac, same SSH path as the other
-    # UEs -> no Python needed on the Mac). No wwan0/MBIM/QMI: the handset
-    # attaches over the air and gets its IP from the UPF once the radio is on.
-    # =====================================================================
-    - name: "Phone bring-up for {{ ue_item }}"
-      when: is_phone
-      block:
-        - name: "Phone: resolve adb / ssh parameters for {{ ue_item }}"
-          set_fact:
-            # ansible_user must be the macOS account that owns adb (e.g. 'tester').
-            phone_ssh: "{{ hostvars[ue_item].ansible_user | default('tester') }}@{{ hostvars[ue_item].ansible_host | default(ue_item) }}"
-            # Absolute adb path (ssh non-interactif -> minimal PATH on macOS).
-            adb_bin: "{{ hostvars[ue_item].adb_bin | default('adb') }}"
-            # serial= disambiguates several handsets sharing one Mac.
-            adb_opts: "{{ ('-s ' ~ hostvars[ue_item].serial) if (hostvars[ue_item].serial is defined and (hostvars[ue_item].serial | string | length) > 0) else '' }}"
+- name: Wait for the selected modem interface to be operational
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    'ip link show {{ ue_interface }}'
+  args:
+    executable: /bin/bash
+  register: synthran_ue_link
+  changed_when: false
+  retries: 10
+  delay: 2
+  until: "'UP' in (synthran_ue_link.stdout | default(''))"
 
-        - name: "Phone: check adb sees the handset on {{ ue_item }} ({{ phone_ssh }})"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -i /home/faraday/r2lab-embedded/mac-ssh-keys/macphone
-            {{ phone_ssh }}
-            '{{ adb_bin }} {{ adb_opts }} devices'
-          register: adb_devices
-          changed_when: false
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-
-        - name: "Phone: assert a handset is in 'device' state on {{ ue_item }}"
-          assert:
-            that:
-              - "adb_devices.stdout_lines | default([]) | select('search', 'device$') | list | length > 0"
-            fail_msg: >-
-              No handset in 'device' state for {{ ue_item }} via {{ phone_ssh }}.
-              Check USB cable / `adb devices` on the Mac; set serial= if several
-              phones share the host. adb output: {{ adb_devices.stdout | default('') | trim }}
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-
-        # Optional clean re-attach (set phone_force_reattach=true), e.g. after
-        # an APN/RAT change. Default = simple OFF.
-        - name: "Phone: airplane mode ON (force re-attach) on {{ ue_item }}"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -i /home/faraday/r2lab-embedded/mac-ssh-keys/macphone
-            {{ phone_ssh }}
-            '{{ adb_bin }} {{ adb_opts }} shell cmd connectivity airplane-mode enable'
-          changed_when: true
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-          when: phone_force_reattach | default(false)
-
-        - name: "Phone: settle before re-enabling the radio on {{ ue_item }}"
-          ansible.builtin.pause:
-            seconds: 3
-          when: phone_force_reattach | default(false)
-
-        - name: "Phone: airplane mode OFF (connect) on {{ ue_item }}"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -i /home/faraday/r2lab-embedded/mac-ssh-keys/macphone
-            {{ phone_ssh }}
-            '{{ adb_bin }} {{ adb_opts }} shell cmd connectivity airplane-mode disable'
-          changed_when: true
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-
-        - name: "Phone: verify airplane mode is OFF on {{ ue_item }}"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -i /home/faraday/r2lab-embedded/mac-ssh-keys/macphone
-            {{ phone_ssh }}
-            '{{ adb_bin }} {{ adb_opts }} shell settings get global airplane_mode_on'
-          register: phone_apm
-          until: "(phone_apm.stdout | default('') | trim) == '0'"
-          retries: 5
-          delay: 2
-          changed_when: false
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-
-        # Connectivity check now unconditional: upf_ip is always known.
-        - name: "Phone: ping UPF {{ upf_ip }} from {{ ue_item }}"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -i /home/faraday/r2lab-embedded/mac-ssh-keys/macphone
-            {{ phone_ssh }}
-            '{{ adb_bin }} {{ adb_opts }} shell ping -c 1 -W 3 {{ upf_ip }}'
-          register: phone_ping
-          until: phone_ping.rc == 0
-          retries: 15
-          delay: 4
-          changed_when: false
-          failed_when: false
-
-        - name: "Phone: connect result for {{ ue_item }}"
-          debug:
-            msg: >-
-              UE {{ ue_item }} -> airplane_mode_on={{ phone_apm.stdout | default('?') | trim }}
-              data={{ 'UP' if phone_ping.rc == 0 else 'not confirmed' }} (UPF {{ upf_ip }})
-
-    # =====================================================================
-    # QUECTEL bring-up (wwan0 via MBIM or QMI, then route to UPF).
-    # =====================================================================
-    - name: "Quectel bring-up for {{ ue_item }}"
-      when: not is_phone
-      block:
-        - name: Check wwan0 connectivity on {{ ue_item }} by pinging UPF
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no
-            root@{{ ue_item }}
-            "ping -I wwan0 -c 1 -W 3 {{ upf_ip }} > /dev/null 2>&1 && echo up || echo down"
-          register: check_wwan0
-          changed_when: false
-          ignore_errors: true
-
-        - name: Set wwan0 reachability flag
-          set_fact:
-            wwan0_up: "{{ (check_wwan0.stdout | default('down')) == 'up' }}"
-
-        - name: "Debug: wwan0 connectivity for {{ ue_item }}"
-          debug:
-            msg: "UE {{ ue_item }} -> wwan0={{ check_wwan0.stdout | default('unknown') }} UPF={{ upf_ip }}"
-
-        # -----------------------------------------------------------------
-        # MBIM bring-up
-        # -----------------------------------------------------------------
-        # qhat-init keeps the plain DNN context and, for SST=1 with a real SD,
-        # exposes the slice-qualified context as <dnn>_EMBB<sd>. Selecting the
-        # plain DNN loses the SD and the network sees FFFFFF instead.
-        - name: "MBIM: stop.sh + start.sh on {{ ue_item }} if wwan0 not reachable"
-          shell: >
-            ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no
-            root@{{ ue_item }}
-            'stop.sh; start.sh -F {{ mbim_access_string }}'
-          when:
-            - ue_mode == 'mbim'
-            - current_dnn is defined
-            - not wwan0_up
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-
-        # -----------------------------------------------------------------
-        # QMI bring-up (Quectel-CM + ci_ctl_qtel.py). IP can take up to ~2 min.
-        # -----------------------------------------------------------------
-        - name: "QMI bring-up for {{ ue_item }}"
-          when:
-            - ue_mode == 'qmi'
-            - not wwan0_up
-          ignore_errors: "{{ ignore_task_errors | default(true) }}"
-          block:
-            - name: "QMI: ensure quectel-CM is running on {{ ue_item }}"
-              # Absolute path: a non-interactive ssh has a minimal PATH and may
-              # not find quectel-CM, so the background launch silently did nothing.
-              shell: |
-                ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@{{ ue_item }} '
-                  if pgrep -x quectel-CM >/dev/null 2>&1; then echo running; exit 0; fi
-                  setsid /usr/local/bin/quectel-CM -s {{ current_dnn }} -4 </dev/null >/var/log/quectel-CM.log 2>&1 &
-                  sleep 3
-                  if pgrep -x quectel-CM >/dev/null 2>&1; then echo started; else echo FAILED; cat /var/log/quectel-CM.log 2>/dev/null; fi
-                '
-              register: cm_state
-              until: "'running' in cm_state.stdout or 'started' in cm_state.stdout"
-              retries: 10
-              delay: 5
-              changed_when: "'started' in cm_state.stdout"
-
-            # The AT port index is NOT stable (ttyUSB2 vs ttyUSB3 across re-enum),
-            # so probe for the port that answers AT instead of hardcoding it.
-            - name: "QMI: detect AT port on {{ ue_item }}"
-              shell: |
-                ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@{{ ue_item }} 'python3 -' <<'PYEOF'
-                import glob, serial, sys
-                for p in sorted(glob.glob('/dev/ttyUSB*')):
-                    try:
-                        s = serial.Serial(p, 115200, timeout=0.4)
-                        s.write(b'AT\r'); r = s.read(64); s.close()
-                        if b'OK' in r:
-                            print(p); sys.exit(0)
-                    except Exception:
-                        pass
-                sys.exit(1)
-                PYEOF
-              register: at_detect
-              changed_when: false
-              failed_when: false
-
-            - name: "QMI: resolve AT port for {{ ue_item }}"
-              # inventory at_port wins; otherwise use the probed port
-              set_fact:
-                qmi_at_port: "{{ hostvars[ue_item].at_port | default(at_detect.stdout | trim, true) }}"
-
-            - name: "QMI: warn if no AT port found on {{ ue_item }}"
-              debug:
-                msg: "No AT port answered on {{ ue_item }} - skipping detach/wup."
-              when: qmi_at_port | length == 0
-
-            - name: "QMI: detach UE {{ ue_item }}"
-              shell: >
-                ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no
-                root@{{ ue_item }}
-                'python3 /usr/local/bin/ci_ctl_qtel.py {{ qmi_at_port }} detach'
-              when: qmi_at_port | length > 0
-              changed_when: false
-
-            - name: "QMI: wake up (wup) UE {{ ue_item }}"
-              shell: >
-                ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no
-                root@{{ ue_item }}
-                'python3 /usr/local/bin/ci_ctl_qtel.py {{ qmi_at_port }} wup'
-              when: qmi_at_port | length > 0
-              changed_when: false
-
-        # -----------------------------------------------------------------
-        # Common: wait for IP / link, install route.
-        # QMI needs a much longer window (up to ~2 min) to acquire an IP.
-        # -----------------------------------------------------------------
-        - name: Retrieve wwan0 IP for {{ ue_item }}
-          shell: |
-            ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }} \
-            "ip -4 addr show wwan0 | grep -oP '(?<=inet\s)\d+(\.(\d+)){3}'"
-          register: ue_ip_cmd
-          until: ue_ip_cmd.stdout != ""
-          retries: "{{ 60 if ue_mode == 'qmi' else 5 }}"
-          delay: 2
-          changed_when: false
-          ignore_errors: true
-
-        - name: Wait until wwan0 interface is fully up
-          shell: ssh root@{{ ue_item }} "ip link show wwan0"
-          register: wwan0_status
-          retries: 10
-          delay: 2
-          until: "'UP' in wwan0_status.stdout"
-          changed_when: false
-          ignore_errors: true
-          when: ue_ip_cmd.stdout | default('') != ''
-
-        - name: Add route to UPF IP when wwan0 is ready
-          shell: |
-            ssh -o BatchMode=yes root@{{ ue_item }} "ip route replace {{ upf_ip }} dev wwan0"
-          changed_when: false
-          ignore_errors: true
-          when: ue_ip_cmd.stdout | default('') != ''
+- name: Route the selected UPF endpoint through the modem interface
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ ue_item }}
+    'ip route replace {{ upf_ip }} dev {{ ue_interface }}'
+  args:
+    executable: /bin/bash
+  changed_when: true

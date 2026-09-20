@@ -1,0 +1,169 @@
+---
+- name: Require one supported selected UE preparation contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_r2lab_ue.device in all_ues
+      - synthran_r2lab_ue.tunnel.host == synthran_r2lab_ue.device
+      - synthran_r2lab_ue.tunnel.interface == 'wwan0'
+      - synthran_r2lab_ue.tunnel.mode in ['mbim', 'qmi']
+      - >-
+        synthran_r2lab_ue.tunnel.mode != 'mbim' or
+        (synthran_r2lab_ue.tunnel.mbim_session | int) == 0
+      - synthran_r2lab_ue.dnn | length > 0
+      - synthran_r2lab_ue.sst | string | length > 0
+      - synthran_r2lab_ue.sd | string | length > 0
+      - >-
+        synthran_r2lab_ue.tunnel.mode != 'mbim' or
+        (synthran_r2lab_ue.sd | string | upper) in ['EMPTY', 'FFFFFF'] or
+        (synthran_r2lab_ue.sst | int) == 1
+    fail_msg: >-
+      The R2Lab preparation phase only supports the selected qhat/qfit contract
+      on wwan0, using MBIM session 0 or the QMI transport. Slice-qualified MBIM
+      preparation is only proven for the RM500Q SST=1 context convention.
+
+- name: Resolve selected UE preparation identity
+  ansible.builtin.set_fact:
+    synthran_prepare_device: "{{ synthran_r2lab_ue.device }}"
+    synthran_prepare_mode: "{{ synthran_r2lab_ue.tunnel.mode }}"
+    synthran_prepare_dnn: "{{ synthran_r2lab_ue.dnn }}"
+    synthran_prepare_sd: "{{ synthran_r2lab_ue.sd | string | upper }}"
+    synthran_prepare_nssai: >-
+      {{ ('%02d' | format(synthran_r2lab_ue.sst | int))
+         if (synthran_r2lab_ue.sd | string | upper) in ['EMPTY', 'FFFFFF']
+         else (('%02d' | format(synthran_r2lab_ue.sst | int)) ~ '.' ~
+               (synthran_r2lab_ue.sd | string | upper)) }}
+
+- name: Initialize the selected UE DNN and S-NSSAI with qhat-init
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ synthran_prepare_device }}
+    'qhat-init --mode={{ synthran_prepare_mode }}
+    --dnn={{ synthran_prepare_dnn }} --nssai={{ synthran_prepare_nssai }}'
+  args:
+    executable: /bin/bash
+  register: synthran_prepare_init
+  changed_when: true
+  failed_when: false
+  async: 1800
+  poll: 5
+
+- name: Detect the selected QMI UE AT port after initialization
+  ansible.builtin.shell: |
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ synthran_prepare_device }} 'python3 -' <<'PYEOF'
+    import glob
+    import serial
+    import sys
+
+    for port in sorted(glob.glob('/dev/ttyUSB*')):
+        try:
+            with serial.Serial(port, 115200, timeout=0.4) as modem:
+                modem.write(b'AT\r')
+                response = modem.read(64)
+            if b'OK' in response:
+                print(port)
+                sys.exit(0)
+        except Exception:
+            pass
+    sys.exit(1)
+    PYEOF
+  args:
+    executable: /bin/bash
+  register: synthran_prepare_at_detect
+  changed_when: false
+  failed_when: false
+  when:
+    - synthran_prepare_mode == 'qmi'
+    - hostvars[synthran_prepare_device].at_port is not defined
+
+- name: Resolve the selected QMI UE AT control port
+  ansible.builtin.set_fact:
+    synthran_prepare_qmi_at_port: >-
+      {{ hostvars[synthran_prepare_device].at_port |
+         default(synthran_prepare_at_detect.stdout | default('') | trim, true) }}
+  when: synthran_prepare_mode == 'qmi'
+
+- name: Detach the prepared MBIM UE before RAN attachment
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ synthran_prepare_device }}
+    'stop.sh'
+  args:
+    executable: /bin/bash
+  register: synthran_prepare_mbim_detach
+  changed_when: true
+  failed_when: false
+  when: synthran_prepare_mode == 'mbim'
+
+- name: Detach the prepared QMI UE before RAN attachment
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ synthran_prepare_device }}
+    'python3 /usr/local/bin/ci_ctl_qtel.py {{ synthran_prepare_qmi_at_port }} detach'
+  args:
+    executable: /bin/bash
+  register: synthran_prepare_qmi_detach
+  changed_when: true
+  failed_when: false
+  when:
+    - synthran_prepare_mode == 'qmi'
+    - synthran_prepare_qmi_at_port | default('') | length > 0
+
+- name: Read prepared UE diagnostics without attaching it
+  ansible.builtin.shell: >-
+    ssh -o ConnectTimeout=5 -o BatchMode=yes root@{{ synthran_prepare_device }}
+    'qhat-check'
+  args:
+    executable: /bin/bash
+  register: synthran_prepare_check
+  changed_when: false
+  failed_when: false
+
+- name: Retain selected UE preparation helper evidence
+  ansible.builtin.copy:
+    content: |
+      phase=prepare
+      device={{ synthran_prepare_device }}
+      imsi={{ synthran_r2lab_ue.imsi }}
+      slice={{ synthran_r2lab_ue.slice }}
+      sst={{ synthran_r2lab_ue.sst }}
+      sd={{ synthran_r2lab_ue.sd }}
+      dnn={{ synthran_prepare_dnn }}
+      interface={{ synthran_r2lab_ue.tunnel.interface }}
+      mode={{ synthran_prepare_mode }}
+      mbim_session={{ synthran_r2lab_ue.tunnel.mbim_session | default('') }}
+      qhat_init_command=qhat-init --mode={{ synthran_prepare_mode }} --dnn={{ synthran_prepare_dnn }} --nssai={{ synthran_prepare_nssai }}
+      qhat_init_rc={{ synthran_prepare_init.rc | default('unavailable') }}
+      qhat_init_stdout={{ synthran_prepare_init.stdout | default('') }}
+      qhat_init_stderr={{ synthran_prepare_init.stderr | default('') }}
+      qmi_at_port={{ synthran_prepare_qmi_at_port | default('') }}
+      qmi_at_probe_rc={{ synthran_prepare_at_detect.rc | default('not-run') }}
+      qmi_at_probe_stdout={{ synthran_prepare_at_detect.stdout | default('') }}
+      qmi_at_probe_stderr={{ synthran_prepare_at_detect.stderr | default('') }}
+      detach_command={{ 'stop.sh' if synthran_prepare_mode == 'mbim' else ('python3 /usr/local/bin/ci_ctl_qtel.py ' ~ (synthran_prepare_qmi_at_port | default('')) ~ ' detach') }}
+      detach_rc={{ synthran_prepare_mbim_detach.rc | default(synthran_prepare_qmi_detach.rc | default('unavailable')) }}
+      detach_stdout={{ synthran_prepare_mbim_detach.stdout | default(synthran_prepare_qmi_detach.stdout | default('')) }}
+      detach_stderr={{ synthran_prepare_mbim_detach.stderr | default(synthran_prepare_qmi_detach.stderr | default('')) }}
+      qhat_check_command=qhat-check
+      qhat_check_rc={{ synthran_prepare_check.rc | default('unavailable') }}
+      qhat_check_stdout={{ synthran_prepare_check.stdout | default('') }}
+      qhat_check_stderr={{ synthran_prepare_check.stderr | default('') }}
+    dest: "{{ run_dir }}/r2lab-ue-{{ synthran_prepare_device }}-prepare.log"
+  delegate_to: localhost
+  become: false
+
+- name: Require selected UE preparation to complete
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_prepare_init.rc == 0
+      - >-
+        synthran_prepare_mode != 'mbim' or
+        (synthran_prepare_mbim_detach.rc | default(1)) == 0
+      - >-
+        synthran_prepare_mode != 'qmi' or
+        (synthran_prepare_qmi_at_port | default('') | length > 0)
+      - >-
+        synthran_prepare_mode != 'qmi' or
+        (synthran_prepare_qmi_detach.rc | default(1)) == 0
+    fail_msg: >-
+      R2Lab UE preparation failed for {{ synthran_prepare_device }}. See
+      r2lab-ue-{{ synthran_prepare_device }}-prepare.log. The deployment will
+      not continue with a partially initialized or still-attached selected UE.

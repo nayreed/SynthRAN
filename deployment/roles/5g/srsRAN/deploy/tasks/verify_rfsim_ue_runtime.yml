@@ -1,0 +1,158 @@
+---
+- name: Read the deployed RFSIM srsUE workload
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ ran_ns }}"
+    label_selectors: "{{ srs_ue_label_selectors }}"
+  register: synthran_srsue_live_pod
+  changed_when: false
+
+- name: Require one unambiguous reference-deployed RFSIM UE pod
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsue_live_pod.resources | length == 1
+      - synthran_srsue_live_pod.resources[0].metadata.name == ue_pod_name
+    fail_msg: >-
+      The reference-deployed RFSIM srsUE workload is missing, ambiguous, or no
+      longer matches the pod selected by the pinned lifecycle.
+
+- name: Resolve configured and live srsUE container identity
+  ansible.builtin.set_fact:
+    synthran_srsue_configured_images: >-
+      {{ synthran_srsue_live_pod.resources[0].spec.containers | default([]) |
+         selectattr('name', 'equalto', 'ue') | map(attribute='image') | list }}
+    synthran_srsue_live_statuses: >-
+      {{ synthran_srsue_live_pod.resources[0].status.containerStatuses | default([]) |
+         selectattr('name', 'equalto', 'ue') | list }}
+
+- name: Require exactly one configured and live srsUE container
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsue_configured_images | length == 1
+      - synthran_srsue_live_statuses | length == 1
+    fail_msg: >-
+      The deployed RFSIM pod does not expose exactly one configured/live `ue`
+      container.
+
+- name: Resolve configured and live srsUE image digests
+  ansible.builtin.set_fact:
+    synthran_srsue_expected_digest: >-
+      {{ synthran_srsue_image_reference |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+    synthran_srsue_live_image_id: >-
+      {{ synthran_srsue_live_statuses[0].imageID | default('') }}
+
+- name: Extract the live srsUE image digest
+  ansible.builtin.set_fact:
+    synthran_srsue_live_digest: >-
+      {{ synthran_srsue_live_image_id |
+         regex_search('sha256:[0-9a-f]{64}') | default('', true) }}
+
+- name: Require the live RFSIM UE workload to match the rendered contract
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_srsue_configured_images[0] == synthran_srsue_image_reference
+      - synthran_srsue_live_statuses[0].ready | default(false) | bool
+      - synthran_srsue_expected_digest | length > 0
+      - synthran_srsue_live_digest | length > 0
+      - ue_list | length == (ue_count | int)
+      - >-
+        (ue_list | map(attribute='index') | map('int') | list) ==
+        (synthran_ue_map | map(attribute='index') | map('int') | list)
+    fail_msg: >-
+      The deployed RFSIM srsUE pod does not match the selected-UE/image contract.
+      The pod spec must retain the exact immutable configured image reference and
+      the running container must expose a digest-qualified imageID.
+
+- name: Verify baked RFSIM runtime prerequisites
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ ue_pod_name }}"
+      - --
+      - /bin/bash
+      - -lc
+      - >-
+        command -v tmux >/dev/null &&
+        command -v python3 >/dev/null &&
+        command -v ip >/dev/null &&
+        python3 -c 'from gnuradio import gr, zeromq, blocks'
+  register: synthran_srsue_runtime_prerequisites
+  changed_when: false
+
+- name: Ensure the RFSIM tmux session exists without runtime package mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ ue_pod_name }}"
+      - --
+      - /bin/bash
+      - -lc
+      - >-
+        if tmux has-session -t ran 2>/dev/null; then
+          printf '%s\n' existing;
+        else
+          tmux new-session -d -s ran && printf '%s\n' created;
+        fi
+  register: synthran_srsue_tmux_session
+  changed_when: "'created' in synthran_srsue_tmux_session.stdout"
+
+- name: Require a usable RFSIM tmux session
+  ansible.builtin.command:
+    argv:
+      - "{{ kubectl_bin }}"
+      - -n
+      - "{{ ran_ns }}"
+      - exec
+      - "{{ ue_pod_name }}"
+      - --
+      - tmux
+      - has-session
+      - -t
+      - ran
+  register: synthran_srsue_tmux_verified
+  changed_when: false
+
+- name: Ensure the shareable srsRAN provenance directory exists
+  ansible.builtin.file:
+    path: "{{ run_dir }}/provenance"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  become: false
+
+- name: Retain verified RFSIM UE runtime provenance
+  ansible.builtin.copy:
+    dest: "{{ run_dir }}/provenance/srsran-rfsim-ue-runtime.json"
+    mode: '0644'
+    content: >-
+      {{ {
+           'schema_version': 4,
+           'chart_repository': repo_url,
+           'chart_revision': version,
+           'source_repository': synthran_srsue_image_source.repository,
+           'source_tag': synthran_srsue_image_source.tag,
+           'configured_image': synthran_srsue_image_reference,
+           'pod_spec_image': synthran_srsue_configured_images[0],
+           'live_image_id': synthran_srsue_live_image_id,
+           'configured_image_digest': synthran_srsue_expected_digest,
+           'live_image_digest': synthran_srsue_live_digest,
+           'pod': ue_pod_name,
+           'pod_uid': synthran_srsue_live_pod.resources[0].metadata.uid,
+           'runtime_prerequisites_verified': synthran_srsue_runtime_prerequisites.rc == 0,
+           'tmux_session': 'ran',
+           'tmux_session_verified': synthran_srsue_tmux_verified.rc == 0,
+           'ue_count': ue_count | int,
+           'selected_ues': ue_list
+         } | to_nice_json }}
+  delegate_to: localhost
+  become: false

@@ -1,0 +1,47 @@
+{
+  "schema": "synthran/5g-ansible-host-bootstrap-adaptations/v1",
+  "reference_commit": "b73fccf87f55060484b3759e9cb347222253534b",
+  "delegated_roles": [
+    "setup/containerd",
+    "setup/storage",
+    "setup/k8s/add_taint",
+    "setup/k8s/remove_cp_taint",
+    "setup/k8s/remove_taint"
+  ],
+  "local_adaptations": {
+    "setup/common": [
+      "Do not start cni-dhcp before /opt/cni/bin/dhcp exists.",
+      "Retain SynthRAN host-safety and idempotence handling."
+    ],
+    "setup/netplan": [
+      "Accept controller-selected netplan_config_file instead of reference-relative host files.",
+      "Install generated netplan with mode 0600."
+    ],
+    "setup/pre_k8s": [
+      "Own only the selected containerd storage binding before Kubernetes installation.",
+      "Bind a containerd subdirectory when the selected device is already mounted elsewhere; mount an unmounted device directly only when it is already ext4.",
+      "Never format storage implicitly and never pre-create kubeadm-generated kubelet configuration."
+    ],
+    "setup/k8s/k8s_setup": [
+      "Consume SynthRAN's version-pinned Kubernetes baseline instead of the reference hardcoded package version."
+    ],
+    "setup/k8s/cluster_create": [
+      "Consume the storage binding established by pre_k8s instead of unmounting/remounting it after kubeadm reset.",
+      "Patch kubeadm-generated kubelet configuration once, after kubeadm init.",
+      "Install checksum-pinned CNI plugins before cni-dhcp can start.",
+      "Create generated join material directly under the private execution tree at mode 0600 with no_log."
+    ],
+    "setup/k8s/cluster_join": [
+      "Use checksum-pinned CNI plugins.",
+      "Move admin and join material only through the private execution tree with restrictive permissions.",
+      "Do not recreate the stale on-disk kube-proxy config compatibility shim."
+    ],
+    "setup/k8s/cni_dhcp": [
+      "SynthRAN-only ordering adapter: require executable /opt/cni/bin/dhcp before service installation/start."
+    ]
+  },
+  "caller_policy": {
+    "fresh": "May run host/runtime/storage/Kubernetes mutation roles after resource preparation and records shareable mount, CNI daemon and registered-node evidence.",
+    "preserve": "Verification-only; must not run reset, storage mutation, package installation, cluster creation, join, taint, or tuning roles."
+  }
+}

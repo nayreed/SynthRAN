@@ -10,23 +10,24 @@ from pathlib import Path
 import shlex
 import shutil
 import socket
+import sys
 
 import yaml
 
-from .deployment_state import build_manifest, build_ue_map, content_hash
+from .deployment_identity import write_execution_manifest
+from .deployment_state import (
+    build_manifest,
+    build_ue_map,
+    content_hash,
+    resolve_user_plane_targets,
+)
 from .profile_validation import validate_network_profile, validate_ue_catalog
-from .r2lab import access
+from .r2lab import access, ssh_options
 from .scenario import redacted
 
 
 def resolve_network_profile(d: dict) -> tuple[dict, str]:
-    """Build the effective network profile for only the selected UEs.
-
-    Network policy (PLMN/DNN/slices/QoS/security) is independent of UE identity.
-    Stable UE identity/transport metadata comes from the UE catalog, while the
-    scenario explicitly assigns one slice from the selected network profile to
-    every selected UE.
-    """
+    """Build the effective network profile for only the selected UEs."""
     profile_name = d["network_profile"]
     profile_source = Path(
         d.get("network_profile_file")
@@ -112,23 +113,19 @@ def render_inventory(
     children["faraday"] = {"hosts": {}}
     if d["platform"] == "r2lab":
         settings = access(d)
-        ssh = [
-            "ssh",
-            "-o",
-            f"UserKnownHostsFile={faraday_known_hosts}",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-        ]
-        if settings["identity_file"]:
-            ssh += ["-i", settings["identity_file"]]
+        gateway_options = ssh_options(
+            settings["host"],
+            faraday_known_hosts,
+            settings["identity_file"],
+        )
         target = (
             settings["username"] + "@" if settings["username"] else ""
         ) + settings["host"]
-        proxy = shlex.join(ssh + ["-W", "%h:%p", target])
+        proxy = shlex.join(["ssh", *gateway_options, "-W", "%h:%p", target])
         faraday_vars = {
             "ansible_host": settings["host"],
             "ansible_python_interpreter": "/usr/bin/python3",
-            "ansible_ssh_common_args": _ssh_common_args(faraday_known_hosts),
+            "ansible_ssh_common_args": shlex.join(gateway_options),
         }
         if settings["username"]:
             faraday_vars["ansible_user"] = settings["username"]
@@ -207,6 +204,7 @@ def main(argv=None):
         controller_known_hosts.resolve(),
         faraday_known_hosts,
     )
+
     private_inventory_path = private_dir / "inventory.yml"
     private_inventory_path.write_text(yaml.safe_dump(raw_inventory, sort_keys=False))
     private_inventory_path.chmod(0o600)
@@ -241,6 +239,7 @@ def main(argv=None):
         n2.pop("amf_ip_split")
 
     topology["contract_version"] = topologies["schema_version"]
+    ue_map = resolve_user_plane_targets(c, profile, ue_map, topology)
     manifest = build_manifest(c, profile, ue_map, topology)
     selected = manifest["deployment"]
     for key in ("ansible_vars", "host_vars"):
@@ -250,9 +249,27 @@ def main(argv=None):
     manifest_path = Path(args.run_dir, "deployment-fingerprint.json")
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
+    context = private_dir / "ansible"
+    shutil.copytree("deployment/playbooks", context / "playbooks", dirs_exist_ok=True)
+    shutil.copytree("deployment/group_vars", context / "group_vars", dirs_exist_ok=True)
+    shutil.copytree("deployment/roles", context / "roles", dirs_exist_ok=True)
+    shutil.copytree("deployment/scripts", context / "scripts", dirs_exist_ok=True)
+    shutil.copyfile("deployment/ansible.cfg", context / "ansible.cfg")
+    (context / "reference").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(
+        "third_party/sopnode-5g-ansible/EXECUTION_REFERENCE.json",
+        context / "reference/EXECUTION_REFERENCE.json",
+    )
+    write_execution_manifest(selected, context, args.run_dir / "execution-manifest.json")
+
     variables = {
         **d.get("ansible_vars", {}),
         "synthran_root": str(Path.cwd()),
+        "synthran_controller_python": sys.executable,
+        "synthran_execution_root": str(context.resolve()),
+        "synthran_execution_reference_file": str(
+            (context / "reference/EXECUTION_REFERENCE.json").resolve()
+        ),
         "core": d["core"],
         "ran": "srsRAN" if d["ran"].lower() == "srsran" else d["ran"],
         "rru": "rfsim" if d["platform"] == "rfsim" else d.get("ru", d["platform"]),
@@ -279,17 +296,6 @@ def main(argv=None):
     Path(args.run_dir, "deployment-vars.yml").write_text(
         yaml.safe_dump(redacted(variables), sort_keys=False)
     )
-
-    context = private_dir / "ansible"
-    shutil.copytree("deployment/playbooks", context / "playbooks", dirs_exist_ok=True)
-    shutil.copytree("deployment/group_vars", context / "group_vars", dirs_exist_ok=True)
-    shutil.copyfile(
-        effective_profile_path, context / "group_vars/all/network_profile_resolved.yaml"
-    )
-    if not (context / "roles").exists():
-        (context / "roles").symlink_to(
-            Path("deployment/roles").resolve(), target_is_directory=True
-        )
 
 
 if __name__ == "__main__":

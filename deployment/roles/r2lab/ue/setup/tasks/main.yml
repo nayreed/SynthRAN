@@ -1,95 +1,145 @@
 ---
-- name: START_UE_SETUP
-  ansible.builtin.meta: noop
-
-- name: Build UE lists
+- name: Resolve the selected physical UE set from the deployment contract
   ansible.builtin.set_fact:
-    all_ues: "{{ (groups['qhats'] | default([])) + (groups['qfits'] | default([])) }}"
+    all_ues: "{{ synthran_ue_map | map(attribute='device') | list }}"
 
-- name: Power OFF QHAT UEs
+- name: Require inventory membership for every selected R2Lab UE
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - all_ues | unique | length == all_ues | length
+      - >-
+        all_ues | difference(
+          (groups['qhats'] | default([])) + (groups['qfits'] | default([]))
+        ) | length == 0
+    fail_msg: >-
+      The selected R2Lab UE contract must map one-to-one onto the rendered
+      qhat/qfit inventory groups.
+
+- name: Split selected UEs by R2Lab hardware class
+  ansible.builtin.set_fact:
+    selected_qhats: "{{ all_ues | intersect(groups['qhats'] | default([])) }}"
+    selected_qfits: "{{ all_ues | intersect(groups['qfits'] | default([])) }}"
+
+- name: Power OFF selected QHAT UEs
   ansible.builtin.shell: rhubarbe pdu off "{{ item }}"
   delegate_to: faraday.inria.fr
   async: 1800
   poll: 0
   failed_when: false
   changed_when: false
-  loop: "{{ groups['qhats'] | default([]) }}"
+  loop: "{{ selected_qhats }}"
   register: qhat_off_jobs
 
-- name: Power OFF QFIT UEs
-  ansible.builtin.shell: qfit off {{ groups['qfits'] | join(' ') }}
+- name: Wait for selected QHAT power-off completion
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  register: qhat_off_status
+  until: qhat_off_status.finished
+  retries: 60
+  delay: 5
+  failed_when: false
+  changed_when: false
+  loop: "{{ qhat_off_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default(item.ansible_job_id) }}"
+
+- name: Retain selected QHAT power-off evidence
+  ansible.builtin.copy:
+    content: |
+      device={{ item.item.item | default('unknown') }}
+      command=rhubarbe pdu off {{ item.item.item | default('unknown') }}
+      rhubarbe_status_contract=0:ON,1:OFF,255:failure
+      expected_rc=1
+      finished={{ item.finished | default(false) }}
+      rc={{ item.rc | default('not-finished') }}
+      stdout={{ item.stdout | default('') }}
+      stderr={{ item.stderr | default('') }}
+    dest: "{{ run_dir }}/r2lab-ue-{{ item.item.item | default('unknown') }}-setup-power-off.log"
+  delegate_to: localhost
+  become: false
+  loop: "{{ qhat_off_status.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item | default('selected-qhat') }}"
+
+- name: Require every selected QHAT to reach the OFF terminal state
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.finished | default(false) | bool
+      - (item.rc | default(255) | int) == 1
+    fail_msg: >-
+      Selected QHAT {{ item.item.item | default('unknown') }} did not complete
+      its Rhubarbe power-off transition. Rhubarbe device actions use
+      0=ON, 1=OFF, 255=failure; refusing to power the UE back on until the
+      selected device has reached the OFF terminal state.
+  loop: "{{ qhat_off_status.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item | default('selected-qhat') }}"
+
+- name: Power OFF selected QFIT UEs
+  ansible.builtin.shell: qfit off {{ selected_qfits | join(' ') }}
   delegate_to: faraday.inria.fr
-  when: groups['qfits'] is defined and groups['qfits'] | length > 0
+  when: selected_qfits | length > 0
   failed_when: false
   changed_when: false
 
-- name: Wait for UE power-off
+- name: Allow selected UE power rails to settle after confirmed power-off
   ansible.builtin.pause:
     seconds: 20
+  when: all_ues | length > 0
 
-- name: Power ON QHAT UEs
+- name: Power ON selected QHAT UEs
   ansible.builtin.shell: rhubarbe pdu on "{{ item }}"
   delegate_to: faraday.inria.fr
   async: 1800
   poll: 0
-  loop: "{{ groups['qhats'] | default([]) }}"
+  loop: "{{ selected_qhats }}"
   register: qhat_on_jobs
 
-- name: Wait QHAT ON completion
+- name: Wait for selected QHAT power-on completion
   ansible.builtin.async_status:
     jid: "{{ item.ansible_job_id }}"
   register: qhat_on_status
   until: qhat_on_status.finished
   retries: 12
   delay: 5
-  loop: "{{ qhat_on_jobs.results }}"
+  loop: "{{ qhat_on_jobs.results | default([]) }}"
 
-- name: Power ON QFIT UEs
-  ansible.builtin.shell: qfit on {{ groups['qfits'] | join(' ') }}
+- name: Power ON selected QFIT UEs
+  ansible.builtin.shell: qfit on {{ selected_qfits | join(' ') }}
   delegate_to: faraday.inria.fr
-  when: groups['qfits'] is defined and groups['qfits'] | length > 0
+  when: selected_qfits | length > 0
 
-- name: Ping UEs
-  ansible.builtin.shell: "ping -c1 -W1 {{ item }}"
+- name: Wait for every selected UE to answer on the management network
+  ansible.builtin.command: "ping -c1 -W1 {{ item }}"
   delegate_to: faraday.inria.fr
-  register: ping_results
-  ignore_errors: true
+  register: synthran_ue_ping
   changed_when: false
   retries: 12
   delay: 10
-  until: ping_results.rc == 0
+  until: synthran_ue_ping.rc == 0
   loop: "{{ all_ues }}"
+  loop_control:
+    label: "{{ item }}"
 
-- name: Build reachable UEs
-  ansible.builtin.set_fact:
-    reachable_ues: >-
-      {{
-        ping_results.results
-        | selectattr('rc', 'defined')
-        | selectattr('rc', 'equalto', 0)
-        | map(attribute='item')
-        | list
-      }}
-
-- name: SSH check
+- name: Wait for every selected UE SSH endpoint
   ansible.builtin.wait_for:
     host: "{{ item }}"
     port: 22
-    timeout: 20
+    connect_timeout: 5
+    timeout: 120
   delegate_to: faraday.inria.fr
-  register: ssh_results
-  ignore_errors: true
-  loop: "{{ reachable_ues }}"
+  loop: "{{ all_ues }}"
+  loop_control:
+    label: "{{ item }}"
 
-- name: Compute failed UEs
-  ansible.builtin.set_fact:
-    failed_ues: "{{ all_ues | difference(reachable_ues) }}"
-
-- name: Report failed UEs
-  ansible.builtin.debug:
-    msg: "UEs not reachable after boot: {{ failed_ues }}"
-  when: failed_ues | length > 0
-
-# This role deliberately stops at power/host readiness. Network-specific modem
-# initialization is owned by provision_r2lab.yml and actual attachment by
-# r2lab/ue/connect.
+- name: Initialize and detach each selected UE from its contract identity
+  ansible.builtin.include_tasks: prepare_one.yml
+  loop: "{{ synthran_ue_map }}"
+  loop_control:
+    loop_var: synthran_r2lab_ue
+    label: >-
+      {{ synthran_r2lab_ue.device }} -> {{ synthran_r2lab_ue.slice }} /
+      {{ synthran_r2lab_ue.dnn }} / SST={{ synthran_r2lab_ue.sst }}
+      SD={{ synthran_r2lab_ue.sd }}

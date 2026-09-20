@@ -14,13 +14,13 @@ spec:
       "cniVersion": "0.3.1",
       "name": "n3network-ueransim-gnb",
       "type": "ovs",
-      "bridge": "{{ net.n3_bridge }}",
+      "bridge": "{{ synthran_topology.transport.workload_interfaces.ran.n3 }}",
       "mtu": 1500,
       "ipam": {
         "type": "static",
         "addresses": [
           {
-            "address": "{{ net.gnb_n3_ip }}/24"
+            "address": "{{ net.gnb_ip }}/24"
           }
         ]
       }

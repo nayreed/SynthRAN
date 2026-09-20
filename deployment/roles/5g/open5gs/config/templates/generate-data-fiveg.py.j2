@@ -7,10 +7,14 @@ import os
 yaml = YAML()
 yaml.default_flow_style = False
 
+# Subscriber credentials are materialized on the core host. Make every file
+# created by this utility owner-only regardless of the invoking shell's umask.
+os.umask(0o077)
 DATA_DIR = "data"
 SUBSCRIBER_FILE = os.path.join(DATA_DIR, "subscribers.yaml")
 SLICE_FILE = os.path.join(DATA_DIR, "slices.yaml")
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+os.chmod(DATA_DIR, 0o700)
 
 DEFAULT_KEY = "{{ profile.security.full_key }}"
 DEFAULT_OPC = "{{ profile.security.opc }}"
@@ -65,6 +69,7 @@ def generate_slices(profile):
         }
     return slices
 
+
 def generate_subscribers(profile, slices):
     subscribers = {}
     for ue_name, ue in profile["ues"].items():
@@ -85,6 +90,7 @@ def generate_subscribers(profile, slices):
         }
     return subscribers
 
+
 def main():
     log.info("Generating slices and subscribers from 5G profile...")
     slices = generate_slices(FIVEG_PROFILE)
@@ -92,11 +98,14 @@ def main():
 
     with open(SLICE_FILE, "w") as f:
         yaml.dump(slices, f)
+    os.chmod(SLICE_FILE, 0o600)
     log.info(f"Saved slices to {SLICE_FILE}")
 
     with open(SUBSCRIBER_FILE, "w") as f:
         yaml.dump(subscribers, f)
+    os.chmod(SUBSCRIBER_FILE, 0o600)
     log.info(f"Saved subscribers to {SUBSCRIBER_FILE}")
+
 
 if __name__ == "__main__":
     main()

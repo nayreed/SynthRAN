@@ -1,47 +1,57 @@
-- name: Set local and remote IPs for {{ item.name }}
+---
+- name: Resolve peer underlay for {{ synthran_gre_bridge }}
   ansible.builtin.set_fact:
-    local_ip: >-
-      {{ item.local_ip_core
-         if inventory_hostname in groups['core_node']
-         else item.local_ip_ran }}
-    remote_ip: >-
+    synthran_transport_remote_ip: >-
       {{ hostvars[groups['ran_node'][0]].ip
          if inventory_hostname in groups['core_node']
          else hostvars[groups['core_node'][0]].ip }}
 
-- name: Remove existing patch ports if present ({{ item.name }}) [free5gc only]
+- name: Converge unkeyed GRE link for {{ synthran_gre_bridge }}
   ansible.builtin.shell: |
-    ovs-vsctl --if-exists del-port n3br patch-n3-n4 || true
-    ovs-vsctl --if-exists del-port n4br patch-n4-n3 || true
-  changed_when: false
-  when: core == 'free5gc'
+    set -eu
+    bridge={{ synthran_gre_bridge | quote }}
+    remote={{ synthran_transport_remote_ip | quote }}
+    port="gre-${bridge}"
+    current_bridge="$(ovs-vsctl port-to-br "$port" 2>/dev/null || true)"
+    current_type="$(ovs-vsctl --if-exists get interface "$port" type 2>/dev/null | tr -d '"' || true)"
+    current_remote="$(ovs-vsctl --if-exists get interface "$port" options:remote_ip 2>/dev/null | tr -d '"' || true)"
+    current_options="$(ovs-vsctl --if-exists get interface "$port" options 2>/dev/null || true)"
+    if [ "$current_bridge" = "$bridge" ] && \
+       [ "$current_type" = "gre" ] && \
+       [ "$current_remote" = "$remote" ] && \
+       ! printf '%s' "$current_options" | grep -q 'key='; then
+      echo retained
+      exit 0
+    fi
+    ovs-vsctl --may-exist add-port "$bridge" "$port"
+    ovs-vsctl set interface "$port" type=gre
+    ovs-vsctl clear interface "$port" options
+    ovs-vsctl set interface "$port" options:remote_ip="$remote"
+    echo changed
+  args:
+    executable: /bin/bash
+  register: synthran_gre_converge
+  changed_when: synthran_gre_converge.stdout | trim == 'changed'
+  become: true
 
-- name: Create GRE tunnel on {{ item.name }} [non-free5gc or n3br only]
+- name: Verify GRE peer for {{ synthran_gre_bridge }}
   ansible.builtin.command:
     argv:
       - ovs-vsctl
-      - --may-exist
-      - add-port
-      - "{{ item.name }}"
-      - "gre-{{ item.name }}"
-      - --
-      - set
+      - get
       - interface
-      - "gre-{{ item.name }}"
-      - type=gre
-      - "options:remote_ip={{ remote_ip }}"
-      - "options:key={{ item.gre_key }}"
-  when: core != 'free5gc' or item.name == 'n3br'
+      - "gre-{{ synthran_gre_bridge }}"
+      - options
+  register: synthran_gre_options
+  changed_when: false
+  become: true
 
-- name: Create patch ports between n3br and n4br [free5gc n4br only]
-  ansible.builtin.shell: |
-    ovs-vsctl --may-exist add-port n3br patch-n3-n4 -- set interface patch-n3-n4 type=patch options:peer=patch-n4-n3
-    ovs-vsctl --may-exist add-port n4br patch-n4-n3 -- set interface patch-n4-n3 type=patch options:peer=patch-n3-n4
-  when: core == 'free5gc' and item.name == 'n4br'
-
-- name: Configure bridge {{ item.name }}
-  ansible.builtin.shell: |
-    ip addr flush dev {{ item.name }} || true
-    ip addr add {{ local_ip }} dev {{ item.name }}
-    ip link set {{ item.name }} up
-
+- name: Require the selected GRE peer and no keyed fork for {{ synthran_gre_bridge }}
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_transport_remote_ip in synthran_gre_options.stdout
+      - "'key=' not in synthran_gre_options.stdout"
+    fail_msg: >-
+      GRE {{ synthran_gre_bridge }} does not match the selected unkeyed
+      topology contract for peer {{ synthran_transport_remote_ip }}.

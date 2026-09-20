@@ -193,33 +193,6 @@
     state: restarted
   become: true
 
-- name: Ensure kube-proxy config directory exists
-  ansible.builtin.file:
-    path: /var/lib/kube-proxy
-    state: directory
-    mode: '0755'
-  become: true
-
-- name: Check if kube-proxy config exists on disk
-  ansible.builtin.stat:
-    path: /etc/kubernetes/config.conf
-  register: kubeproxy_conf
-  become: true
-
-- name: Create symlink to kube-proxy config if it exists
-  ansible.builtin.file:
-    src: /etc/kubernetes/config.conf
-    dest: /var/lib/kube-proxy/kubeproxy-config.yaml
-    state: link
-    force: true
-  become: true
-  when: kubeproxy_conf.stat.exists
-
-- name: Report when kube-proxy config is supplied only by the DaemonSet ConfigMap
-  ansible.builtin.debug:
-    msg: kube-proxy configuration is not present on disk; relying on the DaemonSet ConfigMap.
-  when: not kubeproxy_conf.stat.exists
-
 - name: Remove stale node entry from cluster
   delegate_to: "{{ groups['core_node'][0] }}"
   become: true

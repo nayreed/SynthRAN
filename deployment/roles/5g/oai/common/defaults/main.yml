@@ -18,6 +18,22 @@ demo_oai_script: "{{ dir_oai }}/demo-oai.sh"
 # oai5g-rru repository under the deployment prefix.
 charts_base: "{{ dir_oai }}/charts"
 
+# R2Lab N320 transport values validated on sopnode-f3. Keep these in one place
+# so the staged upstream configuration is corrected before Helm creates the gNB.
+oai_r2lab_n320_ru_parent: "r2lab_usrp"
+oai_r2lab_n320_ru_ip: "192.168.235.120"
+oai_r2lab_n320_ru_prefix: "24"
+oai_r2lab_n320_ru_mtu: "9216"
+# R2Lab assigns the N320's two 10-Gb/s SFP interfaces to one /24. Keep the
+# physical interface identities explicit because Linux's default weak-host ARP
+# behaviour can otherwise resolve an endpoint through the other SFP.
+oai_r2lab_n320_sfp0_ip: "192.168.235.105"
+oai_r2lab_n320_sfp1_ip: "192.168.235.106"
+oai_r2lab_n320_sdr_ip: "{{ oai_r2lab_n320_sfp0_ip }}"
+oai_r2lab_n320_ssh_user: "root"
+oai_r2lab_n320_ru_cni_type: "ipvlan"
+oai_r2lab_n320_ru_cni_mode: "l2"
+
 # yq is installed centrally from a checksum-pinned release before this role.
 yq_version: "v4.45.1"
 yq_bin_path: "/usr/local/bin/yq"

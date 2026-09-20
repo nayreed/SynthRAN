@@ -1,15 +1,319 @@
 ---
+- name: Require a supported OAI RAN mode
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (oai_gnb_mode | default('monolithic')) in ['monolithic', 'cudu', 'cucpup']
+    fail_msg: >-
+      Unsupported OAI RAN mode {{ oai_gnb_mode | default('monolithic') }}.
+      Expected one of monolithic, cudu or cucpup.
+
+- name: Resolve OAI RAN lifecycle identities
+  ansible.builtin.set_fact:
+    oai_ran_release_name: "{{ 'oai-du' if (oai_gnb_mode | default('monolithic')) in ['cudu', 'cucpup'] else 'oai-gnb' }}"
+    oai_n2_release_name: >-
+      {{ 'oai-gnb'
+         if (oai_gnb_mode | default('monolithic')) == 'monolithic'
+         else 'oai-cu'
+         if (oai_gnb_mode | default('monolithic')) == 'cudu'
+         else 'oai-cu-cp' }}
+    oai_expected_ran_releases: >-
+      {{ ['oai-gnb']
+         if (oai_gnb_mode | default('monolithic')) == 'monolithic'
+         else ['oai-cu', 'oai-du']
+         if (oai_gnb_mode | default('monolithic')) == 'cudu'
+         else ['oai-cu-cp', 'oai-cu-up', 'oai-du'] }}
+
+- name: Reconcile R2Lab N320 dual-SFP network readiness before OAI launch
+  ansible.builtin.include_tasks: r2lab_n320_readiness.yml
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
 - name: Remove previous OAI RAN deployment if any
   ansible.builtin.command: "{{ demo_oai_script }} stop-ran"
   args:
     chdir: "{{ repo_dest }}"
 
-- name: Launch OAI gNB pod
+- name: Prove the R2Lab N320 Helm lifecycle starts clean
+  ansible.builtin.command:
+    argv:
+      - helm
+      - status
+      - "{{ item }}"
+      - --namespace
+      - "{{ core }}"
+      - --output
+      - json
+  loop: "{{ oai_expected_ran_releases }}"
+  register: oai_n320_prelaunch_releases
+  changed_when: false
+  failed_when: false
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Reject stale R2Lab N320 Helm releases before launch
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.rc != 0
+    fail_msg: >-
+      OAI release {{ item.item }} still exists after stop-ran; refusing to
+      launch N320 against stale Helm state.
+  loop: "{{ oai_n320_prelaunch_releases.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Prove the R2Lab N320 radio workload starts clean
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - deployment
+      - "{{ oai_ran_release_name }}"
+      - --namespace
+      - "{{ core }}"
+      - -o
+      - name
+  register: oai_n320_prelaunch_radio_workload
+  changed_when: false
+  failed_when: false
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Reject a stale R2Lab N320 radio workload before launch
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (oai_n320_prelaunch_radio_workload.rc | default(1)) != 0
+    fail_msg: >-
+      Deployment {{ oai_ran_release_name }} still exists after stop-ran;
+      refusing to let a stale workload satisfy N320 startup evidence.
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Prepare the Helm-owned R2Lab N320 RU attachment
+  ansible.builtin.include_tasks: r2lab_n320_chart.yml
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Launch OAI RAN through the pinned helper
   ansible.builtin.command: "{{ demo_oai_script }} start-gnb"
   args:
     chdir: "{{ repo_dest }}"
   register: gnb_script
-  changed_when: "'When you finish' in gnb_script.stdout"
+  changed_when: true
+  failed_when: false
+
+- name: Classify the complete OAI launch transcript
+  ansible.builtin.set_fact:
+    oai_start_wait_timeout: >-
+      {{
+        'timed out waiting for the condition' in
+        ((gnb_script.stdout | default('')) ~ '\n' ~ (gnb_script.stderr | default('')))
+      }}
+    oai_start_installation_failed: >-
+      {{
+        'INSTALLATION FAILED' in
+        ((gnb_script.stdout | default('')) ~ '\n' ~ (gnb_script.stderr | default('')))
+      }}
+
+- name: Reject explicit Helm installation failures from the helper transcript
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not (oai_start_installation_failed | bool)
+    fail_msg: >-
+      OAI start-gnb reported a Helm installation failure. The pinned helper
+      continues after some failed commands, so a later command must not mask
+      this launch failure.
+
+- name: Inspect every expected R2Lab N320 Helm release after launch
+  ansible.builtin.command:
+    argv:
+      - helm
+      - status
+      - "{{ item }}"
+      - --namespace
+      - "{{ core }}"
+      - --output
+      - json
+  loop: "{{ oai_expected_ran_releases }}"
+  register: oai_n320_postlaunch_releases
+  changed_when: false
+  failed_when: false
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Require every expected R2Lab N320 Helm release to be deployed
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        item.rc == 0 and
+        (((item.stdout | default('{}', true)) | from_json).get('info', {}).get('status', '')) == 'deployed'
+    fail_msg: >-
+      OAI release {{ item.item }} is not deployed after start-gnb; refusing
+      to accept a helper wait timeout or masked intermediate failure.
+  loop: "{{ oai_n320_postlaunch_releases.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Inspect the R2Lab N320 radio Deployment after launch
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - deployment
+      - "{{ oai_ran_release_name }}"
+      - --namespace
+      - "{{ core }}"
+      - -o
+      - name
+  register: oai_n320_postlaunch_radio_workload
+  changed_when: false
+  failed_when: false
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Require the R2Lab N320 radio Deployment after launch
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (oai_n320_postlaunch_radio_workload.rc | default(1)) == 0
+    fail_msg: >-
+      OAI start-gnb did not create the expected radio Deployment
+      {{ oai_ran_release_name }}.
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Require a valid OAI helper exit result
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        gnb_script.rc == 0 or
+        (
+          platform == 'r2lab' and
+          rru == 'n320' and
+          (oai_start_wait_timeout | bool) and
+          not (oai_start_installation_failed | bool)
+        )
+    fail_msg: >-
+      OAI start-gnb failed before SynthRAN's acceptance gates.
+      rc={{ gnb_script.rc }}. A nonzero result is tolerated only for the
+      evidence-backed R2Lab N320 readiness timeout; all other launch failures
+      remain fatal.
+
+- name: Read the live OAI RFSIM gNB pod set
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - get
+      - pods
+      - --namespace
+      - "{{ core }}"
+      - --selector
+      - app.kubernetes.io/instance=oai-gnb
+      - --output
+      - json
+  register: synthran_oai_rfsim_gnb_pods_raw
+  changed_when: false
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
+
+- name: Decode the live OAI RFSIM gNB pod set
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_gnb_pods: >-
+      {{ (synthran_oai_rfsim_gnb_pods_raw.stdout | from_json).get('items', []) }}
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
+
+- name: Require exactly one live OAI RFSIM gNB pod
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_gnb_pods | length == 1
+    fail_msg: >-
+      OAI RFSIM requires exactly one selected gNB pod before software UE launch.
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
+
+- name: Resolve the live OAI RFSIM gNB container identity
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_gnb_pod: "{{ synthran_oai_rfsim_gnb_pods | first }}"
+    synthran_oai_rfsim_gnb_spec_container: >-
+      {{ (synthran_oai_rfsim_gnb_pods | first).spec.containers
+         | selectattr('name', 'equalto', 'gnb') | list | first | default({}) }}
+    synthran_oai_rfsim_gnb_status_container: >-
+      {{ (synthran_oai_rfsim_gnb_pods | first).status.containerStatuses
+         | default([]) | selectattr('name', 'equalto', 'gnb') | list | first | default({}) }}
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
+
+- name: Require the corrected OAI RFSIM gNB runtime and immutable pulled digest
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - synthran_oai_rfsim_gnb_pod.status.phase == 'Running'
+      - synthran_oai_rfsim_gnb_spec_container.image == synthran_oai_rfsim_gnb_repository ~ ':' ~ synthran_oai_rfsim_runtime_release ~ '@' ~ synthran_oai_rfsim_gnb_index_digest
+      - synthran_oai_rfsim_gnb_status_container.ready | default(false) | bool
+      - "'@sha256:' in (synthran_oai_rfsim_gnb_status_container.imageID | default(''))"
+    fail_msg: >-
+      Live OAI RFSIM gNB does not match the reviewed corrected runtime or
+      lacks an immutable pulled image digest.
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
+
+- name: Retain the live OAI RFSIM gNB runtime identity
+  ansible.builtin.copy:
+    mode: '0644'
+    dest: "{{ run_dir }}/oai-rfsim-runtime.json"
+    content: >-
+      {{ {
+           'schema_version': 1,
+           'release': synthran_oai_rfsim_runtime_release,
+           'upstream_revision': synthran_oai_rfsim_upstream_revision,
+           'prach_fix_revision': synthran_oai_rfsim_prach_fix_revision,
+           'gnb': {
+             'pod': synthran_oai_rfsim_gnb_pod.metadata.name,
+             'pod_uid': synthran_oai_rfsim_gnb_pod.metadata.uid,
+             'image': synthran_oai_rfsim_gnb_spec_container.image,
+             'index_digest': synthran_oai_rfsim_gnb_index_digest,
+             'image_id': synthran_oai_rfsim_gnb_status_container.imageID,
+             'restart_count': synthran_oai_rfsim_gnb_status_container.restartCount | default(0)
+           },
+           'expected_ue_image': synthran_oai_rfsim_ue_repository ~ ':' ~ synthran_oai_rfsim_runtime_release ~ '@' ~ synthran_oai_rfsim_ue_index_digest
+         } | to_nice_json }}
+  delegate_to: localhost
+  become: false
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+    - ran | lower == 'oai'
 
 - name: Verify N3xx gNB RF-device readiness
   block:
@@ -23,116 +327,99 @@
         set -o pipefail
         GNB_POD_NAME="$(kubectl get pods --namespace {{ core }} \
           -l "{{ pod_label_selector }}" \
-          -o jsonpath='{.items[0].metadata.name}')"
+          --sort-by=.metadata.creationTimestamp \
+          -o jsonpath='{.items[-1:].metadata.name}')"
         test -n "$GNB_POD_NAME"
-        kubectl wait --namespace {{ core }} \
-          --for=condition=Ready "pod/${GNB_POD_NAME}" --timeout=5s >/dev/null
         kubectl logs --namespace {{ core }} "$GNB_POD_NAME" -c {{ ran_container_name }} \
           | grep -E 'RU [0-9]+ rf device ready'
       args:
         executable: /bin/bash
       register: gnb_rf_ready
       until: gnb_rf_ready.rc == 0
-      retries: 12
+      retries: 18
       delay: 10
       changed_when: false
       failed_when: false
 
-    - name: Retry N3xx RF initialization after swapping the USRP IP
-      when: gnb_rf_ready.rc != 0
-      block:
-        - name: Stop gNB after failed RF-device initialization
-          ansible.builtin.command: "{{ demo_oai_script }} stop-gnb"
-          args:
-            chdir: "{{ repo_dest }}"
-
-        - name: Swap USRP IP address
-          ansible.builtin.include_role:
-            name: 5g/oai/ran/n3xx_ip_swap
-
-        - name: Require the fallback to select a different USRP endpoint
-          ansible.builtin.assert:
-            quiet: true
-            that:
-              - (current_ip_cmd.stdout | trim | length) > 0
-              - (new_usrp_ip | trim | length) > 0
-              - (current_ip_cmd.stdout | trim) != (new_usrp_ip | trim)
-            fail_msg: >-
-              N3xx RF initialization failed, but the pinned IP-swap fallback could not
-              select a different USRP endpoint from {{ current_ip_cmd.stdout | trim }}.
-
-        - name: Read the swapped USRP endpoint from both OAI RAN charts
-          ansible.builtin.shell: >-
-            grep 'sdr_addrs:' {{ item | quote }} |
-            grep -oP '\d+\.\d+\.\d+\.\d+' |
-            head -n 1
-          args:
-            executable: /bin/bash
-          loop: "{{ target_files }}"
-          register: swapped_usrp_endpoints
-          changed_when: false
-          failed_when: false
-
-        - name: Require both OAI RAN charts to use the swapped USRP endpoint
-          ansible.builtin.assert:
-            quiet: true
-            that:
-              - item.rc == 0
-              - (item.stdout | trim) == (new_usrp_ip | trim)
-            fail_msg: >-
-              {{ item.item }} does not resolve to the swapped N3xx endpoint
-              {{ new_usrp_ip | trim }}; parsed endpoint was {{ item.stdout | trim | default('missing', true) }}.
-          loop: "{{ swapped_usrp_endpoints.results }}"
-          loop_control:
-            label: "{{ item.item }}"
-
-        - name: Restart OAI gNB pod with the swapped USRP endpoint
-          ansible.builtin.command: "{{ demo_oai_script }} start-gnb"
-          args:
-            chdir: "{{ repo_dest }}"
-
-        - name: Re-check that the gNB opens the N3xx RF device
-          ansible.builtin.shell: |
-            set -o pipefail
-            GNB_POD_NAME="$(kubectl get pods --namespace {{ core }} \
-              -l "{{ pod_label_selector }}" \
-              -o jsonpath='{.items[0].metadata.name}')"
-            test -n "$GNB_POD_NAME"
-            kubectl wait --namespace {{ core }} \
-              --for=condition=Ready "pod/${GNB_POD_NAME}" --timeout=5s >/dev/null
-            kubectl logs --namespace {{ core }} "$GNB_POD_NAME" -c {{ ran_container_name }} \
-              | grep -E 'RU [0-9]+ rf device ready'
-          args:
-            executable: /bin/bash
-          register: gnb_rf_ready_retry
-          until: gnb_rf_ready_retry.rc == 0
-          retries: 12
-          delay: 10
-          changed_when: false
-          failed_when: false
-
-        - name: Require N3xx RF-device readiness after the fallback
-          ansible.builtin.assert:
-            quiet: true
-            that:
-              - gnb_rf_ready_retry.rc == 0
-            fail_msg: >-
-              The OAI RAN pod became available but did not report successful N3xx RF-device
-              initialization after trying both configured USRP endpoints. Failure diagnostics
-              will retain the RAN logs; do not treat a missing pre-UE Frame.Slot line as the
-              synchronization criterion.
+    - name: Require N3xx RF-device readiness
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - gnb_rf_ready.rc == 0
+        fail_msg: >-
+          The OAI RAN did not report successful N3xx RF-device initialization.
+          Inspect the newest RAN pod logs. For R2Lab N320, SynthRAN validates the
+          Helm-rendered ipvlan RU attachment before the release is launched.
   when: rru in ['n300', 'n320']
 
-- name: Launch OAI NR-UE pods for RFSIM
-  ansible.builtin.command: "{{ demo_oai_script }} {{ ue_cmd }}"
-  args:
-    chdir: "{{ repo_dest }}"
-  loop: "{{ range(1, ue_count + 1) | list }}"
+- name: Attest the live R2Lab N320 RAN-local contract after RF readiness
+  ansible.builtin.include_tasks: r2lab_n320_attest.yml
+  when:
+    - platform == 'r2lab'
+    - rru == 'n320'
+
+- name: Stage the read-only software UE probe for OAI RFSIM readiness
+  ansible.builtin.copy:
+    src: "{{ synthran_execution_root }}/scripts/probe_software_ues.py"
+    dest: "/tmp/synthran-probe-software-ues-{{ run_dir | basename }}.py"
+    mode: '0755'
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+
+- name: Stage the sealed deployment identity for OAI RFSIM readiness
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.file', synthran_deployment_contract_file) }}\n"
+    dest: "/tmp/synthran-rfsim-contract-{{ run_dir | basename }}.json"
+    mode: '0600'
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+
+- name: Initialize selected OAI RFSIM readiness evidence
+  ansible.builtin.set_fact:
+    synthran_oai_rfsim_probe_script: "/tmp/synthran-probe-software-ues-{{ run_dir | basename }}.py"
+    synthran_oai_rfsim_probe_contract: "/tmp/synthran-rfsim-contract-{{ run_dir | basename }}.json"
+    synthran_oai_rfsim_readiness: []
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+
+- name: Launch and attest every selected OAI RFSIM UE
+  ansible.builtin.include_tasks: rfsim_ue_start.yml
+  loop: "{{ synthran_ue_map }}"
   loop_control:
-    loop_var: ue_index
-  vars:
-    ue_cmd: >-
-      {{ 'start-nr-ue' if ue_index == 1 else 'start-nr-ue' ~ ue_index }}
-  register: nr_ue_scripts
-  changed_when: "'condition met' in nr_ue_scripts.stdout"
-  when: rru == 'rfsim'
+    loop_var: synthran_rfsim_ue
+    label: >-
+      {{ synthran_rfsim_ue.device }} -> slot {{ synthran_rfsim_ue.index }} /
+      {{ synthran_rfsim_ue.slice }}
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+
+- name: Retain immediate selected OAI RFSIM readiness evidence
+  ansible.builtin.copy:
+    mode: '0644'
+    dest: "{{ run_dir }}/oai-rfsim-ue-readiness.json"
+    content: >-
+      {{ {
+           'schema_version': 1,
+           'authority': 'synthran_ue_map',
+           'bindings': synthran_oai_rfsim_readiness
+         } | to_nice_json }}
+  delegate_to: localhost
+  become: false
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'
+
+- name: Remove temporary OAI RFSIM readiness inputs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ synthran_oai_rfsim_probe_script }}"
+    - "{{ synthran_oai_rfsim_probe_contract }}"
+  when:
+    - platform == 'rfsim'
+    - rru == 'rfsim'

@@ -1,168 +1,27 @@
 ---
-- name: Prepare core and RAN hosts
+- name: Start selected 5G stack deployment timing
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Start stack deployment phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - stack_deployment
+      changed_when: false
+
+- name: Configure authoritative N2/N3/N4 host transport
   hosts: sopnodes
   become: true
   any_errors_fatal: true
   roles:
-    - setup/common
-    - setup/netplan
-    - setup/containerd
-    - setup/pre_k8s
-    - setup/k8s/k8s_setup
-    - setup/optimization/cpu
-    - setup/ovs
-  tasks:
-    - name: Resolve the supported yq architecture
-      ansible.builtin.set_fact:
-        synthran_yq_arch: >-
-          {{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else
-             'arm64' if ansible_architecture in ['aarch64', 'arm64'] else '' }}
-
-    - name: Require a checksum-pinned yq binary for this architecture
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - synthran_yq_arch | length > 0
-          - synthran_yq_arch in yq_sha256
-        fail_msg: >-
-          No checksum-pinned yq binary is defined for architecture
-          {{ ansible_architecture }}.
-
-    - name: Install the checksum-verified shared yq binary
-      ansible.builtin.get_url:
-        url: >-
-          https://github.com/mikefarah/yq/releases/download/{{ yq_version }}/yq_linux_{{ synthran_yq_arch }}
-        dest: /usr/local/bin/yq
-        mode: '0755'
-        force: true
-        checksum: "sha256:{{ yq_sha256[synthran_yq_arch] }}"
-
-    - name: Read back the installed yq version
-      ansible.builtin.command: /usr/local/bin/yq --version
-      register: synthran_yq_version
-      changed_when: false
-
-    - name: Require the installed yq binary to match the pinned release
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - yq_version in synthran_yq_version.stdout
-        fail_msg: >-
-          /usr/local/bin/yq does not match the pinned {{ yq_version }} baseline:
-          {{ synthran_yq_version.stdout | default(synthran_yq_version.stderr) }}
-
-- name: Create the Kubernetes control plane
-  hosts: core_node
-  become: true
-  any_errors_fatal: true
-  module_defaults:
-    kubernetes.core.helm:
-      chart_version: "{{ flannel_chart_version }}"
-  pre_tasks:
-    - name: Resolve the supported CNI plugin architecture
-      ansible.builtin.set_fact:
-        synthran_cni_arch: >-
-          {{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else
-             'arm64' if ansible_architecture in ['aarch64', 'arm64'] else '' }}
-
-    - name: Require a pinned CNI artifact for this architecture
-      ansible.builtin.assert:
-        quiet: true
-        that:
-          - synthran_cni_arch | length > 0
-          - synthran_cni_arch in cni_plugins_sha256
-        fail_msg: >-
-          No checksum-pinned CNI plugin bundle is defined for architecture
-          {{ ansible_architecture }}.
-
-    - name: Stage the checksum-verified CNI plugin bundle
-      ansible.builtin.get_url:
-        url: >-
-          https://github.com/containernetworking/plugins/releases/download/v{{ cni_plugins_version }}/cni-plugins-linux-{{ synthran_cni_arch }}-v{{ cni_plugins_version }}.tgz
-        dest: /tmp/cni-plugins.tgz
-        mode: '0600'
-        force: true
-        checksum: "sha256:{{ cni_plugins_sha256[synthran_cni_arch] }}"
-  roles:
-    - setup/k8s/cluster_create
-    - setup/k8s/cni_dhcp
-    - setup/k8s/remove_cp_taint
-  tasks:
-    - name: Move the kubeadm join command into the private run directory
-      ansible.builtin.command:
-        argv:
-          - install
-          - -m
-          - '0600'
-          - "{{ playbook_dir }}/.kubeadm_join_command.txt"
-          - "{{ synthran_private_dir }}/kubeadm_join_command.txt"
-      delegate_to: localhost
-      become: false
-      no_log: true
-
-    - name: Remove the staged kubeadm join command
-      ansible.builtin.file:
-        path: "{{ playbook_dir }}/.kubeadm_join_command.txt"
-        state: absent
-      delegate_to: localhost
-      become: false
-      no_log: true
-
-- name: Join the RAN host to Kubernetes
-  hosts: ran_node
-  become: true
-  any_errors_fatal: true
-  roles:
-    - role: setup/k8s/cluster_join
-      when: inventory_hostname != groups['core_node'][0]
-    - role: setup/k8s/cni_dhcp
-      when: inventory_hostname != groups['core_node'][0]
-
-- name: Reserve only a split RAN node for RAN workloads
-  hosts: core_node
-  become: true
-  any_errors_fatal: true
-  roles:
-    - role: setup/k8s/add_taint
-      vars:
-        target_node: "{{ ran_node_name }}"
-      when: bridge_enabled and core_node_name != ran_node_name
-    - role: setup/k8s/remove_taint
-      vars:
-        target_node: "{{ ran_node_name }}"
-      when: core_node_name == ran_node_name
-
-- name: Install Multus and storage prerequisites
-  hosts: core_node
-  become: true
-  any_errors_fatal: true
-  roles:
-    - setup/cni
-    - role: setup/storage
-      when: core == 'open5gs' or core == 'free5gc'
-
-- name: Apply the supported RAN-node CPU and kubelet tuning
-  hosts: ran_node
-  become: true
-  any_errors_fatal: true
-  roles:
-    - setup/k8s/k8s_cpu_tuning
-
-- name: Configure core-side transport
-  hosts: core_node
-  become: true
-  any_errors_fatal: true
-  roles:
     - role: setup/gre_tunnel
-      when: bridge_enabled and core_node_name != ran_node_name
-
-- name: Configure RAN-side transport
-  hosts: ran_node
-  become: true
-  any_errors_fatal: true
-  roles:
-    - role: setup/gre_tunnel
-      when: bridge_enabled and core_node_name != ran_node_name
 
 - name: "Deploy the {{ core | upper }} core"
   hosts: core_node
@@ -246,6 +105,15 @@
       ansible.builtin.include_role:
         name: 5g/oai/core
       when: core == 'oai'
+
+    - name: Enforce exclusive physical RAN ownership before backend startup
+      ansible.builtin.include_role:
+        name: 5g/ran_transition
+      when:
+        - platform | string | trim | lower == 'r2lab'
+        - rru | string | trim | lower in ['n300', 'n320']
+        - ran | string | trim | lower in ['oai', 'srsran']
+
     - name: Deploy the OAI RAN
       ansible.builtin.include_role:
         name: 5g/oai/ran
@@ -266,3 +134,20 @@
       ansible.builtin.include_role:
         name: 5g/ueransim/deploy
       when: ran == 'ueransim'
+
+- name: Finish selected 5G stack deployment timing
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Finish stack deployment phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - stack_deployment
+      changed_when: false

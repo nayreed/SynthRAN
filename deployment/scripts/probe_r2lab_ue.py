@@ -56,12 +56,13 @@ def verify_observations(
         raise ValueError(
             f"R2Lab diagnostics do not show the configured DNN {contract['dnn']}"
         )
-    if str(contract["sd"]).upper() != "EMPTY":
-        nssai = f"{int(contract['sst']):02x}.{str(contract['sd']).lower()}"
+    contract_sd = str(contract["sd"]).upper()
+    if contract_sd not in {"EMPTY", "FFFFFF"}:
+        nssai = f"{int(contract['sst']):02x}.{contract_sd.lower()}"
         slice_apns = {contract["dnn"].lower()}
         # RM500Q firmware reports the configured eMBB context with this suffix.
         if int(contract["sst"]) == 1:
-            slice_apns.add(f"{contract['dnn']}_EMBB{contract['sd']}".lower())
+            slice_apns.add(f"{contract['dnn']}_EMBB{contract_sd}".lower())
         if not any(
             dnn.lower() in slice_apns and f'"{nssai}"' in tail.lower()
             for dnn, tail in contexts
@@ -112,6 +113,8 @@ def verify_observations(
         "index": contract["index"],
         "imsi": identities[0],
         "slice": contract["slice"],
+        "sst": str(contract["sst"]),
+        "sd": str(contract["sd"]),
         "dnn": contract["dnn"],
         "host": tunnel["host"],
         "interface": links[0]["ifname"],

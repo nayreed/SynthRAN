@@ -1,0 +1,236 @@
+name: core lifecycle contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-lifecycle-contract:
+    name: Issue 61 core ownership and profiles
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out SynthRAN
+        uses: actions/checkout@v7
+
+      - name: Check out pinned 5g-Ansible reference
+        uses: actions/checkout@v7
+        with:
+          repository: sopnode/5g_ansible
+          ref: b73fccf87f55060484b3759e9cb347222253534b
+          path: reference
+
+      - name: Check out pinned Open5GS source
+        uses: actions/checkout@v7
+        with:
+          repository: sopnode/open5gs-k8s
+          ref: e53601e5209425867413d45d3d01ed9a1b696de7
+          path: open5gs-source
+
+      - name: Check out pinned Free5GC source
+        uses: actions/checkout@v7
+        with:
+          repository: sopnode/free5gc-helm
+          ref: 499ad3d6b0c0c8879f49edcc174f306ee72a4ff4
+          path: free5gc-source
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deployment validation runtime
+        run: python -m pip install --disable-pip-version-check -e '.[deployment]'
+
+      - name: Install pinned Ansible collections
+        run: ansible-galaxy collection install -r deployment/collections/requirements.yml
+
+      - name: Verify Helm is available
+        run: helm version --short
+
+      - name: Compile Sub 08 Python
+        run: >-
+          python -m compileall -q
+          tools/check_core_lifecycle_contract.py
+          tools/check_core_profile_render.py
+          deployment/roles/5g/free5gc/config/files/patch_amf_n2_nad.py
+          deployment/roles/5g/free5gc/config/files/patch_iupf_n3_nad.py
+          deployment/roles/5g/free5gc/config/files/patch_nads.py
+          deployment/roles/5g/free5gc/config/files/patch_upf_wrapper.py
+
+      - name: Parse touched Sub 08 Ansible YAML
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          paths = [
+              Path("deployment/roles/5g/oai/core/tasks/main.yml"),
+              Path("deployment/roles/5g/oai/core/tasks/materialize_reference.yml"),
+              Path("deployment/roles/5g/open5gs/config/tasks/main.yml"),
+              Path("deployment/roles/5g/open5gs/config/tasks/validate_profile.yml"),
+              Path("deployment/roles/5g/open5gs/deploy/tasks/main.yml"),
+              Path("deployment/roles/5g/free5gc/config/defaults/main.yml"),
+              Path("deployment/roles/5g/free5gc/config/tasks/main.yml"),
+              Path("deployment/roles/5g/free5gc/config/tasks/validate_profile.yml"),
+              Path("deployment/roles/5g/free5gc/deploy/tasks/main.yml"),
+              Path("deployment/roles/5g/free5gc/verify/tasks/main.yml"),
+          ]
+          for path in paths:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+          print(f"parsed {len(paths)} Sub 08 YAML files")
+          PY
+
+      - name: Validate exact core lifecycle and source contracts
+        run: >-
+          python tools/check_core_lifecycle_contract.py
+          --reference-root reference
+          --open5gs-root open5gs-source
+          --free5gc-root free5gc-source
+
+      - name: Render effective Open5GS and Free5GC profiles
+        run: >-
+          python tools/check_core_profile_render.py
+          --free5gc-root free5gc-source
+
+      - name: Exercise production profile validators and negative cases
+        run: |
+          set -euo pipefail
+          valid="$RUNNER_TEMP/core-profile-valid.yml"
+          bad_open5gs="$RUNNER_TEMP/core-profile-bad-open5gs.yml"
+          bad_free5gc="$RUNNER_TEMP/core-profile-bad-free5gc.yml"
+
+          cat >"$valid" <<YAML
+          - hosts: localhost
+            gather_facts: false
+            vars:
+              fiveg:
+                plmn: {mcc: "001", mnc: "01", tac: "1"}
+                slices:
+                  - {name: slice1, sst: "1", sd: EMPTY, dnn: internet, ip_prefix: "12.1.1"}
+                  - {name: slice2, sst: "1", sd: "100000", dnn: streaming, ip_prefix: "14.1.1"}
+                ues:
+                  uesim01: {imsi_suffix: "0000000001", slice: slice1}
+                  uesim02: {imsi_suffix: "0000000002", slice: slice2}
+            tasks:
+              - ansible.builtin.include_tasks: "$GITHUB_WORKSPACE/deployment/roles/5g/open5gs/config/tasks/validate_profile.yml"
+              - ansible.builtin.include_tasks: "$GITHUB_WORKSPACE/deployment/roles/5g/free5gc/config/tasks/validate_profile.yml"
+          YAML
+          ansible-playbook -i localhost, -c local "$valid"
+
+          cat >"$bad_open5gs" <<YAML
+          - hosts: localhost
+            gather_facts: false
+            vars:
+              fiveg:
+                plmn: {mcc: "001", mnc: "01", tac: "1"}
+                slices:
+                  - {name: slice1, sst: "1", sd: EMPTY, dnn: internet, ip_prefix: "12.1.1"}
+                  - {name: slice2, sst: "1", sd: "100000", dnn: streaming, ip_prefix: "14.1.1"}
+                  - {name: slice3, sst: "1", sd: "200000", dnn: extra, ip_prefix: "16.1.1"}
+                ues:
+                  uesim01: {imsi_suffix: "0000000001", slice: slice1}
+            tasks:
+              - ansible.builtin.include_tasks: "$GITHUB_WORKSPACE/deployment/roles/5g/open5gs/config/tasks/validate_profile.yml"
+          YAML
+          if ansible-playbook -i localhost, -c local "$bad_open5gs"; then
+            echo "Open5GS validator accepted an unsupported three-slice profile" >&2
+            exit 1
+          fi
+
+          cat >"$bad_free5gc" <<YAML
+          - hosts: localhost
+            gather_facts: false
+            vars:
+              fiveg:
+                plmn: {mcc: "001", mnc: "01", tac: "1"}
+                slices:
+                  - {name: slice1, sst: "1", sd: EMPTY, dnn: internet, ip_prefix: "12.1.1"}
+                  - {name: slice2, sst: "1", sd: "100000", dnn: streaming, ip_prefix: "14.1.1"}
+                ues:
+                  uesim01: {imsi_suffix: "0000000001", slice: missing-slice}
+            tasks:
+              - ansible.builtin.include_tasks: "$GITHUB_WORKSPACE/deployment/roles/5g/free5gc/config/tasks/validate_profile.yml"
+          YAML
+          if ansible-playbook -i localhost, -c local "$bad_free5gc"; then
+            echo "Free5GC validator accepted an unknown UE slice" >&2
+            exit 1
+          fi
+
+      - name: Materialize authoritative execution-reference cache
+        run: python -m synthran.reference_checkout
+
+      - name: Syntax-check the active core network playbook
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
+        run: |
+          fixture="$RUNNER_TEMP/core-ansible"
+          mkdir -p "$fixture/private" "$fixture/result"
+          cat >"$fixture/inventory.yml" <<'YAML'
+          all:
+            children:
+              core_node:
+                hosts:
+                  core-ci:
+                    ansible_connection: local
+                    ansible_python_interpreter: /usr/bin/python3
+              ran_node:
+                hosts:
+                  ran-ci:
+                    ansible_connection: local
+                    ansible_python_interpreter: /usr/bin/python3
+              broker_node:
+                hosts:
+                  core-ci: {}
+              sopnodes:
+                children:
+                  core_node: {}
+                  ran_node: {}
+              k8s_workers:
+                children:
+                  ran_node: {}
+          YAML
+          cat >"$fixture/vars.yml" <<YAML
+          synthran_root: $GITHUB_WORKSPACE
+          synthran_private_dir: $fixture/private
+          run_dir: $fixture/result
+          core: open5gs
+          ran: srsRAN
+          platform: r2lab
+          rru: n320
+          core_node_name: core-ci
+          ran_node_name: ran-ci
+          broker_node_name: core-ci
+          bridge_enabled: true
+          synthran_host_preparation: fresh
+          network_profile: default
+          network_profile_file: $GITHUB_WORKSPACE/deployment/group_vars/all/network_profile_default.yaml
+          synthran_ue_map: []
+          ue_count: 0
+          synthran_topology:
+            contract_version: 1
+            namespace: open5gs
+            network:
+              n3:
+                route_cidr: 192.168.3.0/24
+            transport:
+              bridges:
+                core: [n2br, n3br, n4br]
+              endpoints:
+                amf_ngap_ip: 10.10.3.200
+          YAML
+          ansible-playbook \
+            -i "$fixture/inventory.yml" \
+            -e @deployment/group_vars/all/all.yml \
+            -e @"$fixture/vars.yml" \
+            deployment/playbooks/network.yml \
+            --syntax-check
