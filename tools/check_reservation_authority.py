@@ -443,6 +443,8 @@ def preparation_checks() -> dict[str, str]:
         }
     finally:
         reservation.run = original
+        reservation.STATE_PATH = original_state
+        state_tmp.cleanup()
         if old_attempts is None:
             os.environ.pop("SYNTHRAN_POS_READY_ATTEMPTS", None)
         else:
@@ -456,6 +458,9 @@ def preparation_checks() -> dict[str, str]:
 
 def allocation_reuse_checks() -> dict[str, str]:
     original = reservation.run
+    original_state = reservation.STATE_PATH
+    state_tmp = tempfile.TemporaryDirectory(prefix="synthran-allocation-reuse-")
+    reservation.STATE_PATH = Path(state_tmp.name) / "pos-reservation.json"
     old_attempts = os.environ.get("SYNTHRAN_POS_READY_ATTEMPTS")
     old_interval = os.environ.get("SYNTHRAN_POS_READY_INTERVAL_SECONDS")
     os.environ["SYNTHRAN_POS_READY_ATTEMPTS"] = "1"
@@ -474,6 +479,7 @@ def allocation_reuse_checks() -> dict[str, str]:
             }
         },
     }
+    reservation._write_json(reservation.STATE_PATH, authority)
     try:
         def matching(argv, _stdin, _n):
             if argv[:3] == ["pos", "allocations", "allocate"]:
@@ -554,6 +560,7 @@ def allocation_reuse_checks() -> dict[str, str]:
         stale = Fake(mismatch)
         reservation.run = stale
         stale_authority = json.loads(json.dumps(authority))
+        reservation._write_json(reservation.STATE_PATH, stale_authority)
         result = reservation.prepare_hosts(
             {"host_preparation": "fresh", "image": "configured-image"},
             selected=[node],
