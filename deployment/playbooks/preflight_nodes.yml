@@ -278,6 +278,7 @@
         fail_msg: >-
           SynthRAN requires Ubuntu on {{ inventory_hostname }}; observed
           {{ ansible_distribution | default('unknown') }}.
+      when: synthran_host_preparation in ['preserve', 'fresh']
 
     - name: Require selected boot profile before physical testbed mutation
       ansible.builtin.assert:
