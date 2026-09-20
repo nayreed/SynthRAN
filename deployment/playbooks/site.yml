@@ -1,5 +1,6 @@
 ---
 - import_playbook: provision_nodes.yml
+- import_playbook: preflight_nodes.yml
 - import_playbook: provision_r2lab.yml
 - import_playbook: bootstrap_nodes.yml
 - import_playbook: network.yml

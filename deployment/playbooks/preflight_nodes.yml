@@ -1,0 +1,347 @@
+---
+- name: Preflight selected SOP hosts before physical testbed mutation
+  hosts: sopnodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require a declared host preparation policy for SOP preflight
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_host_preparation in ['preserve', 'bootstrap', 'fresh']
+        fail_msg: >-
+          Unsupported synthran_host_preparation={{ synthran_host_preparation | default('undefined') }}.
+
+    - name: Wait for the selected SOP node before preflight
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        sleep: 5
+        timeout: 180
+
+    - name: Gather SOP preflight facts
+      ansible.builtin.setup:
+
+    - name: Resolve required boot profile
+      ansible.builtin.set_fact:
+        synthran_preflight_boot_profile: >-
+          {{ 'reference-n3xx' if inventory_hostname in synthran_ran_boot_nodes
+             else 'reference-generic' }}
+        synthran_preflight_required_boot_tokens: >-
+          {{ synthran_boot_common_tokens
+             + (synthran_boot_ran_tokens
+                if inventory_hostname in synthran_ran_boot_nodes else []) }}
+
+    - name: Read live kernel command line
+      ansible.builtin.command: cat /proc/cmdline
+      register: synthran_preflight_cmdline
+      changed_when: false
+
+    - name: Probe containerd service
+      ansible.builtin.command: systemctl is-active containerd
+      register: synthran_preflight_containerd
+      changed_when: false
+      failed_when: false
+
+    - name: Probe kubelet service
+      ansible.builtin.command: systemctl is-active kubelet
+      register: synthran_preflight_kubelet
+      changed_when: false
+      failed_when: false
+
+    - name: Probe CNI DHCP binary
+      ansible.builtin.stat:
+        path: /opt/cni/bin/dhcp
+      register: synthran_preflight_dhcp_binary
+
+    - name: Probe CNI DHCP daemon
+      ansible.builtin.command: systemctl is-active cni-dhcp.service
+      register: synthran_preflight_dhcp_service
+      changed_when: false
+      failed_when: false
+
+    - name: Probe OVS database service
+      ansible.builtin.command: systemctl is-active ovsdb-server
+      register: synthran_preflight_ovsdb
+      changed_when: false
+      failed_when: false
+
+    - name: Probe OVS switching service
+      ansible.builtin.command: systemctl is-active ovs-vswitchd
+      register: synthran_preflight_ovsvswitchd
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve authoritative OVS bridges for this host
+      ansible.builtin.set_fact:
+        synthran_preflight_bridges: >-
+          {{
+            ((synthran_topology.transport.bridges.core
+              if inventory_hostname in groups['core_node'] else [])
+             +
+             (synthran_topology.transport.bridges.ran
+              if inventory_hostname in groups['ran_node'] else []))
+            | unique | list
+          }}
+
+    - name: Probe authoritative OVS bridges
+      ansible.builtin.command:
+        argv: [ovs-vsctl, br-exists, "{{ item }}"]
+      loop: "{{ synthran_preflight_bridges }}"
+      register: synthran_preflight_ovs_bridges
+      changed_when: false
+      failed_when: false
+
+    - name: Probe IPv4 forwarding
+      ansible.builtin.command: sysctl -n net.ipv4.ip_forward
+      register: synthran_preflight_ip_forward
+      changed_when: false
+      failed_when: false
+
+    - name: Probe bridge IPv4 filtering
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-iptables
+      register: synthran_preflight_bridge_ipv4
+      changed_when: false
+      failed_when: false
+
+    - name: Probe bridge IPv6 filtering
+      ansible.builtin.command: sysctl -n net.bridge.bridge-nf-call-ip6tables
+      register: synthran_preflight_bridge_ipv6
+      changed_when: false
+      failed_when: false
+
+    - name: Probe active swap
+      ansible.builtin.command: swapon --noheadings
+      register: synthran_preflight_swap
+      changed_when: false
+      failed_when: false
+
+    - name: Build per-host SOP preflight evidence
+      ansible.builtin.set_fact:
+        synthran_sop_preflight_evidence:
+          schema: synthran/sop-preflight-host/v1
+          host: "{{ inventory_hostname }}"
+          host_preparation: "{{ synthran_host_preparation }}"
+          os:
+            distribution: "{{ ansible_distribution }}"
+            release: "{{ ansible_distribution_release }}"
+            version: "{{ ansible_distribution_version }}"
+            kernel: "{{ ansible_kernel }}"
+            architecture: "{{ ansible_architecture }}"
+          boot:
+            profile: "{{ synthran_preflight_boot_profile }}"
+            required_tokens: "{{ synthran_preflight_required_boot_tokens }}"
+            command_line: "{{ synthran_preflight_cmdline.stdout | trim }}"
+          services:
+            containerd_rc: "{{ synthran_preflight_containerd.rc }}"
+            containerd_state: "{{ synthran_preflight_containerd.stdout | default('') | trim }}"
+            kubelet_rc: "{{ synthran_preflight_kubelet.rc }}"
+            kubelet_state: "{{ synthran_preflight_kubelet.stdout | default('') | trim }}"
+            cni_dhcp_rc: "{{ synthran_preflight_dhcp_service.rc }}"
+            cni_dhcp_state: "{{ synthran_preflight_dhcp_service.stdout | default('') | trim }}"
+            ovsdb_server_rc: "{{ synthran_preflight_ovsdb.rc }}"
+            ovsdb_server_state: "{{ synthran_preflight_ovsdb.stdout | default('') | trim }}"
+            ovs_vswitchd_rc: "{{ synthran_preflight_ovsvswitchd.rc }}"
+            ovs_vswitchd_state: "{{ synthran_preflight_ovsvswitchd.stdout | default('') | trim }}"
+          cni:
+            dhcp_binary_exists: "{{ synthran_preflight_dhcp_binary.stat.exists | default(false) }}"
+            dhcp_binary_executable: "{{ synthran_preflight_dhcp_binary.stat.executable | default(false) }}"
+          ovs:
+            required_bridges: "{{ synthran_preflight_bridges }}"
+            bridge_probe_results: >-
+              {{ synthran_preflight_ovs_bridges.results | default([])
+                 | map(attribute='rc') | list }}
+          network:
+            ip_forward: "{{ synthran_preflight_ip_forward.stdout | default('') | trim }}"
+            bridge_nf_call_iptables: "{{ synthran_preflight_bridge_ipv4.stdout | default('') | trim }}"
+            bridge_nf_call_ip6tables: "{{ synthran_preflight_bridge_ipv6.stdout | default('') | trim }}"
+            active_swap: "{{ synthran_preflight_swap.stdout | default('') | trim }}"
+
+    - name: Retain per-host SOP preflight evidence before enforcement
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-preflight-{{ inventory_hostname }}.json"
+        mode: '0644'
+        content: "{{ synthran_sop_preflight_evidence | to_nice_json }}\n"
+      delegate_to: localhost
+      become: false
+
+- name: Preflight existing Kubernetes control plane before physical testbed mutation
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Probe Kubernetes control plane readiness
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, --raw=/readyz]
+      register: synthran_preflight_readyz
+      changed_when: false
+      failed_when: false
+
+    - name: Probe preserved RAN node registration
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - node
+          - "{{ ran_node_name }}"
+          - -o
+          - name
+      register: synthran_preflight_ran_node
+      changed_when: false
+      failed_when: false
+
+    - name: Probe NetworkAttachmentDefinition API
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - crd
+          - network-attachment-definitions.k8s.cni.cncf.io
+          - -o
+          - name
+      register: synthran_preflight_nad
+      changed_when: false
+      failed_when: false
+
+    - name: Build control-plane preflight evidence
+      ansible.builtin.set_fact:
+        synthran_sop_preflight_cluster_evidence:
+          schema: synthran/sop-preflight-cluster/v1
+          host_preparation: "{{ synthran_host_preparation }}"
+          core_node: "{{ inventory_hostname }}"
+          ran_node: "{{ ran_node_name }}"
+          readyz:
+            rc: "{{ synthran_preflight_readyz.rc }}"
+            stdout: "{{ synthran_preflight_readyz.stdout | default('') | trim }}"
+          ran_node_registered:
+            rc: "{{ synthran_preflight_ran_node.rc }}"
+            stdout: "{{ synthran_preflight_ran_node.stdout | default('') | trim }}"
+          network_attachment_definition:
+            rc: "{{ synthran_preflight_nad.rc }}"
+            stdout: "{{ synthran_preflight_nad.stdout | default('') | trim }}"
+
+    - name: Retain control-plane SOP preflight evidence before enforcement
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-preflight-cluster.json"
+        mode: '0644'
+        content: "{{ synthran_sop_preflight_cluster_evidence | to_nice_json }}\n"
+      delegate_to: localhost
+      become: false
+
+- name: Enforce selected SOP host preflight policy before physical testbed mutation
+  hosts: sopnodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require supported Ubuntu host for SOP deployment
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ansible_distribution == 'Ubuntu'
+        fail_msg: >-
+          SynthRAN requires Ubuntu on {{ inventory_hostname }}; observed
+          {{ ansible_distribution | default('unknown') }}.
+
+    - name: Require selected boot profile before physical testbed mutation
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item in synthran_preflight_cmdline.stdout.split()
+        fail_msg: >-
+          {{ inventory_hostname }} is missing required boot parameter {{ item }}
+          for {{ synthran_preflight_boot_profile }}.
+      loop: "{{ synthran_preflight_required_boot_tokens }}"
+
+    - name: Require preserved containerd
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_containerd.rc == 0
+        fail_msg: preserve mode requires active containerd; no repair was attempted.
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require preserved kubelet
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_kubelet.rc == 0
+        fail_msg: preserve mode requires active kubelet; no repair was attempted.
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require preserved CNI DHCP prerequisites
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_dhcp_binary.stat.exists | default(false)
+          - synthran_preflight_dhcp_binary.stat.executable | default(false)
+          - synthran_preflight_dhcp_service.rc == 0
+        fail_msg: >-
+          preserve mode requires the executable CNI DHCP plugin and active
+          cni-dhcp.service; no repair was attempted.
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require preserved OVS services
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_ovsdb.rc == 0
+          - synthran_preflight_ovsvswitchd.rc == 0
+        fail_msg: preserve mode requires active OVS services; no repair was attempted.
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require preserved authoritative OVS bridges
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.rc == 0
+        fail_msg: >-
+          preserve mode is missing an authoritative OVS bridge on
+          {{ inventory_hostname }}; no bridge mutation was attempted.
+      loop: "{{ synthran_preflight_ovs_bridges.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('unknown') }}"
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require preserved Kubernetes networking sysctls
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_ip_forward.rc == 0
+          - synthran_preflight_ip_forward.stdout | trim == '1'
+          - synthran_preflight_bridge_ipv4.rc == 0
+          - synthran_preflight_bridge_ipv4.stdout | trim == '1'
+          - synthran_preflight_bridge_ipv6.rc == 0
+          - synthran_preflight_bridge_ipv6.stdout | trim == '1'
+        fail_msg: preserve mode requires the existing Kubernetes networking sysctls.
+      when: synthran_host_preparation == 'preserve'
+
+    - name: Require swap to remain disabled in preserve mode
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_swap.rc == 0
+          - synthran_preflight_swap.stdout | trim | length == 0
+        fail_msg: preserve mode requires swap to already be disabled.
+      when: synthran_host_preparation == 'preserve'
+
+- name: Enforce preserved Kubernetes control-plane preflight before physical testbed mutation
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require preserved Kubernetes control plane
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - synthran_preflight_readyz.rc == 0
+          - synthran_preflight_ran_node.rc == 0
+          - synthran_preflight_nad.rc == 0
+        fail_msg: >-
+          preserve mode requires a ready Kubernetes control plane, the selected
+          RAN node registration, and the NetworkAttachmentDefinition API.
+      when: synthran_host_preparation == 'preserve'
