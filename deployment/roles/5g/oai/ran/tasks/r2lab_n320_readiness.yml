@@ -12,6 +12,7 @@
     modification_time: preserve
 
 - name: Reconcile and attest R2Lab N320 dual-SFP readiness
+  become: true
   ansible.builtin.shell: |
     set -euo pipefail
 
