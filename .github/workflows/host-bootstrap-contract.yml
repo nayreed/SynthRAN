@@ -32,6 +32,9 @@ jobs:
       - name: Install pinned Ansible collections
         run: ansible-galaxy collection install -r deployment/collections/requirements.yml
 
+      - name: Validate host preparation policy contract
+        run: python tools/check_host_preparation_contract.py
+
       - name: Materialize pinned 5g-Ansible reference
         run: python -m synthran.reference_checkout
 
