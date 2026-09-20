@@ -707,7 +707,10 @@ def prepare_hosts(
             for node in selected
         }
         done, pending = wait(futures, return_when=FIRST_EXCEPTION)
-        if any(future.exception() is not None for future in done):
+        if any(
+            not future.cancelled() and future.exception() is not None
+            for future in done
+        ):
             for future in pending:
                 future.cancel()
 
