@@ -47,7 +47,7 @@ Bootstrap is executable only after an evidence-backed classification of the curr
 
 For an existing healthy Kubernetes identity, bootstrap reuses the cluster and reconciles only declared prerequisites. A clusterless host may rebuild Kubernetes in place while retaining the current POS allocation and OS. An existing but unhealthy Kubernetes identity is not reset speculatively: it is classified `requires-fresh` and the deployment stops with an explicit instruction to select `fresh`.
 
-Boot-profile drift is corrected automatically only when the state is unambiguous and safe: a clusterless POS live host may receive the required boot parameters and an ordinary OS reboot. Bootstrap never uses POS image staging or the clean-image POS reset path. If the corrected profile does not become active, or boot drift is detected on an existing/ambiguous host, bootstrap stops and requires `fresh` rather than escalating silently.
+Boot-profile drift is corrected automatically only when the state is unambiguous and safe on the supported Jammy POS live baseline. The required boot parameters are applied without image staging, affected SOP hosts reboot sequentially with an ordinary OS reboot, and a reused Kubernetes cluster must recover its control plane and selected RAN node before any R2Lab mutation begins. Bootstrap never uses POS image staging or the clean-image POS reset path. If the corrected profile does not become active, the reused cluster does not recover, the OS/release is unsupported, or an existing Kubernetes identity is unhealthy, bootstrap stops and requires `fresh` rather than escalating silently.
 
 ## fresh
 

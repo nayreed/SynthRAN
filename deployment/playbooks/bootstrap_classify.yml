@@ -77,6 +77,7 @@
         synthran_bootstrap_host_prereqs_healthy: >-
           {{
             (ansible_distribution == 'Ubuntu')
+            and (ansible_distribution_release == 'jammy')
             and (synthran_preflight_containerd.rc | int == 0)
             and (synthran_preflight_kubelet.rc | int == 0)
             and (synthran_preflight_dhcp_binary.stat.exists | default(false) | bool)
@@ -101,6 +102,7 @@
         synthran_bootstrap_classification_reasons: >-
           {{
             ([] if ansible_distribution == 'Ubuntu' else ['unsupported-os'])
+            + ([] if ansible_distribution_release == 'jammy' else ['unsupported-ubuntu-release'])
             + ([] if synthran_bootstrap_cluster_action != 'requires-fresh' else ['existing-cluster-unhealthy'])
             + ([] if synthran_preflight_missing_boot_tokens | length == 0 else ['boot-profile-drift'])
             + ([]
@@ -129,13 +131,11 @@
             'requires-fresh'
             if (
               ansible_distribution != 'Ubuntu'
+              or ansible_distribution_release != 'jammy'
               or synthran_bootstrap_cluster_action == 'requires-fresh'
               or (
                 synthran_preflight_missing_boot_tokens | length > 0
-                and (
-                  synthran_bootstrap_cluster_action != 'rebuild'
-                  or not (synthran_bootstrap_live_boot | bool)
-                )
+                and not (synthran_bootstrap_live_boot | bool)
               )
             )
             else 'reboot-required'
@@ -193,6 +193,7 @@
   gather_facts: false
   become: true
   any_errors_fatal: true
+  serial: 1
   tasks:
     - name: Load retained POS authority for bootstrap boot mutation
       ansible.builtin.set_fact:
@@ -317,3 +318,65 @@
       when:
         - synthran_host_preparation == 'bootstrap'
         - synthran_bootstrap_classification == 'reboot-required'
+
+- name: Revalidate reused Kubernetes after bootstrap reboot
+  hosts: core_node
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve whether a reused cluster experienced a bootstrap reboot
+      ansible.builtin.set_fact:
+        synthran_bootstrap_reused_cluster_rebooted: >-
+          {{
+            synthran_host_preparation == 'bootstrap'
+            and synthran_bootstrap_cluster_action == 'reuse'
+            and (
+              hostvars[groups['core_node'][0]].synthran_bootstrap_classification == 'reboot-required'
+              or hostvars[groups['ran_node'][0]].synthran_bootstrap_classification == 'reboot-required'
+            )
+          }}
+
+    - name: Wait for reused Kubernetes control plane after bootstrap reboot
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - --raw=/readyz
+      register: synthran_bootstrap_reused_readyz
+      changed_when: false
+      retries: 36
+      delay: 5
+      until: synthran_bootstrap_reused_readyz.rc == 0
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+
+    - name: Wait for reused RAN node after bootstrap reboot
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - "node/{{ ran_node_name }}"
+          - --for=condition=Ready
+          - --timeout=180s
+      register: synthran_bootstrap_reused_ran_ready
+      changed_when: false
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+
+    - name: Retain reused-cluster recovery evidence before R2Lab mutation
+      ansible.builtin.copy:
+        dest: "{{ run_dir }}/sop-bootstrap-cluster-recovery.json"
+        mode: '0644'
+        content: >-
+          {{ {
+               'schema': 'synthran/bootstrap-cluster-recovery/v1',
+               'cluster_action': synthran_bootstrap_cluster_action,
+               'control_plane_ready': synthran_bootstrap_reused_readyz.rc | int == 0,
+               'ran_node_ready': synthran_bootstrap_reused_ran_ready.rc | int == 0,
+               'r2lab_mutation_started': false
+             } | to_nice_json }}\n
+      delegate_to: localhost
+      become: false
+      when: synthran_bootstrap_reused_cluster_rebooted | bool
+
