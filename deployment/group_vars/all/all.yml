@@ -47,8 +47,41 @@ synthran_oai_rfsim_gnb_index_digest: "sha256:0dd2bd5507ccbbe08600a6df33a32f7861e
 synthran_oai_rfsim_ue_repository: "docker.io/oaisoftwarealliance/oai-nr-ue"
 synthran_oai_rfsim_ue_index_digest: "sha256:18b7a553088e98187de38e363ebe389ece45db6b54c0ce568c60f681762515c8"
 
-# #52 normalizes this field to fresh|preserve in the resolved scenario. This
-# policy remains controller-owned and is never inferred from live host state.
+# #124 defines preserve|bootstrap|fresh in the resolved scenario. This policy
+# remains controller-owned and is never inferred from live host state.
+synthran_ran_boot_nodes:
+  - sopnode-f1
+  - sopnode-f2
+  - sopnode-f3
+
+# These token lists mirror the pinned POS boot profiles used by
+# synthran.reservation. The preflight checks the running kernel before any
+# R2Lab radio/UE mutation; contract CI guards this vocabulary.
+synthran_boot_common_tokens:
+  - biosdevname=0
+  - net.ifnames=0
+  - mitigations=off
+  - intel_iommu=on
+  - iommu=pt
+  - selinux=0
+  - enforcing=0
+  - nosoftlockup
+  - intel_pstate=disable
+  - idle=poll
+  - nosmt
+synthran_boot_ran_tokens:
+  - isolcpus=managed_irq,16-63
+  - nohz_full=16-63
+  - nohz=on
+  - rcu_nocbs=16-63
+  - kthread_cpus=0-4
+  - irqaffinity=0-4
+  - rcu_nocb_poll
+  - skew_tick=1
+  - tsc=nowatchdog
+  - nmi_watchdog=0
+  - softlockup_panic=0
+  - audit=0
 synthran_host_preparation: >-
   {{
     (
