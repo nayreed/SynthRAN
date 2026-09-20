@@ -140,7 +140,6 @@ def main() -> None:
         "setup/k8s/k8s_setup",
         "setup/optimization/cpu",
         "setup/ovs",
-        "setup/k8s/k8s_setup",
         "setup/k8s/cluster_create",
         "setup/k8s/cni_dhcp",
         "setup/k8s/cluster_join",
@@ -154,6 +153,7 @@ def main() -> None:
     rebuild_only_roles = {
         "setup/netplan",
         "setup/pre_k8s",
+        "setup/k8s/k8s_setup",
         "setup/k8s/cluster_create",
         "setup/k8s/cni_dhcp",
         "setup/k8s/cluster_join",
