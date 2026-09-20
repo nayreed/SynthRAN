@@ -43,7 +43,11 @@ Its contract is:
 - never silently escalate to `fresh`;
 - fail and instruct the operator to choose `fresh` when the current host cannot be reconciled safely.
 
-Task 1 of issue #124 declares this policy but does not implement the reconciliation engine. Until Task 4 lands, a resolved scenario may name `bootstrap`, but execution fails closed before any host-preparation command is attempted.
+Bootstrap is executable only after an evidence-backed classification of the current host and cluster state. The classifier records one of `healthy`, `repairable-in-place`, `reboot-required`, or `requires-fresh` before R2Lab hardware mutation.
+
+For an existing healthy Kubernetes identity, bootstrap reuses the cluster and reconciles only declared prerequisites. A clusterless host may rebuild Kubernetes in place while retaining the current POS allocation and OS. An existing but unhealthy Kubernetes identity is not reset speculatively: it is classified `requires-fresh` and the deployment stops with an explicit instruction to select `fresh`.
+
+Boot-profile drift is corrected automatically only when the state is unambiguous and safe: a clusterless POS live host may receive the required boot parameters and an ordinary OS reboot. Bootstrap never uses POS image staging or the clean-image POS reset path. If the corrected profile does not become active, or boot drift is detected on an existing/ambiguous host, bootstrap stops and requires `fresh` rather than escalating silently.
 
 ## fresh
 
@@ -83,8 +87,7 @@ Issue #124 is intentionally incremental:
 
 1. Task 1 defines and validates this three-mode contract.
 2. Tasks 2-3 move viability checks before physical R2Lab mutation.
-3. Task 4 implements the bounded `bootstrap` reconciler.
-4. Task 5 defines live boot-state comparison and minimum reboot behavior.
-5. Later tasks expose the mode in the interactive wizard, optimize fresh preparation, and physically validate the result.
+3. Tasks 4-6 implement bounded reconciliation, boot-state handling, and repairability classification.
+4. Later tasks expose the mode in the interactive wizard, optimize fresh preparation, and physically validate the result.
 
-This ordering prevents a partially implemented `bootstrap` mode from mutating physical hosts.
+The classifier and its evidence run before any R2Lab cleanup, RRU power cycle, or selected-UE preparation.
