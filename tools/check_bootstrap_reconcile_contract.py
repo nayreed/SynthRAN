@@ -71,6 +71,7 @@ def main() -> int:
         "reboot-required",
         "requires-fresh",
         "existing-cluster-unhealthy",
+        "unsupported-ubuntu-release",
         "boot-profile-drift",
         "sop-bootstrap-classification-cluster.json",
         "sop-bootstrap-classification-{{ inventory_hostname }}.json",
@@ -79,6 +80,11 @@ def main() -> int:
         "Require explicit POS authority before bootstrap boot mutation",
         "Reboot current OS to activate corrected boot parameters",
         "Require corrected boot profile after bootstrap reboot",
+        "serial: 1",
+        "Revalidate reused Kubernetes after bootstrap reboot",
+        "Wait for reused Kubernetes control plane after bootstrap reboot",
+        "Wait for reused RAN node after bootstrap reboot",
+        "sop-bootstrap-cluster-recovery.json",
         "image_staged': false",
         "allocation_reclaimed': false",
         "pos_reset_used': false",
@@ -110,8 +116,10 @@ def main() -> int:
         "synthran_host_preparation in ['fresh', 'bootstrap']",
         "synthran_bootstrap_cluster_action == 'rebuild'",
         "synthran_bootstrap_cluster_action == 'reuse'",
+        "Resolve bootstrap CNI repair need",
         "Reconcile CNI plugin binaries for bootstrap reuse",
         "Reconcile CNI DHCP service for bootstrap reuse",
+        "synthran_bootstrap_cni_repair_needed | bool",
         "setup/k8s/cluster_create",
         "setup/k8s/cluster_join",
         "setup/ovs",
@@ -129,6 +137,15 @@ def main() -> int:
     require(
         preflight < classify_at < r2lab,
         "bootstrap classification and boot reconciliation must precede R2Lab mutation",
+    )
+    require(
+        classify.index("Apply minimum bootstrap boot-profile correction")
+        < classify.index("Revalidate reused Kubernetes after bootstrap reboot"),
+        "reused-cluster recovery proof must follow bounded reboot",
+    )
+    require(
+        bootstrap_nodes.count("synthran_bootstrap_cni_repair_needed | bool") == 6,
+        "bootstrap CNI repair predicate must guard exactly the six bounded repair tasks",
     )
 
     preflight_text = (
