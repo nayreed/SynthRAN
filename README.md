@@ -30,47 +30,65 @@ That boundary is a research invariant: an experiment must not silently repair or
 ## System model
 
 ```mermaid
-flowchart LR
-    subgraph SOURCE["Modeled Ambient-IoT source"]
-        ENERGY["Harvested energy"] --> CAP["Capacitor"]
-        CAP --> CTRL["Controller"]
-        CTRL --> SENSE["Sensing"]
-        SENSE --> MAC["Access protocol"]
-        MAC --> TX["Backscatter attempts"]
-        TX --> RX["Receiver / SINR / collision / SIC"]
-        RX --> EVENTS["Decoded event trace"]
+flowchart TB
+    classDef model fill:#ECFDF3,stroke:#16A34A,color:#14532D,stroke-width:1.5px
+    classDef infra fill:#EFF6FF,stroke:#2563EB,color:#1E3A8A,stroke-width:1.5px
+    classDef science fill:#F5F3FF,stroke:#7C3AED,color:#4C1D95,stroke-width:1.5px
+    classDef evidence fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.5px
+    classDef external fill:#F8FAFC,stroke:#64748B,color:#334155,stroke-width:1px,stroke-dasharray:5 5
+
+    subgraph MODEL["1 · Modeled Ambient-IoT"]
+        direction LR
+        ENERGY["Harvested energy"] --> DEVICE["Capacitor · controller · sensing"]
+        DEVICE --> ACCESS["Backscatter · MAC · SINR / SIC"]
+        ACCESS --> EVENTS["Decoded events"]
     end
 
-    subgraph SCIENCE["Scientific experiment layer"]
-        EXP["./experiment.sh"] --> QUAL["Qualify"]
-        QUAL --> CAL["Calibrate"]
-        CAL --> FREEZE["Freeze design"]
-        FREEZE --> CONF["Confirm"]
-        CONF --> ANALYZE["Analyze"]
+    subgraph INFRA["2 · 5G infrastructure · deploy.sh"]
+        direction LR
+        SELECT["Resolve topology"] --> PLATFORM{"Platform"}
+        PLATFORM -->|RFSIM| VIRTUAL["Software radio + UE"]
+        PLATFORM -->|R2Lab| PHYSICAL["SLICES / POS / R2Lab<br/>N300 / N320 + modem UE"]
+        VIRTUAL --> STACK["5G core + RAN<br/>N2 / N3 / N4"]
+        PHYSICAL --> STACK
+        STACK --> VERIFY["Verify + attest"]
+        VERIFY --> ACCEPTED["accepted-testbed"]
     end
 
-    subgraph TESTBED["5G infrastructure layer"]
-        DEP["./deploy.sh"] --> RES["Reserve / resolve"]
-        RES --> PREP["Prepare"]
-        PREP --> CORE["5G core"]
-        CORE --> RAN["RAN + radio"]
-        RAN --> UE["Gateway UE(s)"]
-        UE --> VERIFY["Verify + attest"]
+    UPSTREAM["sopnode/5g_ansible<br/>reviewed lifecycle tasks"]:::external
+    UPSTREAM -.-> STACK
+
+    subgraph SCIENCE["3 · Scientific experiment · experiment.sh"]
+        direction LR
+        DESIGN["Qualify · calibrate · freeze"] --> ATTACH["Read-only attach"]
+        ATTACH --> ELIG["Experiment eligibility"]
+        ELIG --> REPLAY["Frozen workload replay"]
+        REPLAY --> ANALYZE["Analyze"]
     end
 
-    subgraph ATTACH["Read-only experiment attachment"]
-        ACCEPTED["Accepted deployment identity"] --> COMPAT["Compatibility gate"]
-        COMPAT --> REPLAY["Workload replay"]
+    subgraph OBSERVED["4 · Observed outcome"]
+        direction LR
+        GATEWAY["Selected gateway UE"] --> APP["N6 application / collector"]
+        APP --> RESULT["Reconciled evidence"]
     end
 
-    EVENTS --> CONF
-    VERIFY --> ACCEPTED
-    CONF --> COMPAT
-    REPLAY --> UE
-    UE --> APP["N6-side application / collector"]
-    APP --> RESULT["Reconciled evidence"]
+    EVENTS --> BUNDLE["Immutable workload"]:::evidence
+    BUNDLE --> REPLAY
+    ACCEPTED --> ATTACH
+    REPLAY --> GATEWAY
     ANALYZE --> RESULT
+
+    class ENERGY,DEVICE,ACCESS,EVENTS model
+    class SELECT,PLATFORM,VIRTUAL,PHYSICAL,STACK,VERIFY,ACCEPTED infra
+    class DESIGN,ATTACH,ELIG,REPLAY,ANALYZE science
+    class GATEWAY,APP,RESULT evidence
 ```
+
+**How to read it:**
+
+- **The Ambient-IoT radio process is modeled.** Physical R2Lab hardware carries the downstream 5G gateway transport of a frozen decoded workload; it does not make the upstream Ambient-IoT link physical.
+- **`deploy.sh` owns infrastructure; `experiment.sh` owns science.** Reviewed `sopnode/5g_ansible` tasks may implement lifecycle steps, but SynthRAN retains resource authority, deployment identity, and acceptance.
+- **`accepted-testbed` is necessary but not sufficient for a physical study.** Experiments apply a separate eligibility gate for the fresh UE/PDU/path/treatment evidence required by that study before replay begins.
 
 ---
 
