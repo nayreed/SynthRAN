@@ -852,8 +852,11 @@ def prepare_hosts(
         flush=True,
     )
     allocation_authority = allocation_authority or {}
-    persistent_allocation_authority = bool(
-        str(allocation_authority.get("event_id", "")).strip()
+    persisted_allocation_authority = _read_managed_state()
+    persistent_allocation_authority = (
+        bool(str(allocation_authority.get("event_id", "")).strip())
+        and _same_calendar_authority(allocation_authority, calendar)
+        and persisted_allocation_authority == allocation_authority
     )
     result_folder = str(
         allocation_authority.get("allocation_result_folder", "")
