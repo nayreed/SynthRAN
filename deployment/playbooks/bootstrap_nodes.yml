@@ -227,11 +227,20 @@
          synthran_bootstrap_cluster_action == 'rebuild')
   roles:
     - role: setup/k8s/cluster_create
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
     - role: setup/k8s/cni_dhcp
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
     - role: setup/k8s/remove_cp_taint
-      when: synthran_host_preparation == 'fresh'
+      when: >-
+        synthran_host_preparation == 'fresh' or
+        (synthran_host_preparation == 'bootstrap' and
+         synthran_bootstrap_cluster_action == 'rebuild')
   tasks:
     - name: Verify preserved Kubernetes control plane is reachable
       ansible.builtin.command:
