@@ -97,6 +97,20 @@ def policy_checks() -> dict[str, str]:
     assert explicit["reservation"]["host_preparation"] == "preserve"
     assert explicit["r2lab_reservation"]["mode"] == "require-existing"
 
+    bootstrap = {
+        "platform": "r2lab",
+        "reservation": {
+            "mode": "require-existing",
+            "host_preparation": "bootstrap",
+            "duration_minutes": 120,
+            "image": "unused-for-bootstrap",
+        },
+        "r2lab_reservation": {"mode": "require-existing", "duration_minutes": 120},
+    }
+    _normalize_reservation_policy(bootstrap)
+    assert bootstrap["reservation"]["mode"] == "require-existing"
+    assert bootstrap["reservation"]["host_preparation"] == "bootstrap"
+
     invalid = {
         "platform": "r2lab",
         "reservation": {"mode": "disabled", "host_preparation": "fresh"},
@@ -105,6 +119,7 @@ def policy_checks() -> dict[str, str]:
     return {
         "legacy_canonicalization": "passed",
         "explicit_independent_policy": "passed",
+        "bootstrap_policy": "passed",
         "invalid_policy_rejected": "passed",
     }
 

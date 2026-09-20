@@ -18,13 +18,22 @@ def main() -> int:
     markers = [
         "Ensure selected SOP nodes are reserved?",
         "How should SynthRAN prepare the selected SOP nodes?",
-        "Reuse current node state",
-        "Reset/reimage nodes before deployment",
+        "Reuse verified current node state",
+        "Bootstrap/reconcile current node state",
+        "Fresh reset/reimage",
+        "No host repair or reboot.",
+        "Keep the current OS/allocation and repair safe prerequisites in place",
+        "known-clean POS image/reset path",
         "SELECTED_RESERVATION_MODE=create",
         "SELECTED_RESERVATION_MODE=require-existing",
         "SELECTED_RESERVATION_MODE=disabled",
         "SELECTED_HOST_PREPARATION=fresh",
+        "SELECTED_HOST_PREPARATION=bootstrap",
         "SELECTED_HOST_PREPARATION=preserve",
+        "Enter choice [1-3]",
+        "bootstrap (retain OS/allocation; bounded reconcile/reboot)",
+        "preserve (verify/reuse only; no repair)",
+        "fresh reset/reimage, image",
         "'mode': reservation_mode",
         "'host_preparation': host_preparation",
     ]
@@ -43,6 +52,12 @@ def main() -> int:
                 "internal reservation policy leaked back into the ordinary interactive UX: "
                 + leaked_internal_label
             )
+
+    preserve_choice = text.index("1) SELECTED_HOST_PREPARATION=preserve")
+    bootstrap_choice = text.index("2) SELECTED_HOST_PREPARATION=bootstrap")
+    fresh_choice = text.index("3) SELECTED_HOST_PREPARATION=fresh")
+    if not preserve_choice < bootstrap_choice < fresh_choice:
+        raise CheckError("interactive preparation choice mapping is not preserve -> bootstrap -> fresh")
 
     if text.index("'mode': reservation_mode") > text.index("Path(output).write_text"):
         raise CheckError("reservation mode is not materialized before scenario write")

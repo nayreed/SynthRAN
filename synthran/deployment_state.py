@@ -340,11 +340,20 @@ def build_manifest(
     deployment = clean_scenario["deployment"]
     network_definition = copy.deepcopy(network_profile)
     network_definition.pop("ues", None)
+    reservation = deployment.get("reservation", {})
+    host_preparation = str(reservation.get("host_preparation", ""))
     selected = {
         "core": str(deployment["core"]).lower(),
         "ran": str(deployment["ran"]).lower(),
         "platform": str(deployment["platform"]).lower(),
         "radio_unit": "rfsim" if deployment["platform"] == "rfsim" else deployment.get("ru", deployment["platform"]),
+        "reservation_mode": str(reservation.get("mode", "")),
+        "host_preparation": host_preparation,
+        "pos_image": (
+            str(reservation.get("image", ""))
+            if host_preparation == "fresh"
+            else None
+        ),
         "ansible_vars": copy.deepcopy(deployment.get("ansible_vars", {})),
         "host_vars": copy.deepcopy(deployment.get("host_vars", {})),
         "nodes": copy.deepcopy(deployment["nodes"]),

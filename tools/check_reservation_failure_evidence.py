@@ -120,6 +120,23 @@ def pos_failure(tmp: Path) -> None:
             raise CheckError("POS failure evidence lost the original provider error")
         if evidence["selected_resources"] != nodes:
             raise CheckError("POS failure evidence lost selected allocation identities")
+        preparation = evidence.get("host_preparation", {})
+        if preparation.get("mode") != "fresh" or preparation.get("status") != "failed":
+            raise CheckError("parallel fresh failure did not retain host-preparation failure evidence")
+        records = preparation.get("nodes", {})
+        if set(records) != set(nodes):
+            raise CheckError(f"parallel fresh failure lost per-node evidence: {records}")
+        failed_nodes = [
+            node for node, record in records.items()
+            if record.get("status") == "failed"
+        ]
+        if not failed_nodes:
+            raise CheckError("parallel fresh failure evidence contains no failed node record")
+        if not all(
+            record.get("completed_phases") is not None
+            for record in records.values()
+        ):
+            raise CheckError("parallel fresh failure evidence lost phase history")
         state = json.loads((tmp / "pos-state.json").read_text())
         if state.get("event_id") != "42" or state.get("nodes") != nodes:
             raise CheckError("persistent POS state lost known reservation identity")

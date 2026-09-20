@@ -84,6 +84,9 @@ def deployment_fixture() -> dict:
         "ran": "srsran",
         "platform": "rfsim",
         "radio_unit": "rfsim",
+        "reservation_mode": "create",
+        "host_preparation": "fresh",
+        "pos_image": "ubuntu-jammy",
         "network_profile": "ci",
         "network_profile_hash": "sha256:" + "9" * 64,
         "bridge_enabled": True,
@@ -280,6 +283,8 @@ def main() -> None:
             "ran": ["srsran", "oai"],
             "platform": "rfsim",
             "radio_unit": "rfsim",
+            "reservation_mode": "create",
+            "host_preparation": "fresh",
             "nodes": {"core": "f2", "ran": "f3"},
             "ue_devices": ["uesim01"],
             "exact_ue_devices": True,
@@ -290,6 +295,9 @@ def main() -> None:
         assert attached["status"] == "accepted-testbed-attached"
         assert attached["experiment_eligible"] is False
         assert attached["mode"] == "read_only"
+        assert attached["deployment"]["reservation_mode"] == "create"
+        assert attached["deployment"]["host_preparation"] == "fresh"
+        assert attached["deployment"]["pos_image"] == "ubuntu-jammy"
 
         require_failure(
             lambda: attach_active_deployment({"ran": "oai"}, endpoint_path=endpoint),

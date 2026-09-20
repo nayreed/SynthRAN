@@ -73,12 +73,14 @@ The canonical preparation contract is documented in [`host-preparation.md`](host
 
 `fresh` requires proven calendar authority first and uses two phases. Phase 1 proves allocation authority for **every selected SOP node before any image/reset mutation occurs**. If one selected node cannot be allocated, no selected node has been reimaged. An already-active allocation may be reclaimed only after all selected nodes have first been probed and only under the explicit `fresh` policy.
 
-After allocation authority is proven for the complete selected resource set, phase 2 prepares each exact node in this order:
+After allocation authority is proven for the complete selected resource set, phase 2 prepares independent selected SOP nodes concurrently. The per-node sequence remains strict:
 
 1. select the resolved scenario image with the reviewed upstream staging mechanic;
 2. apply the pinned original-upstream SOP/N3xx boot parameters;
 3. perform a blocking POS reset;
 4. prove SSH readiness with a bounded retry.
+
+Calendar acquisition, allocation probing and any required allocation reclaim remain serialized authority work. If one parallel node fails, SynthRAN cancels work that has not started and signals already-running peers to stop at the next safe per-node phase boundary. Any provider command already in flight is allowed to settle rather than being orphaned. Per-node completion/cancellation/failure state is retained and the preparation fails as a whole.
 
 The user-facing `ubuntu-jammy` alias resolves before POS mutation to the pinned provider artifact `ubuntu-jammy-slices@2025-04-02T01:33:28+00:00`; explicit full image identifiers remain unchanged. The resolved private scenario and evidence therefore record the actual provider image.
 
@@ -104,7 +106,9 @@ R2Lab cleanup is selected-resource scoped. It stops only the UEs present in the 
 
 ## Evidence
 
-Every reservation pass writes `results/<run>/reservation-authority.json` incrementally. It records the selected role/resource identity, explicit policies, provider context, POS calendar ID/coverage and host-preparation evidence. Bootstrap additionally retains SOP preflight, repairability classification, and (when needed) boot-reconciliation evidence before physical R2Lab mutation. If a later mutation fails, earlier known ownership identifiers remain in the run evidence together with the original error message.
+Every reservation pass writes `results/<run>/reservation-authority.json` incrementally. It records the selected role/resource identity, explicit policies, provider context, POS calendar ID/coverage and host-preparation evidence. Multi-node fresh preparation retains per-node phase/status evidence, including partial failure state when one independently prepared node fails. Bootstrap additionally retains SOP preflight, repairability classification, and (when needed) boot-reconciliation evidence before physical R2Lab mutation. If a later mutation fails, earlier known ownership identifiers remain in the run evidence together with the original error message.
+
+The accepted deployment identity also retains the canonical `reservation_mode` and `host_preparation` values; `pos_image` is bound only for the `fresh` path so preserve/bootstrap do not claim an unused image. Host runtime provenance records the preparation mode observed for the run.
 
 `pos-selection.json` remains as a compatibility/evidence surface for the deployment runner, including POS coverage end used to constrain an R2Lab lease window. It no longer carries remapped node identities because reservation handling cannot remap them.
 

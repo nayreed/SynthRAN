@@ -617,16 +617,23 @@ BANNER
 
     case "$DEFAULT_HOST_PREPARATION" in
       preserve) DEFAULT_PREP_CHOICE=1 ;;
-      *) DEFAULT_PREP_CHOICE=2 ;;
+      bootstrap) DEFAULT_PREP_CHOICE=2 ;;
+      fresh) DEFAULT_PREP_CHOICE=3 ;;
+      *) DEFAULT_PREP_CHOICE=3 ;;
     esac
     echo
     echo "How should SynthRAN prepare the selected SOP nodes?"
-    echo "1) Reuse current node state"
-    echo "2) Reset/reimage nodes before deployment"
-    read -r -p "Enter choice [1-2] [$DEFAULT_PREP_CHOICE]: " PREP_CHOICE
+    echo "1) Reuse verified current node state"
+    echo "   No host repair or reboot. Deployment stops if required prerequisites are missing."
+    echo "2) Bootstrap/reconcile current node state"
+    echo "   Keep the current OS/allocation and repair safe prerequisites in place; a bounded reboot may be used, but no reimage."
+    echo "3) Fresh reset/reimage"
+    echo "   Use the known-clean POS image/reset path and rebuild host/Kubernetes prerequisites."
+    read -r -p "Enter choice [1-3] [$DEFAULT_PREP_CHOICE]: " PREP_CHOICE
     case "${PREP_CHOICE:-$DEFAULT_PREP_CHOICE}" in
       1) SELECTED_HOST_PREPARATION=preserve ;;
-      2) SELECTED_HOST_PREPARATION=fresh ;;
+      2) SELECTED_HOST_PREPARATION=bootstrap ;;
+      3) SELECTED_HOST_PREPARATION=fresh ;;
       *) echo "Invalid SOP preparation choice" >&2; exit 2 ;;
     esac
 
@@ -707,11 +714,17 @@ PY
   echo "  UE slices:"
   describe_ue_slice_assignments "$SELECTED_NETWORK_PROFILE" "$SELECTED_UE_SLICE_SPEC"
   if $SELECTED_RESERVE; then
-    if [[ "$SELECTED_HOST_PREPARATION" == fresh ]]; then
-      echo "  POS:             true, ${SELECTED_DURATION}m, image $SELECTED_POS_IMAGE"
-    else
-      echo "  POS:             true, ${SELECTED_DURATION}m, reuse current host state"
-    fi
+    case "$SELECTED_HOST_PREPARATION" in
+      preserve)
+        echo "  POS:             true, ${SELECTED_DURATION}m, preserve (verify/reuse only; no repair)"
+        ;;
+      bootstrap)
+        echo "  POS:             true, ${SELECTED_DURATION}m, bootstrap (retain OS/allocation; bounded reconcile/reboot)"
+        ;;
+      fresh)
+        echo "  POS:             true, ${SELECTED_DURATION}m, fresh reset/reimage, image $SELECTED_POS_IMAGE"
+        ;;
+    esac
   else
     echo "  POS:             false"
   fi
