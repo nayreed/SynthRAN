@@ -65,6 +65,54 @@ Permitted behavior includes:
 
 `fresh` must not be entered implicitly from another mode.
 
+## Operator decision guide
+
+Choose the least-mutating mode justified by what you know about the selected SOP hosts:
+
+```text
+Current host + Kubernetes state already proven complete?
+├─ yes -> preserve
+│          verification only; any missing prerequisite is a hard failure
+└─ no
+   ├─ valid retained Ubuntu/Jammy worth keeping and safe to reconcile?
+   │  ├─ yes -> bootstrap
+   │  │          classify first; repair only supported prerequisites;
+   │  │          bounded reboot only when explicitly justified
+   │  └─ no  -> fresh
+   │             known-clean image/reset baseline
+   └─ bootstrap says requires-fresh -> stop and choose fresh explicitly
+```
+
+- Use **preserve** after a previous accepted deployment or when independent evidence says the complete prerequisite stack is still healthy. It is verification-only.
+- Use **bootstrap** for a valid retained Ubuntu/Jammy host that may be missing Kubernetes, CNI, OVS, sysctl, or related SynthRAN prerequisites.
+- Use **fresh** when host history is uncertain, an existing Kubernetes identity is unhealthy, the OS/release is unsupported, boot state cannot be reconciled safely, or a deterministic clean baseline is required.
+
+Do not choose `preserve` merely because you want a faster deployment. `preserve` is a verification policy, not an optimization flag.
+
+### Bootstrap fallback rule
+
+Bootstrap never performs an automatic fresh image/reset fallback. When classification reports `requires-fresh`:
+
+1. the current deployment stops before physical R2Lab mutation;
+2. inspect `sop-bootstrap-classification-<host>.json` and the failure message;
+3. keep the failed run as evidence;
+4. start a new deployment and choose `fresh` explicitly.
+
+### Evidence to inspect
+
+Under `results/<run-id>/`:
+
+- `reservation-authority.json` — selected policy and external-resource authority;
+- `sop-preflight-<host>.json` — observed host prerequisite state;
+- `sop-bootstrap-classification-<host>.json` — bootstrap decision and reasons;
+- `sop-bootstrap-boot-<host>.json` — bounded boot correction/reboot evidence when used;
+- `bootstrap-evidence.json` — final host/Kubernetes bootstrap state;
+- `phase-timings.json` — reservation/preparation/deployment/verification durations;
+- `deployment-fingerprint.json` — final deployment identity;
+- `live-deployment-evidence.json` — UE/session/user-plane acceptance evidence.
+
+For the issue #124 physical acceptance procedure, see [`issue124-r2lab-validation.md`](issue124-r2lab-validation.md).
+
 ## Authority matrix
 
 | Capability | preserve | bootstrap | fresh |
