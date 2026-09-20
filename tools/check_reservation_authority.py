@@ -443,8 +443,6 @@ def preparation_checks() -> dict[str, str]:
         }
     finally:
         reservation.run = original
-        reservation.STATE_PATH = original_state
-        state_tmp.cleanup()
         if old_attempts is None:
             os.environ.pop("SYNTHRAN_POS_READY_ATTEMPTS", None)
         else:
@@ -624,6 +622,8 @@ def allocation_reuse_checks() -> dict[str, str]:
         }
     finally:
         reservation.run = original
+        reservation.STATE_PATH = original_state
+        state_tmp.cleanup()
         if old_attempts is None:
             os.environ.pop("SYNTHRAN_POS_READY_ATTEMPTS", None)
         else:
