@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import os
 import re
 import subprocess
@@ -45,6 +46,33 @@ REFERENCE_BOOT_RAN_PARAMETERS = (
 
 class ReservationError(RuntimeError):
     pass
+
+
+class FreshNodePreparationError(ReservationError):
+    def __init__(
+        self,
+        node: str,
+        phase: str,
+        record: Mapping[str, Any],
+        cause: Exception,
+    ) -> None:
+        self.node = node
+        self.phase = phase
+        self.record = dict(record)
+        self.cause = cause
+        super().__init__(f"{node} fresh preparation failed during {phase}: {cause}")
+
+
+class FreshPreparationError(ReservationError):
+    def __init__(
+        self,
+        nodes: Mapping[str, Mapping[str, Any]],
+        failures: Mapping[str, str],
+    ) -> None:
+        self.nodes = {name: dict(record) for name, record in nodes.items()}
+        self.failures = dict(failures)
+        detail = "; ".join(f"{node}: {message}" for node, message in self.failures.items())
+        super().__init__("fresh host preparation failed: " + detail)
 
 
 def _output(result: subprocess.CompletedProcess[str]) -> str:
@@ -527,6 +555,67 @@ def _wait_for_ssh(node: str) -> int:
     raise ReservationError(f"{node} did not become SSH-ready after POS reset: {last}")
 
 
+def _prepare_fresh_node(
+    node: str,
+    *,
+    allocation: str,
+    image: str,
+) -> dict[str, Any]:
+    boot_profile, boot_parameters = _boot_parameters(node)
+    record: dict[str, Any] = {
+        "allocation": allocation,
+        "image": image,
+        "boot_profile": boot_profile,
+        "status": "preparing",
+        "completed_phases": [],
+    }
+    phase = "image-staging"
+    try:
+        print(
+            f"[POS prepare] {node}: selecting image {image}; provider staging may "
+            "take several minutes",
+            flush=True,
+        )
+        run_visible(["pos", "nodes", "image", "--staging", node, image])
+        record["completed_phases"].append("image-staging")
+        print(f"[POS prepare] {node}: image staging completed", flush=True)
+
+        phase = "boot-parameters"
+        print(
+            f"[POS prepare] {node}: applying boot parameters ({boot_profile})",
+            flush=True,
+        )
+        run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
+        record["completed_phases"].append("boot-parameters")
+        print(f"[POS prepare] {node}: boot parameters applied", flush=True)
+
+        phase = "reset"
+        print(
+            f"[POS prepare] {node}: resetting node with POS --blocking; this command "
+            "returns only after POS reports reset completion",
+            flush=True,
+        )
+        run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
+        record["completed_phases"].append("reset")
+        record["reset"] = "blocking"
+        print(f"[POS prepare] {node}: POS reset completed", flush=True)
+
+        phase = "ssh-readiness"
+        ready_attempt = _wait_for_ssh(node)
+        record["completed_phases"].append("ssh-readiness")
+        record["ssh_ready_attempt"] = ready_attempt
+        record["status"] = "ready"
+        return record
+    except Exception as exc:
+        record["status"] = "failed"
+        record["failed_phase"] = phase
+        record["failure"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        raise FreshNodePreparationError(node, phase, record, exc) from exc
+
+
 def prepare_hosts(
     reservation: Mapping[str, Any],
     *,
@@ -590,53 +679,63 @@ def prepare_hosts(
             allocation_states[node] = _reclaim_allocation_for_fresh(node)
 
     print(
-        "Allocation authority proven for all selected SOP nodes; applying image, boot parameters, reset, and readiness checks",
+        "Allocation authority proven for all selected SOP nodes; preparing independent nodes concurrently",
         flush=True,
     )
 
-    nodes: dict[str, Any] = {}
     for node in selected:
-        allocation = allocation_states[node]
-        if allocation not in {"new", "reclaimed"}:
+        if allocation_states[node] not in {"new", "reclaimed"}:
             raise ReservationError(
-                f"internal allocation state for {node} is not safe to prepare: {allocation}"
+                f"internal allocation state for {node} is not safe to prepare: "
+                f"{allocation_states[node]}"
             )
-        boot_profile, boot_parameters = _boot_parameters(node)
 
-        print(
-            f"[POS prepare] {node}: selecting image {image}; provider staging may "
-            "take several minutes",
-            flush=True,
-        )
-        run_visible(["pos", "nodes", "image", "--staging", node, image])
-        print(f"[POS prepare] {node}: image staging completed", flush=True)
-
-        print(
-            f"[POS prepare] {node}: applying boot parameters ({boot_profile})",
-            flush=True,
-        )
-        run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
-        print(f"[POS prepare] {node}: boot parameters applied", flush=True)
-
-        print(
-            f"[POS prepare] {node}: resetting node with POS --blocking; this command "
-            "returns only after POS reports reset completion",
-            flush=True,
-        )
-        run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
-        print(f"[POS prepare] {node}: POS reset completed", flush=True)
-
-        ready_attempt = _wait_for_ssh(node)
-        nodes[node] = {
-            "allocation": allocation,
-            "image": image,
-            "boot_profile": boot_profile,
-            "reset": "blocking",
-            "ssh_ready_attempt": ready_attempt,
+    node_records: dict[str, dict[str, Any]] = {}
+    failures: dict[str, str] = {}
+    max_workers = max(1, len(selected))
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="synthran-pos-fresh",
+    ) as executor:
+        futures = {
+            executor.submit(
+                _prepare_fresh_node,
+                node,
+                allocation=allocation_states[node],
+                image=image,
+            ): node
+            for node in selected
         }
+        done, pending = wait(futures, return_when=FIRST_EXCEPTION)
+        if any(future.exception() is not None for future in done):
+            for future in pending:
+                future.cancel()
+
+    for future, node in futures.items():
+        if future.cancelled():
+            node_records[node] = {
+                "allocation": allocation_states[node],
+                "image": image,
+                "boot_profile": _boot_parameters(node)[0],
+                "status": "cancelled-after-peer-failure",
+                "completed_phases": [],
+            }
+            failures[node] = "cancelled after another selected node failed"
+            continue
+        try:
+            node_records[node] = future.result()
+        except FreshNodePreparationError as exc:
+            node_records[node] = dict(exc.record)
+            failures[node] = str(exc)
+
+    ordered_records = {node: node_records[node] for node in selected}
+    if failures:
+        raise FreshPreparationError(ordered_records, failures)
+
     return {
         "mode": "fresh",
-        "nodes": nodes,
+        "nodes": ordered_records,
+        "parallel_preparation": len(selected) > 1,
         "managed_by": "synthran",
     }
 
@@ -727,6 +826,14 @@ def execute(config_path: Path, run_dir: Path) -> dict[str, Any]:
         _write_json(run_dir / "pos-selection.json", pos_selection)
         return evidence
     except Exception as exc:
+        if isinstance(exc, FreshPreparationError):
+            evidence["host_preparation"] = {
+                "mode": "fresh",
+                "status": "failed",
+                "nodes": exc.nodes,
+                "parallel_preparation": len(selected) > 1,
+                "managed_by": "synthran",
+            }
         evidence["status"] = "failed"
         evidence["failure"] = {
             "type": type(exc).__name__,
