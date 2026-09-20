@@ -15,6 +15,7 @@ SETUP = ROOT / "deployment/roles/5g/oai/setup/tasks/main.yml"
 N320_SOURCE = ROOT / "deployment/roles/5g/oai/setup/tasks/r2lab_n320.yml"
 RAN = ROOT / "deployment/roles/5g/oai/ran/tasks/main.yml"
 N320_CHART = ROOT / "deployment/roles/5g/oai/ran/tasks/r2lab_n320_chart.yml"
+N320_READINESS = ROOT / "deployment/roles/5g/oai/ran/tasks/r2lab_n320_readiness.yml"
 N320_ATTEST = ROOT / "deployment/roles/5g/oai/ran/tasks/r2lab_n320_attest.yml"
 N320_NAD = ROOT / "deployment/roles/5g/oai/ran/files/r2lab_n320_ipvlan_nad.yaml"
 LEGACY_SWAP = ROOT / "deployment/roles/5g/oai/ran/n3xx_ip_swap"
@@ -124,6 +125,7 @@ def validate_local_contract(pin: str) -> None:
     source = text(N320_SOURCE)
     ran = text(RAN)
     chart = text(N320_CHART)
+    readiness = text(N320_READINESS)
     attest = text(N320_ATTEST)
     nad = text(N320_NAD)
 
@@ -132,7 +134,10 @@ def validate_local_contract(pin: str) -> None:
         'oai_r2lab_n320_ru_ip: "192.168.235.120"',
         'oai_r2lab_n320_ru_prefix: "24"',
         'oai_r2lab_n320_ru_mtu: "9216"',
-        'oai_r2lab_n320_sdr_ip: "192.168.235.105"',
+        'oai_r2lab_n320_sfp0_ip: "192.168.235.105"',
+        'oai_r2lab_n320_sfp1_ip: "192.168.235.106"',
+        'oai_r2lab_n320_sdr_ip: "{{ oai_r2lab_n320_sfp0_ip }}"',
+        'oai_r2lab_n320_ssh_user: "root"',
         'oai_r2lab_n320_ru_cni_type: "ipvlan"',
         'oai_r2lab_n320_ru_cni_mode: "l2"',
     }
@@ -179,6 +184,7 @@ def validate_local_contract(pin: str) -> None:
         "platform == 'r2lab' and",
         "rru == 'n320' and",
         "oai_start_wait_timeout | bool",
+        "r2lab_n320_readiness.yml",
         "Verify N3xx gNB RF-device readiness",
         "r2lab_n320_attest.yml",
     ):
@@ -188,6 +194,21 @@ def validate_local_contract(pin: str) -> None:
         "A nonzero result is tolerated only for the\n      evidence-backed R2Lab N320 readiness timeout",
         "OAI RAN lifecycle",
     )
+
+    for needle in (
+        "StrictHostKeyChecking=accept-new",
+        "net.ipv4.conf.${scope}.arp_ignore=1",
+        "net.ipv4.conf.${scope}.arp_announce=2",
+        'test "$remote_sfp0_ip" = "$N320_SFP0_IP"',
+        'test "$remote_sfp1_ip" = "$N320_SFP1_IP"',
+        'test "$sfp0_neighbor" = "$remote_sfp0_mac"',
+        'test "$sfp1_neighbor" = "$remote_sfp1_mac"',
+        "ip neigh del",
+        "oai-n320-network-readiness.json",
+    ):
+        require(readiness, needle, "N320 pre-launch readiness")
+    forbid(readiness, "StrictHostKeyChecking=no", "N320 pre-launch readiness")
+    forbid(readiness, "rhubarbe-pdu", "N320 pre-launch readiness")
 
     for needle in (
         "time.sleep(10)",
@@ -201,6 +222,7 @@ def validate_local_contract(pin: str) -> None:
         "charts_revision': synthran_oai_charts_revision",
         "selected_transport': synthran_topology.transport",
         "selected_network': synthran_topology.network",
+        "prelaunch_network': oai_n320_network_readiness.stdout | from_json",
     ):
         require(attest, needle, "N320 runtime attestation")
 
