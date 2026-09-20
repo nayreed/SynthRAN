@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Regression checks for reuse of an active exact POS reservation.
+"""Regression checks for remaining coverage of an active exact POS reservation.
 
-Physical validation on 2026-09-16 exposed a rolling-duration bug: a 120-minute
-reservation stopped qualifying for reuse as soon as wall-clock time elapsed, so
-SynthRAN attempted to create an overlapping reservation and POS returned -1.
+Physical validation on 2026-09-20 proved that reusing an active event based on
+its original booked duration is unsafe: a nearly expired reservation was
+accepted for a new 120-minute deployment request and both SOP nodes disappeared
+when the reservation ended. Reuse must therefore be based on coverage remaining
+from the current time, while still refusing overlapping calendar creation.
 """
 
 from __future__ import annotations
@@ -75,21 +77,40 @@ def main() -> int:
 
     try:
         active_120 = event("6536", start=start, duration_minutes=120, nodes=selected)
-        fake = CalendarOnlyFake([active_120])
-        reservation.run = fake
+
+        # Seven elapsed minutes leave only 113 minutes of authority. A new
+        # 120-minute request must fail closed and must not attempt an overlapping
+        # POS calendar create.
+        insufficient = CalendarOnlyFake([active_120])
+        reservation.run = insufficient
+        expect_error(
+            lambda: reservation.acquire_calendar(
+                {"mode": "create", "duration_minutes": 120},
+                selected=selected,
+                owner="ci-user",
+                now=now,
+            ),
+            "remaining coverage",
+        )
+        if any(call[:3] == ["pos", "calendar", "create"] for call in insufficient.calls):
+            raise CheckError("insufficient active reservation triggered overlapping create")
+
+        # The same active event may still be reused when its remaining window
+        # really covers the requested duration.
+        reusable = CalendarOnlyFake([active_120])
+        reservation.run = reusable
         record = reservation.acquire_calendar(
-            {"mode": "create", "duration_minutes": 120},
+            {"mode": "create", "duration_minutes": 110},
             selected=selected,
             owner="ci-user",
             now=now,
         )
         if record["status"] != "reused" or record["id"] != "6536":
             raise CheckError(f"unexpected reuse record: {record}")
-        if any(call[:3] == ["pos", "calendar", "create"] for call in fake.calls):
-            raise CheckError("create mode attempted a second overlapping reservation")
+        if any(call[:3] == ["pos", "calendar", "create"] for call in reusable.calls):
+            raise CheckError("covering active reservation triggered overlapping create")
 
-        # require-existing remains a remaining-coverage promise. Seven elapsed
-        # minutes means this same event no longer covers a fresh 120-minute window.
+        # require-existing uses the same remaining-coverage promise.
         strict = CalendarOnlyFake([active_120])
         reservation.run = strict
         expect_error(
@@ -104,8 +125,8 @@ def main() -> int:
         if any(call[:3] == ["pos", "calendar", "create"] for call in strict.calls):
             raise CheckError("require-existing attempted a mutation")
 
-        # An active event booked for less than the configured acquisition duration
-        # must fail closed rather than being silently accepted or overlapped.
+        # A still shorter active event must likewise fail closed rather than
+        # being silently accepted or overlapped.
         short = CalendarOnlyFake(
             [event("short", start=start, duration_minutes=60, nodes=selected)]
         )
@@ -117,7 +138,7 @@ def main() -> int:
                 owner="ci-user",
                 now=now,
             ),
-            "shorter than requested",
+            "remaining coverage",
         )
         if any(call[:3] == ["pos", "calendar", "create"] for call in short.calls):
             raise CheckError("short active reservation triggered overlapping create")
