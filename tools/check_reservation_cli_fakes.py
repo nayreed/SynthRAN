@@ -246,36 +246,53 @@ def check_sop(root: Path, env: dict[str, str], state: Path, log: Path) -> dict[s
     selected = [value for value in create["argv"] if value.startswith("sopnode-")]
     if selected != ["sopnode-f2", "sopnode-f3"]:
         raise CheckError(f"fake-CLI path remapped resources: {selected}")
-    ordered = [
-        entry["argv"][:2]
-        for entry in calls
-        if entry["command"] == "pos"
-        and entry["argv"][:2]
+    pos_calls = [entry for entry in calls if entry["command"] == "pos"]
+    allocation_indices = [
+        index
+        for index, entry in enumerate(pos_calls)
+        if entry["argv"][:2] == ["allocations", "allocate"]
+    ]
+    mutation_indices = [
+        index
+        for index, entry in enumerate(pos_calls)
+        if entry["argv"][:2]
         in (
-            ["allocations", "allocate"],
             ["nodes", "image"],
             ["nodes", "bootparameter"],
             ["nodes", "reset"],
         )
     ]
-    if ordered != [
-        ["allocations", "allocate"],
-        ["allocations", "allocate"],
-        ["nodes", "image"],
-        ["nodes", "bootparameter"],
-        ["nodes", "reset"],
-        ["nodes", "image"],
-        ["nodes", "bootparameter"],
-        ["nodes", "reset"],
-    ]:
-        raise CheckError(f"fresh command ordering changed: {ordered}")
+    if len(allocation_indices) != 2 or not mutation_indices:
+        raise CheckError(f"fresh authority/preparation calls are incomplete: {pos_calls}")
+    if max(allocation_indices) >= min(mutation_indices):
+        raise CheckError(
+            "fresh per-node preparation started before all allocation probes completed"
+        )
+
+    for node in selected:
+        phases = []
+        for entry in pos_calls:
+            argv = entry["argv"]
+            if argv[:2] == ["nodes", "image"] and argv[-2] == node:
+                phases.append("image")
+            elif argv[:2] == ["nodes", "bootparameter"] and argv[2] == node:
+                phases.append("bootparameter")
+            elif argv[:2] == ["nodes", "reset"] and argv[-1] == node:
+                phases.append("reset")
+        if phases != ["image", "bootparameter", "reset"]:
+            raise CheckError(f"fresh per-node phase ordering changed for {node}: {phases}")
     if any(entry["stdin"] for entry in calls):
         raise CheckError("SOP/provider authority read or forwarded stdin despite EOF")
     evidence = json.loads((result_dir / "reservation-authority.json").read_text())
     if evidence["pos_calendar"]["id"] != "42" or evidence["selected_resources"] != ["sopnode-f2", "sopnode-f3"]:
         raise CheckError("fresh fake-CLI evidence lost exact provider identity")
+    if evidence.get("host_preparation", {}).get("parallel_preparation") is not True:
+        raise CheckError("fresh fake-CLI evidence did not record multi-node parallel preparation")
+    for node in selected:
+        if evidence["host_preparation"]["nodes"][node].get("status") != "ready":
+            raise CheckError(f"fresh fake-CLI evidence lost ready state for {node}")
 
-    before = len(calls)
+    before = len(read_log(log))
     config = root / "existing.yml"
     result_dir = root / "existing-result"
     sop_scenario(config, provider="require-existing", pos="require-existing", preparation="preserve")
@@ -304,7 +321,46 @@ def check_sop(root: Path, env: dict[str, str], state: Path, log: Path) -> dict[s
         raise CheckError(f"require-existing/preserve mutated resources: {forbidden}")
     if any(entry["stdin"] for entry in later):
         raise CheckError("require-existing/preserve read stdin")
-    return {"fresh": "passed", "require_existing_preserve": "passed", "stdin_eof": "passed"}
+
+    before = len(read_log(log))
+    config = root / "bootstrap.yml"
+    result_dir = root / "bootstrap-result"
+    sop_scenario(config, provider="require-existing", pos="require-existing", preparation="bootstrap")
+    result = run(
+        [sys.executable, "deployment/scripts/reserve_sop.py", str(config), str(result_dir)],
+        env=env,
+    )
+    if result.returncode:
+        raise CheckError(f"require-existing/bootstrap fake-CLI path failed:\n{result.stdout}\n{result.stderr}")
+    later = read_log(log)[before:]
+    forbidden = [
+        entry
+        for entry in later
+        if entry["command"] == "pos"
+        and entry["argv"][:2]
+        in (
+            ["calendar", "create"],
+            ["allocations", "allocate"],
+            ["allocations", "free"],
+            ["nodes", "image"],
+            ["nodes", "bootparameter"],
+            ["nodes", "reset"],
+        )
+    ]
+    if forbidden or any(entry["command"] == "ssh" for entry in later):
+        raise CheckError(f"require-existing/bootstrap reservation layer mutated hosts: {forbidden}")
+    bootstrap_evidence = json.loads((result_dir / "reservation-authority.json").read_text())
+    if bootstrap_evidence["policies"]["host_preparation"] != "bootstrap":
+        raise CheckError("bootstrap fake-CLI evidence lost canonical preparation policy")
+    if bootstrap_evidence["host_preparation"]["mode"] != "bootstrap":
+        raise CheckError("bootstrap fake-CLI result lost in-place preparation mode")
+
+    return {
+        "fresh": "passed",
+        "require_existing_preserve": "passed",
+        "require_existing_bootstrap": "passed",
+        "stdin_eof": "passed",
+    }
 
 
 def r2_command(root: Path, mode: str) -> list[str]:
