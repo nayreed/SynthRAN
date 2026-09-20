@@ -37,6 +37,16 @@ class Fake:
         return result
 
 
+def is_allocate(command: list[str], node: str) -> bool:
+    return (
+        command[:3] == ["pos", "allocations", "allocate"]
+        and len(command) == 6
+        and command[3] == "--result-folder"
+        and command[4].startswith("synthran-")
+        and command[5] == node
+    )
+
+
 def assert_no_destructive_host_mutation(calls: list[list[str]]) -> None:
     forbidden = (
         ["pos", "allocations", "free", "-k"],
@@ -53,9 +63,9 @@ def failed_second_probe_is_non_destructive() -> None:
     selected = ["sopnode-f2", "sopnode-f3"]
 
     def handler(argv: list[str], _n: int):
-        if argv == ["pos", "allocations", "allocate", "sopnode-f2"]:
+        if is_allocate(argv, "sopnode-f2"):
             return done(argv, rc=1, out="Nodes are already allocated: sopnode-f2")
-        if argv == ["pos", "allocations", "allocate", "sopnode-f3"]:
+        if is_allocate(argv, "sopnode-f3"):
             return done(argv, rc=7, err="provider allocation failure")
         raise CheckError(f"unexpected command after failed probe: {argv}")
 
@@ -77,11 +87,7 @@ def failed_second_probe_is_non_destructive() -> None:
     finally:
         reservation.run = original
 
-    expected = [
-        ["pos", "allocations", "allocate", "sopnode-f2"],
-        ["pos", "allocations", "allocate", "sopnode-f3"],
-    ]
-    if fake.calls != expected:
+    if len(fake.calls) != 2 or not is_allocate(fake.calls[0], "sopnode-f2") or not is_allocate(fake.calls[1], "sopnode-f3"):
         raise CheckError(f"unexpected probe sequence: {fake.calls}")
     assert_no_destructive_host_mutation(fake.calls)
 
@@ -92,7 +98,7 @@ def all_nodes_are_probed_before_reclaim_or_image() -> None:
 
     def handler(argv: list[str], _n: int):
         nonlocal first_f2
-        if argv == ["pos", "allocations", "allocate", "sopnode-f2"] and first_f2:
+        if is_allocate(argv, "sopnode-f2") and first_f2:
             first_f2 = False
             return done(argv, rc=1, out="Nodes are already allocated: sopnode-f2")
         if argv[:3] == ["pos", "allocations", "allocate"]:
@@ -138,8 +144,8 @@ def all_nodes_are_probed_before_reclaim_or_image() -> None:
     if result["nodes"]["sopnode-f3"]["allocation"] != "new":
         raise CheckError("sopnode-f3 should be recorded as newly allocated")
 
-    probe_f2 = fake.calls.index(["pos", "allocations", "allocate", "sopnode-f2"])
-    probe_f3 = fake.calls.index(["pos", "allocations", "allocate", "sopnode-f3"])
+    probe_f2 = next(index for index, command in enumerate(fake.calls) if is_allocate(command, "sopnode-f2"))
+    probe_f3 = next(index for index, command in enumerate(fake.calls) if is_allocate(command, "sopnode-f3"))
     reclaim_f2 = fake.calls.index(["pos", "allocations", "free", "-k", "sopnode-f2"])
     first_image = next(
         index for index, command in enumerate(fake.calls)
@@ -203,7 +209,7 @@ def independent_fresh_preparation_overlaps() -> None:
         if command[:3] == ["pos", "nodes", "image"]
     )
     last_probe = max(
-        fake.calls.index(["pos", "allocations", "allocate", node])
+        next(index for index, command in enumerate(fake.calls) if is_allocate(command, node))
         for node in selected
     )
     if last_probe >= first_image:
