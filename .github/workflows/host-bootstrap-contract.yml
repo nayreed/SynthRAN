@@ -35,6 +35,9 @@ jobs:
       - name: Validate early SOP preflight ordering contract
         run: python tools/check_sop_preflight_contract.py
 
+      - name: Validate bootstrap reconciliation safety contract
+        run: python tools/check_bootstrap_reconcile_contract.py
+
       - name: Install pinned Ansible collections
         run: ansible-galaxy collection install -r deployment/collections/requirements.yml
 
@@ -52,6 +55,7 @@ jobs:
               Path("deployment/group_vars/all/all.yml"),
               Path("deployment/playbooks/provision_nodes.yml"),
               Path("deployment/playbooks/preflight_nodes.yml"),
+              Path("deployment/playbooks/bootstrap_classify.yml"),
               Path("deployment/playbooks/bootstrap_nodes.yml"),
               Path("deployment/playbooks/network.yml"),
               Path("deployment/playbooks/site.yml"),
@@ -184,7 +188,7 @@ jobs:
           ANSIBLE_CONFIG: ${{ github.workspace }}/deployment/ansible.cfg
           ANSIBLE_ROLES_PATH: ${{ github.workspace }}/deployment/roles
         run: |
-          for playbook in provision_nodes.yml preflight_nodes.yml bootstrap_nodes.yml; do
+          for playbook in provision_nodes.yml preflight_nodes.yml bootstrap_classify.yml bootstrap_nodes.yml; do
             ansible-playbook \
               -i "$SYNTHRAN_BOOTSTRAP_FIXTURE/inventory.yml" \
               -e @deployment/group_vars/all/all.yml \
