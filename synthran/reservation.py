@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from . import phase_timing
 from .host_preparation import BOOTSTRAP, validate_preparation_mode
 
 
@@ -642,6 +643,7 @@ def _prepare_fresh_node(
     allocation_id: str | None,
     image: str,
     stop_event: threading.Event,
+    timing_run_dir: Path | None,
 ) -> dict[str, Any]:
     boot_profile, boot_parameters = _boot_parameters(node)
     record: dict[str, Any] = {
@@ -667,7 +669,27 @@ def _prepare_fresh_node(
             "take several minutes",
             flush=True,
         )
-        run_visible(["pos", "nodes", "image", "--staging", node, image])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "image", "--staging", node, image])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_image_staging",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_image_staging",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("image-staging")
         print(f"[POS prepare] {node}: image staging completed", flush=True)
 
@@ -677,7 +699,27 @@ def _prepare_fresh_node(
             f"[POS prepare] {node}: applying boot parameters ({boot_profile})",
             flush=True,
         )
-        run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "bootparameter", node, "--raw", boot_parameters])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "boot_parameter_mutation",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "boot_parameter_mutation",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("boot-parameters")
         print(f"[POS prepare] {node}: boot parameters applied", flush=True)
 
@@ -688,14 +730,54 @@ def _prepare_fresh_node(
             "returns only after POS reports reset completion",
             flush=True,
         )
-        run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
+        timing = phase_timing.capture_start()
+        try:
+            run_visible(["pos", "nodes", "reset", "--blocking", "--verbose", node])
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_reset",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "pos_reset",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("reset")
         record["reset"] = "blocking"
         print(f"[POS prepare] {node}: POS reset completed", flush=True)
 
         phase = "ssh-readiness"
         stop_if_peer_failed("ssh-readiness")
-        ready_attempt = _wait_for_ssh(node)
+        timing = phase_timing.capture_start()
+        try:
+            ready_attempt = _wait_for_ssh(node)
+        except Exception:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "ssh_readiness",
+                    scope=node,
+                    started=timing,
+                    status="failed",
+                )
+            raise
+        else:
+            if timing_run_dir is not None:
+                phase_timing.record_interval(
+                    timing_run_dir,
+                    "ssh_readiness",
+                    scope=node,
+                    started=timing,
+                )
         record["completed_phases"].append("ssh-readiness")
         record["ssh_ready_attempt"] = ready_attempt
         record["status"] = "ready"
@@ -719,6 +801,7 @@ def prepare_hosts(
     selected: Sequence[str],
     calendar: Mapping[str, Any],
     allocation_authority: dict[str, Any] | None = None,
+    timing_run_dir: Path | None = None,
 ) -> dict[str, Any]:
     try:
         mode = validate_preparation_mode(reservation.get("host_preparation", ""))
@@ -858,6 +941,7 @@ def prepare_hosts(
                 allocation_id=allocation_records.get(node, {}).get("id"),
                 image=image,
                 stop_event=stop_event,
+                timing_run_dir=timing_run_dir,
             ): node
             for node in selected
         }
@@ -1016,14 +1100,34 @@ def execute(config_path: Path, run_dir: Path) -> dict[str, Any]:
     _write_json(evidence_path, evidence)
 
     try:
-        evidence["provider"] = provider_context(provider)
-        _write_json(evidence_path, evidence)
+        reservation_timing = phase_timing.capture_start()
+        try:
+            evidence["provider"] = provider_context(provider)
+            _write_json(evidence_path, evidence)
 
-        now = dt.datetime.now().astimezone()
-        owner = _owner()
-        calendar = acquire_calendar(
-            reservation, selected=selected, owner=owner, now=now
-        )
+            now = dt.datetime.now().astimezone()
+            owner = _owner()
+            calendar = acquire_calendar(
+                reservation, selected=selected, owner=owner, now=now
+            )
+        except Exception:
+            phase_timing.record_interval(
+                run_dir,
+                "reservation",
+                scope="sop",
+                started=reservation_timing,
+                status="failed",
+                details={"mode": str(reservation.get("mode", ""))},
+            )
+            raise
+        else:
+            phase_timing.record_interval(
+                run_dir,
+                "reservation",
+                scope="sop",
+                started=reservation_timing,
+                details={"mode": str(reservation.get("mode", ""))},
+            )
         evidence["pos_calendar"] = calendar
         allocation_authority = _save_state(calendar, role_nodes)
         _write_json(evidence_path, evidence)
@@ -1033,6 +1137,7 @@ def execute(config_path: Path, run_dir: Path) -> dict[str, Any]:
             selected=selected,
             calendar=calendar,
             allocation_authority=allocation_authority,
+            timing_run_dir=run_dir,
         )
         evidence["status"] = "ready"
         evidence["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
