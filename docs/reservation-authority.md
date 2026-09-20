@@ -80,7 +80,7 @@ After allocation authority is proven for the complete selected resource set, pha
 3. perform a blocking POS reset;
 4. prove SSH readiness with a bounded retry.
 
-Calendar acquisition, allocation probing and any required allocation reclaim remain serialized authority work. If one parallel node fails, SynthRAN cancels work that has not started, lets already-running node operations settle rather than orphaning provider work, records per-node completion/failure state, and fails the preparation as a whole.
+Calendar acquisition, allocation probing and any required allocation reclaim remain serialized authority work. If one parallel node fails, SynthRAN cancels work that has not started and signals already-running peers to stop at the next safe per-node phase boundary. Any provider command already in flight is allowed to settle rather than being orphaned. Per-node completion/cancellation/failure state is retained and the preparation fails as a whole.
 
 The user-facing `ubuntu-jammy` alias resolves before POS mutation to the pinned provider artifact `ubuntu-jammy-slices@2025-04-02T01:33:28+00:00`; explicit full image identifiers remain unchanged. The resolved private scenario and evidence therefore record the actual provider image.
 
