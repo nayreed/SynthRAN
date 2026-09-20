@@ -333,15 +333,6 @@ def _covering_exact_events(
     return matches
 
 
-def _booked_duration(event: Mapping[str, Any]) -> dt.timedelta:
-    try:
-        start = stamp(str(event["start_date"]))
-        stop = stamp(str(event["end_date"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ReservationError("POS calendar event has invalid start/end timestamps") from exc
-    return stop - start
-
-
 def _calendar_record(event: Mapping[str, Any], *, status: str) -> dict[str, Any]:
     return {
         "status": status,
@@ -401,14 +392,17 @@ def acquire_calendar(
             "multiple owned active POS calendar events exactly cover the selected nodes; refusing ambiguous authority"
         )
     if active:
-        booked = _booked_duration(active[0])
-        requested = dt.timedelta(minutes=duration)
-        if booked < requested:
-            booked_minutes = max(0, int(booked.total_seconds() // 60))
+        active_end = stamp(str(active[0]["end_date"]))
+        if active_end < required_end:
+            remaining = max(
+                dt.timedelta(),
+                active_end - now,
+            )
+            remaining_minutes = int(remaining.total_seconds() // 60)
             raise ReservationError(
-                "owned active POS calendar event exactly covers the selected nodes but was booked "
-                f"for {booked_minutes} minute(s), shorter than requested {duration}; "
-                "refusing an overlapping calendar create"
+                "owned active POS calendar event exactly covers the selected nodes but has only "
+                f"{remaining_minutes} minute(s) of remaining coverage, shorter than requested "
+                f"{duration}; refusing an overlapping calendar create"
             )
         record = _calendar_record(active[0], status="reused")
         print(
@@ -439,15 +433,18 @@ def acquire_calendar(
 
     matches = [
         event
-        for event in _active_exact_events(
-            _calendars(), owner=owner, selected=selected, now=now
+        for event in _covering_exact_events(
+            _calendars(),
+            owner=owner,
+            selected=selected,
+            now=now,
+            end=required_end,
         )
         if str(event.get("id")) == reservation_id
-        and _booked_duration(event) >= dt.timedelta(minutes=duration)
     ]
     if len(matches) != 1:
         raise ReservationError(
-            "POS provider evidence did not prove the newly created reservation exactly covers the selected nodes for the requested booked duration"
+            "POS provider evidence did not prove the newly created reservation exactly covers the selected nodes through the requested end time"
         )
     print(
         f"Created SOP reservation {reservation_id} for {', '.join(selected)}",
