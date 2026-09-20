@@ -7,7 +7,7 @@
     - name: Start Kubernetes bootstrap phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - start
@@ -455,7 +455,7 @@
     - name: Finish Kubernetes bootstrap phase timing
       ansible.builtin.command:
         argv:
-          - "{{ synthran_controller_python }}"
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
           - -m
           - synthran.phase_timing
           - finish
