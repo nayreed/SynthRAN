@@ -81,6 +81,7 @@
                'distribution_version': ansible_distribution_version,
                'kernel': ansible_kernel,
                'architecture': ansible_architecture,
+               'host_preparation': synthran_host_preparation,
                'kubelet': synthran_prov_kubelet.stdout | default(''),
                'containerd': synthran_prov_containerd.stdout | default(''),
                'helm': synthran_prov_helm.stdout | default(''),
