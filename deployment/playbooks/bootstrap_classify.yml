@@ -218,6 +218,26 @@
         - synthran_host_preparation == 'bootstrap'
         - synthran_bootstrap_classification == 'reboot-required'
 
+    - name: Start bootstrap boot-parameter mutation timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - boot_parameter_mutation
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
     - name: Apply required POS boot parameters without image staging
       ansible.builtin.command:
         argv:
@@ -229,6 +249,26 @@
           - "{{ synthran_preflight_required_boot_tokens | join(' ') }}"
       delegate_to: localhost
       become: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Finish bootstrap boot-parameter mutation timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - boot_parameter_mutation
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
       when:
         - synthran_host_preparation == 'bootstrap'
         - synthran_bootstrap_classification == 'reboot-required'
@@ -265,12 +305,52 @@
         - synthran_host_preparation == 'bootstrap'
         - synthran_bootstrap_classification == 'reboot-required'
 
+    - name: Start bootstrap reboot timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - bootstrap_reboot
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
     - name: Reboot current OS to activate corrected boot parameters
       ansible.builtin.reboot:
         reboot_timeout: 300
         connect_timeout: 10
         post_reboot_delay: 5
         msg: SynthRAN bootstrap is activating the authorized SOP boot profile
+      when:
+        - synthran_host_preparation == 'bootstrap'
+        - synthran_bootstrap_classification == 'reboot-required'
+
+    - name: Finish bootstrap reboot timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python | default(ansible_playbook_python) }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - bootstrap_reboot
+          - --scope
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
       when:
         - synthran_host_preparation == 'bootstrap'
         - synthran_bootstrap_classification == 'reboot-required'
