@@ -129,6 +129,35 @@ def build_negative(path: Path, revision: str) -> None:
     write_json(path / "deployment-fingerprint.json", {"status": "failed"})
 
 
+
+def build_reachability_negative(path: Path, revision: str) -> None:
+    base_run(path, revision, 2)
+    write_json(
+        path / "reservation-authority.json",
+        {
+            "policies": {"host_preparation": "preserve"},
+            "selected_nodes": {
+                "core": "sopnode-f2",
+                "ran": "sopnode-f3",
+                "broker": "sopnode-f2",
+            },
+        },
+    )
+    write_json(
+        path / "phase-timings.json",
+        timing(success_phase("reservation")),
+    )
+    (path / "ansible.log").write_text(
+        "PLAY [Validate selected SOP nodes]\\n"
+        "TASK [Wait for the selected SOP node to become reachable]\\n"
+        "fatal: [sopnode-f2]: FAILED! => timed out waiting for ping module test: "
+        "Failed to connect to the host via ssh: root@sopnode-f2: Permission denied (publickey).\\n"
+        "fatal: [sopnode-f3]: FAILED! => timed out waiting for ping module test: "
+        "Failed to connect to the host via ssh: root@sopnode-f3: Permission denied (publickey).\\n",
+        encoding="utf-8",
+    )
+
+
 def build_positive(path: Path, revision: str) -> None:
     base_run(path, revision, 0)
     write_json(
@@ -236,6 +265,22 @@ def main() -> int:
         build_positive(positive, revision)
 
         neg = validator.validate_preserve_failure(negative, revision)
+        require(
+            neg["preflight_failure_stage"] == "detailed-preflight",
+            "detailed negative fixture did not report detailed-preflight stage",
+        )
+
+        reachability_negative = root / "reachability-negative"
+        build_reachability_negative(reachability_negative, revision)
+        reachability = validator.validate_preserve_failure(
+            reachability_negative,
+            revision,
+        )
+        require(
+            reachability["preflight_failure_stage"] == "reachability-gate",
+            "reachability fixture did not report reachability-gate stage",
+        )
+
         pos = validator.validate_bootstrap_success(
             positive,
             revision,
