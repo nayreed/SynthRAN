@@ -347,7 +347,8 @@
               'installation_failed_observed': oai_start_installation_failed | bool
             },
             'selected_transport': synthran_topology.transport,
-            'selected_network': synthran_topology.network
+            'selected_network': synthran_topology.network,
+            'prelaunch_network': oai_n320_network_readiness.stdout | from_json
           }, recursive=True)
         | to_nice_json
       }}
