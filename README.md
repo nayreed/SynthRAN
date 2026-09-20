@@ -30,78 +30,65 @@ That boundary is a research invariant: an experiment must not silently repair or
 ## System model
 
 ```mermaid
-flowchart LR
-    subgraph SOURCE["Modeled Ambient-IoT source"]
-        ENERGY["Harvested energy"] --> CAP["Capacitor"]
-        CAP --> CTRL["Controller"]
-        CTRL --> SENSE["Sensing"]
-        SENSE --> MAC["Access protocol"]
-        MAC --> TX["Backscatter attempts"]
-        TX --> RX["Receiver / SINR / collision / SIC"]
-        RX --> EVENTS["Decoded event trace"]
+flowchart TB
+    classDef model fill:#ECFDF3,stroke:#16A34A,color:#14532D,stroke-width:1.5px
+    classDef infra fill:#EFF6FF,stroke:#2563EB,color:#1E3A8A,stroke-width:1.5px
+    classDef science fill:#F5F3FF,stroke:#7C3AED,color:#4C1D95,stroke-width:1.5px
+    classDef evidence fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.5px
+    classDef external fill:#F8FAFC,stroke:#64748B,color:#334155,stroke-width:1px,stroke-dasharray:5 5
+
+    subgraph MODEL["1 · Modeled Ambient-IoT"]
+        direction LR
+        ENERGY["Harvested energy"] --> DEVICE["Capacitor · controller · sensing"]
+        DEVICE --> ACCESS["Backscatter · MAC · SINR / SIC"]
+        ACCESS --> EVENTS["Decoded events"]
     end
 
-    subgraph DEPLOY["Infrastructure authority — ./deploy.sh"]
-        DEP["Deployment request"] --> RESOLVE["Resolve selected topology"]
-        RESOLVE --> PLATFORM{"Radio platform"}
-
-        PLATFORM -->|"R2Lab / N3xx"| AUTH["Resource authority<br/>SLICES / POS / R2Lab"]
-        PLATFORM -->|"RFSIM"| HOST["Host / cluster preparation"]
-        AUTH --> HOST
-
-        HOST --> TRANSPORT["N2 / N3 / N4 transport"]
-        TRANSPORT --> CORE["5G core<br/>OAI / Open5GS / free5GC"]
-        CORE --> RAN["RAN<br/>OAI / srsRAN / UERANSIM"]
-        RAN --> RADIO{"Selected radio / UE path"}
-
-        RADIO -->|"software"| SWUE["RFSIM / software UE(s)"]
-        RADIO -->|"physical"| PHYUE["N300 / N320 + selected modem UE(s)"]
-
-        SWUE --> VERIFY["Runtime verification + attestation"]
-        PHYUE --> VERIFY
-        VERIFY --> ACCEPTED["accepted-testbed<br/>deployment identity"]
+    subgraph INFRA["2 · 5G infrastructure · deploy.sh"]
+        direction LR
+        SELECT["Resolve topology"] --> PLATFORM{"Platform"}
+        PLATFORM -->|RFSIM| VIRTUAL["Software radio + UE"]
+        PLATFORM -->|R2Lab| PHYSICAL["SLICES / POS / R2Lab<br/>N300 / N320 + modem UE"]
+        VIRTUAL --> STACK["5G core + RAN<br/>N2 / N3 / N4"]
+        PHYSICAL --> STACK
+        STACK --> VERIFY["Verify + attest"]
+        VERIFY --> ACCEPTED["accepted-testbed"]
     end
 
-    subgraph UPSTREAM["Reviewed upstream lifecycle delegation"]
-        REF["Pinned sopnode/5g_ansible<br/>execution reference"]
+    UPSTREAM["sopnode/5g_ansible<br/>reviewed lifecycle tasks"]:::external
+    UPSTREAM -.-> STACK
+
+    subgraph SCIENCE["3 · Scientific experiment · experiment.sh"]
+        direction LR
+        DESIGN["Qualify · calibrate · freeze"] --> ATTACH["Read-only attach"]
+        ATTACH --> ELIG["Experiment eligibility"]
+        ELIG --> REPLAY["Frozen workload replay"]
+        REPLAY --> ANALYZE["Analyze"]
     end
 
-    REF -. "reviewed task ownership only" .-> HOST
-    REF -. "reviewed task ownership only" .-> CORE
-    REF -. "reviewed task ownership only" .-> RAN
-
-    subgraph SCIENCE["Scientific experiment authority — ./experiment.sh"]
-        EXP["Select experiment"] --> QUAL["Qualify"]
-        QUAL --> CAL["Calibrate"]
-        CAL --> FREEZE["Freeze design"]
-        FREEZE --> CONF["Confirm"]
-        CONF --> ANALYZE["Analyze"]
-
-        ATTACH["Read-only accepted-testbed attachment"]
-        ELIG["Experiment-time eligibility<br/>fresh UE / PDU / path / treatment evidence"]
-        REPLAY["Frozen workload replay"]
+    subgraph OBSERVED["4 · Observed outcome"]
+        direction LR
+        GATEWAY["Selected gateway UE"] --> APP["N6 application / collector"]
+        APP --> RESULT["Reconciled evidence"]
     end
 
-    EVENTS --> BUNDLE["Immutable decoded workload bundle"]
-    BUNDLE --> CONF
-
+    EVENTS --> BUNDLE["Immutable workload"]:::evidence
+    BUNDLE --> REPLAY
     ACCEPTED --> ATTACH
-    CONF --> ATTACH
-    ATTACH --> ELIG
-    ELIG --> REPLAY
-
-    REPLAY --> GATEWAY["Selected gateway UE"]
-    GATEWAY --> APP["N6-side application / collector"]
-    APP --> RESULT["Reconciled scientific evidence"]
+    REPLAY --> GATEWAY
     ANALYZE --> RESULT
+
+    class ENERGY,DEVICE,ACCESS,EVENTS model
+    class SELECT,PLATFORM,VIRTUAL,PHYSICAL,STACK,VERIFY,ACCEPTED infra
+    class DESIGN,ATTACH,ELIG,REPLAY,ANALYZE science
+    class GATEWAY,APP,RESULT evidence
 ```
 
-The post-rework authority boundary is deliberate:
+**How to read it:**
 
-- **SynthRAN owns resource authority, deployment identity, acceptance, and experiment eligibility.** A reviewed upstream task may own a lifecycle step, but it never decides that a deployment is accepted.
-- **Physical resource mutation is selected and bounded.** R2Lab/SLICES/POS authority is resolved before host, radio, or UE mutation; software-only RFSIM paths do not inherit physical resource ownership.
-- **Host preparation and deployment acceptance are separate concepts.** SOP preparation may use `preserve`, `bootstrap`, or `fresh`, while acceptance is based on retained live evidence after the selected core/RAN/radio/UE path is running.
-- **`accepted-testbed` is not automatically `experiment-eligible`.** A study may require stricter experiment-time evidence—such as fresh UE/PDU state, treatment validity, or remote-observed UE→N6 path/source identity—before scientific replay begins. This distinction is especially important for transport experiments and is tracked explicitly rather than inferred from provisioning success.
+- **The Ambient-IoT radio process is modeled.** Physical R2Lab hardware carries the downstream 5G gateway transport of a frozen decoded workload; it does not make the upstream Ambient-IoT link physical.
+- **`deploy.sh` owns infrastructure; `experiment.sh` owns science.** Reviewed `sopnode/5g_ansible` tasks may implement lifecycle steps, but SynthRAN retains resource authority, deployment identity, and acceptance.
+- **`accepted-testbed` is necessary but not sufficient for a physical study.** Experiments apply a separate eligibility gate for the fresh UE/PDU/path/treatment evidence required by that study before replay begins.
 
 ---
 
