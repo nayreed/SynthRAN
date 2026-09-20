@@ -29,6 +29,9 @@ jobs:
       - name: Install deployment runtime
         run: python -m pip install --disable-pip-version-check -e '.[deployment]'
 
+      - name: Validate host preparation policy contract
+        run: python tools/check_host_preparation_contract.py
+
       - name: Install pinned Ansible collections
         run: ansible-galaxy collection install -r deployment/collections/requirements.yml
 

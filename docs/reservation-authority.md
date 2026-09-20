@@ -21,7 +21,7 @@ deployment:
 
   reservation:
     mode: require-existing       # create | require-existing | disabled
-    host_preparation: preserve   # fresh | preserve
+    host_preparation: preserve   # preserve | bootstrap | fresh
     duration_minutes: 120
     image: ubuntu-jammy
 
@@ -32,7 +32,7 @@ deployment:
 
 These choices are separate on purpose. Reusing a calendar or R2Lab lease never implies permission to reimage a host. Likewise, preserving host state does not weaken exact-resource coverage verification.
 
-`reservation.mode=disabled` requires `host_preparation=preserve`. A destructive fresh preparation without proven POS calendar authority is rejected.
+`reservation.mode=disabled` requires `host_preparation=preserve`. Both `bootstrap` and `fresh` are mutating policies and therefore require proven POS calendar authority.
 
 Legacy source scenarios are deterministic rather than interactive:
 
@@ -65,7 +65,11 @@ When provider mode is enabled, the order is:
 
 ## POS host preparation
 
-`preserve` performs zero allocation, image, boot-parameter, reset or readiness mutation.
+The canonical preparation contract is documented in [`host-preparation.md`](host-preparation.md) and implemented in `synthran/host_preparation.py`.
+
+`preserve` is strictly verification-only and performs zero allocation, image, boot-parameter, package/service repair, reboot, reset, or other host mutation.
+
+`bootstrap` is the bounded in-place reconciliation policy: it retains the current allocation and OS, forbids image staging/allocation reclaim/clean-image POS reset, and may eventually reconcile prerequisites plus perform only explicit boot changes/reboot when required. Task 1 of issue #124 declares this mode but intentionally fails closed before host preparation until the reconciler is implemented; it never silently escalates to `fresh`.
 
 `fresh` requires proven calendar authority first and uses two phases. Phase 1 proves allocation authority for **every selected SOP node before any image/reset mutation occurs**. If one selected node cannot be allocated, no selected node has been reimaged. An already-active allocation may be reclaimed only after all selected nodes have first been probed and only under the explicit `fresh` policy.
 
