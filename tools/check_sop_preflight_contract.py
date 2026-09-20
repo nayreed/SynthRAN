@@ -31,11 +31,12 @@ def main() -> int:
     site = site_path.read_text(encoding="utf-8")
     provision = site.index("provision_nodes.yml")
     preflight = site.index("preflight_nodes.yml")
+    classify = site.index("bootstrap_classify.yml")
     r2lab = site.index("provision_r2lab.yml")
     bootstrap = site.index("bootstrap_nodes.yml")
     require(
-        provision < preflight < r2lab < bootstrap,
-        "site.yml must validate nodes, preflight SOP state, then mutate R2Lab, then bootstrap",
+        provision < preflight < classify < r2lab < bootstrap,
+        "site.yml must validate nodes, preflight/classify SOP state, then mutate R2Lab, then bootstrap",
     )
 
     path = ROOT / "deployment/playbooks/preflight_nodes.yml"
