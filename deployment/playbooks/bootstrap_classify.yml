@@ -103,7 +103,10 @@
             ([] if ansible_distribution == 'Ubuntu' else ['unsupported-os'])
             + ([] if synthran_bootstrap_cluster_action != 'requires-fresh' else ['existing-cluster-unhealthy'])
             + ([] if synthran_preflight_missing_boot_tokens | length == 0 else ['boot-profile-drift'])
-            + ([] if synthran_bootstrap_live_boot | bool else ['non-live-boot'])
+            + ([]
+               if (synthran_preflight_missing_boot_tokens | length == 0
+                   or synthran_bootstrap_live_boot | bool)
+               else ['boot-drift-on-non-live-host'])
             + ([] if synthran_preflight_containerd.rc | int == 0 else ['containerd-missing-or-inactive'])
             + ([] if synthran_preflight_kubelet.rc | int == 0 else ['kubelet-missing-or-inactive'])
             + ([] if (synthran_preflight_dhcp_binary.stat.exists | default(false) | bool) else ['cni-dhcp-binary-missing'])
