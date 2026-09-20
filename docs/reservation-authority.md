@@ -69,7 +69,7 @@ The canonical preparation contract is documented in [`host-preparation.md`](host
 
 `preserve` is strictly verification-only and performs zero allocation, image, boot-parameter, package/service repair, reboot, reset, or other host mutation.
 
-`bootstrap` is the bounded in-place reconciliation policy: it retains the current allocation and OS, forbids image staging/allocation reclaim/clean-image POS reset, and may eventually reconcile prerequisites plus perform only explicit boot changes/reboot when required. Task 1 of issue #124 declares this mode but intentionally fails closed before host preparation until the reconciler is implemented; it never silently escalates to `fresh`.
+`bootstrap` is the bounded in-place reconciliation policy: it retains the current allocation and OS, forbids image staging/allocation reclaim/clean-image POS reset, and reconciles only the declared host/Kubernetes prerequisites after classifying the live state. A healthy existing cluster is reused; a clusterless host may rebuild Kubernetes in place; an existing but unhealthy cluster is classified `requires-fresh` and blocked. Safe boot drift on a clusterless POS live host may be corrected with the pinned boot parameters plus an ordinary reboot. Bootstrap never silently escalates to `fresh`. Classification and boot-reconciliation evidence are retained before R2Lab hardware mutation.
 
 `fresh` requires proven calendar authority first and uses two phases. Phase 1 proves allocation authority for **every selected SOP node before any image/reset mutation occurs**. If one selected node cannot be allocated, no selected node has been reimaged. An already-active allocation may be reclaimed only after all selected nodes have first been probed and only under the explicit `fresh` policy.
 
@@ -104,7 +104,7 @@ R2Lab cleanup is selected-resource scoped. It stops only the UEs present in the 
 
 ## Evidence
 
-Every reservation pass writes `results/<run>/reservation-authority.json` incrementally. It records the selected role/resource identity, explicit policies, provider context, POS calendar ID/coverage and host-preparation evidence. If a later mutation fails, earlier known ownership identifiers remain in that file together with the original error message.
+Every reservation pass writes `results/<run>/reservation-authority.json` incrementally. It records the selected role/resource identity, explicit policies, provider context, POS calendar ID/coverage and host-preparation evidence. Bootstrap additionally retains SOP preflight, repairability classification, and (when needed) boot-reconciliation evidence before physical R2Lab mutation. If a later mutation fails, earlier known ownership identifiers remain in the run evidence together with the original error message.
 
 `pos-selection.json` remains as a compatibility/evidence surface for the deployment runner, including POS coverage end used to constrain an R2Lab lease window. It no longer carries remapped node identities because reservation handling cannot remap them.
 
