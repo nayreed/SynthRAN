@@ -266,6 +266,49 @@ def pos_checks() -> dict[str, str]:
         )
         assert record["status"] == "required-existing"
 
+        reuse = Fake(existing)
+        reservation.run = reuse
+        record = reservation.acquire_calendar(
+            {"mode": "create", "duration_minutes": 120},
+            selected=selected,
+            owner="ci-user",
+            now=now,
+        )
+        assert record["status"] == "reused"
+        assert not any(
+            call["argv"][:3] == ["pos", "calendar", "create"]
+            for call in reuse.calls
+        )
+
+        near_expiry = {
+            "id": "78",
+            "owner": "ci-user",
+            "nodes": selected,
+            "start_date": (now - dt.timedelta(minutes=115)).isoformat(),
+            "end_date": (now + dt.timedelta(minutes=5)).isoformat(),
+        }
+
+        def expiring(argv, _stdin, _n):
+            if argv == ["pos", "calendar", "list", "--json"]:
+                return done(argv, out=json.dumps([near_expiry]))
+            raise CheckError(f"near-expiry reuse attempted mutation: {argv}")
+
+        expiring_fake = Fake(expiring)
+        reservation.run = expiring_fake
+        expect_error(
+            lambda: reservation.acquire_calendar(
+                {"mode": "create", "duration_minutes": 120},
+                selected=selected,
+                owner="ci-user",
+                now=now,
+            ),
+            "remaining coverage",
+        )
+        assert not any(
+            call["argv"][:3] == ["pos", "calendar", "create"]
+            for call in expiring_fake.calls
+        )
+
         def unavailable(argv, _stdin, _n):
             if argv == ["pos", "calendar", "list", "--json"]:
                 return done(argv, out="[]")
@@ -306,6 +349,8 @@ def pos_checks() -> dict[str, str]:
         return {
             "exact_create": "passed",
             "require_existing": "passed",
+            "active_reuse_with_remaining_coverage": "passed",
+            "near_expiry_active_reuse_rejected": "passed",
             "unavailable_no_remap": "passed",
             "ambiguous_fail_closed": "passed",
         }
