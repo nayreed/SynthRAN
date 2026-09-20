@@ -769,6 +769,9 @@ def prepare_hosts(
         flush=True,
     )
     allocation_authority = allocation_authority or {}
+    persistent_allocation_authority = bool(
+        str(allocation_authority.get("event_id", "")).strip()
+    )
     result_folder = str(
         allocation_authority.get("allocation_result_folder", "")
     ).strip()
@@ -786,7 +789,7 @@ def prepare_hosts(
     for node in selected:
         state = _probe_allocation_for_fresh(node, result_folder=result_folder)
         allocation_states[node] = state
-        if state == "new":
+        if state == "new" and persistent_allocation_authority:
             live = _live_allocation_record(node)
             if live is not None and live.get("result_folder") == result_folder:
                 allocation_records[node] = live
@@ -795,10 +798,14 @@ def prepare_hosts(
     for node in selected:
         if allocation_states[node] != "already-active":
             continue
-        live = _managed_allocation_matches(
-            node,
-            expected=retained_allocations.get(node),
-            result_folder=result_folder,
+        live = (
+            _managed_allocation_matches(
+                node,
+                expected=retained_allocations.get(node),
+                result_folder=result_folder,
+            )
+            if persistent_allocation_authority
+            else None
         )
         if live is not None:
             allocation_states[node] = "managed-existing"
@@ -814,7 +821,11 @@ def prepare_hosts(
             node,
             result_folder=result_folder,
         )
-        live = _live_allocation_record(node)
+        live = (
+            _live_allocation_record(node)
+            if persistent_allocation_authority
+            else None
+        )
         if live is not None and live.get("result_folder") == result_folder:
             allocation_records[node] = live
             _record_managed_allocation(allocation_authority, node, live)
