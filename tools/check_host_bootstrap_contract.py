@@ -140,6 +140,7 @@ def main() -> None:
         "setup/k8s/k8s_setup",
         "setup/optimization/cpu",
         "setup/ovs",
+        "setup/k8s/k8s_setup",
         "setup/k8s/cluster_create",
         "setup/k8s/cni_dhcp",
         "setup/k8s/cluster_join",
@@ -195,6 +196,7 @@ def main() -> None:
         "Stage the checksum-verified CNI plugin bundle",
     }
     bootstrap_only_tasks = {
+        "Resolve bootstrap CNI repair need",
         "Resolve bootstrap CNI plugin architecture",
         "Require pinned CNI artifact for bootstrap reuse",
         "Ensure CNI plugin directory exists for bootstrap reuse",
