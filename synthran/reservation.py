@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -61,6 +62,13 @@ class FreshNodePreparationError(ReservationError):
         self.record = dict(record)
         self.cause = cause
         super().__init__(f"{node} fresh preparation failed during {phase}: {cause}")
+
+
+class FreshNodePreparationCancelled(ReservationError):
+    def __init__(self, node: str, record: Mapping[str, Any]) -> None:
+        self.node = node
+        self.record = dict(record)
+        super().__init__(f"{node} fresh preparation stopped after peer failure")
 
 
 class FreshPreparationError(ReservationError):
@@ -560,6 +568,7 @@ def _prepare_fresh_node(
     *,
     allocation: str,
     image: str,
+    stop_event: threading.Event,
 ) -> dict[str, Any]:
     boot_profile, boot_parameters = _boot_parameters(node)
     record: dict[str, Any] = {
@@ -570,7 +579,15 @@ def _prepare_fresh_node(
         "completed_phases": [],
     }
     phase = "image-staging"
+
+    def stop_if_peer_failed(next_phase: str) -> None:
+        if stop_event.is_set():
+            record["status"] = "cancelled-after-peer-failure"
+            record["cancelled_before_phase"] = next_phase
+            raise FreshNodePreparationCancelled(node, record)
+
     try:
+        stop_if_peer_failed("image-staging")
         print(
             f"[POS prepare] {node}: selecting image {image}; provider staging may "
             "take several minutes",
@@ -581,6 +598,7 @@ def _prepare_fresh_node(
         print(f"[POS prepare] {node}: image staging completed", flush=True)
 
         phase = "boot-parameters"
+        stop_if_peer_failed("boot-parameters")
         print(
             f"[POS prepare] {node}: applying boot parameters ({boot_profile})",
             flush=True,
@@ -590,6 +608,7 @@ def _prepare_fresh_node(
         print(f"[POS prepare] {node}: boot parameters applied", flush=True)
 
         phase = "reset"
+        stop_if_peer_failed("reset")
         print(
             f"[POS prepare] {node}: resetting node with POS --blocking; this command "
             "returns only after POS reports reset completion",
@@ -601,12 +620,16 @@ def _prepare_fresh_node(
         print(f"[POS prepare] {node}: POS reset completed", flush=True)
 
         phase = "ssh-readiness"
+        stop_if_peer_failed("ssh-readiness")
         ready_attempt = _wait_for_ssh(node)
         record["completed_phases"].append("ssh-readiness")
         record["ssh_ready_attempt"] = ready_attempt
         record["status"] = "ready"
         return record
+    except FreshNodePreparationCancelled:
+        raise
     except Exception as exc:
+        stop_event.set()
         record["status"] = "failed"
         record["failed_phase"] = phase
         record["failure"] = {
@@ -693,6 +716,7 @@ def prepare_hosts(
     node_records: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     max_workers = max(1, len(selected))
+    stop_event = threading.Event()
     with ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix="synthran-pos-fresh",
@@ -703,6 +727,7 @@ def prepare_hosts(
                 node,
                 allocation=allocation_states[node],
                 image=image,
+                stop_event=stop_event,
             ): node
             for node in selected
         }
@@ -727,6 +752,8 @@ def prepare_hosts(
             continue
         try:
             node_records[node] = future.result()
+        except FreshNodePreparationCancelled as exc:
+            node_records[node] = dict(exc.record)
         except FreshNodePreparationError as exc:
             node_records[node] = dict(exc.record)
             failures[node] = str(exc)
