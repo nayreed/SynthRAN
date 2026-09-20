@@ -1,4 +1,21 @@
 ---
+- name: Start selected 5G stack deployment timing
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Start stack deployment phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python }}"
+          - -m
+          - synthran.phase_timing
+          - start
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - stack_deployment
+      changed_when: false
+
 - name: Configure authoritative N2/N3/N4 host transport
   hosts: sopnodes
   become: true
@@ -117,3 +134,20 @@
       ansible.builtin.include_role:
         name: 5g/ueransim/deploy
       when: ran == 'ueransim'
+
+- name: Finish selected 5G stack deployment timing
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Finish stack deployment phase timing
+      ansible.builtin.command:
+        argv:
+          - "{{ synthran_controller_python }}"
+          - -m
+          - synthran.phase_timing
+          - finish
+          - --run-dir
+          - "{{ run_dir }}"
+          - --phase
+          - stack_deployment
+      changed_when: false
