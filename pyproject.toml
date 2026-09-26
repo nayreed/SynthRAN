@@ -14,7 +14,7 @@ license-files = ["LICENSE", "third_party/NOTICE.md", "third_party/amber/LICENSE"
 dependencies = ["PyYAML==6.0.3"]
 
 [project.optional-dependencies]
-experiment = ["numpy==2.4.6", "pandas==3.0.5", "simpy==4.1.2", "paho-mqtt==2.1.0"]
+experiment = ["numpy==2.4.6", "pandas==3.0.6", "simpy==4.1.2", "paho-mqtt==2.1.0"]
 analysis = ["matplotlib==3.11.2", "openpyxl==3.1.5"]
 deployment = ["ansible-core==2.19.13"]
 
